@@ -1,0 +1,44 @@
+# Memora (忆庐) systemd unit —— 由 `memora init` 渲染，安装到 /etc/systemd/system/memora.service
+#
+# 何时需要它：希望「开机自启」与「崩溃自动拉起」时。
+#   `Restart=always` 是 systemd 相对自守护形态唯一不可替代的能力——自守护的
+#   `memora start` 无法在进程崩溃后自动复活。
+# 何时不需要：单机临时使用，直接 `memora start` / `memora stop` 即可，两者只需其一。
+#
+# 安装步骤：
+#   sudo cp memora.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now memora
+
+[Unit]
+Description=Memora (忆庐) — 轻量自托管 AI 长期记忆服务
+Documentation=https://github.com/yujinping/memora
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 专用非 root 用户。若以普通用户运行，请修改 User/Group 并确保该用户对数据目录有写权限。
+User=memora
+Group=memora
+# CWD 会决定 `.env` 探测的首个候选路径，故显式固定为数据目录。
+# 配置本身经 EnvironmentFile 注入，不依赖 CWD。
+WorkingDirectory=__DATA_DIR__
+ExecStart=__EXE__ run
+# 前缀 `-` 表示文件缺失不算错误；生产建议把 ADMIN_TOKEN 等放在该文件的 600 权限版本里
+EnvironmentFile=-/etc/memora/memora.env
+# 崩溃/异常退出后自动拉起
+Restart=always
+RestartSec=3
+# 停机时先发 SIGTERM 走优雅退出（WAL 落盘），由应用自行收尾
+KillSignal=SIGTERM
+TimeoutStopSec=20
+# 日志交给 journald：journalctl -u memora -f
+StandardOutput=journal
+StandardError=journal
+# 安全加固：服务只需要写数据目录，不需要提升权限
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

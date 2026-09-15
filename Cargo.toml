@@ -1,0 +1,34 @@
+[package]
+name = "memora"
+version = "0.1.0"
+edition = "2021"
+authors = ["yujinping"]
+description = "Memora (忆庐): 轻量自托管 AI 长期记忆服务 (MCP + SQLite)"
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# 项目 token 的随机源。只取系统熵，不引入 rand 生态（PRNG 状态与分布 API 此处无用）。
+getrandom = "0.3"
+# P4.2 自守护进程管理：setsid 脱离控制终端、kill(pid, 0) 存活探测、SIGTERM/SIGKILL。
+# 这些在 std 中无安全封装（`CommandExt::pre_exec` 本身就是 unsafe），故直接绑定 libc；
+# 纯 FFI 声明，无编译期成本。
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+# MCP SDK。3.x 迭代较快，故锁定次版本（"3.3.0" 等价 ^3.3.0，不含 4.x）；
+# 升级前请先跑 `cargo test routes::`（协议级端到端）与 `cargo test mcp::`（工具语义）。
+rmcp = { version = "3.3.0", features = ["transport-streamable-http-server"] }
+# 与 rmcp 的 schemars 依赖同源（1.x），用于工具入参 / 出参的 JSON Schema 推导
+schemars = "1.2.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

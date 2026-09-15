@@ -1,0 +1,12 @@
+/target
+/data
+.env
+*.db
+*.db-shm
+*.db-wal
+
+# macOS 元数据
+.DS_Store
+
+# AI 助手内部工作记忆（非项目源码，不纳入版本库）
+.workbuddy/

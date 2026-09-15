@@ -1,0 +1,34 @@
+# Caddyfile 片段 —— 为 Memora 提供自动 HTTPS 反向代理
+#
+# 由 `memora init` 渲染。使用步骤：
+#   1. 把 mem.example.com 换成你的真实域名（需已解析到本机，且 80/443 可达）；
+#   2. 将本片段并入 /etc/caddy/Caddyfile（同域名存在时请合并，不要重复定义站点）；
+#   3. sudo systemctl reload caddy
+#
+# ⚠ 关键前置：`.env` 中的 MCP_ALLOWED_HOSTS 必须包含下面的域名。
+#   rmcp 的 Streamable HTTP 传输默认只信回环 Host（防 DNS 重绑定），而反代会透传
+#   真实域名；白名单未命中时 MCP 请求会被协议层以 403 拒绝，且错误信息并不指向配置项。
+#
+# 只暴露三个前缀，其余一律 404：记忆库里是私有内容，不应存在未预期的暴露面。
+mem.example.com {
+	handle /mcp* {
+		reverse_proxy 127.0.0.1:__PORT__
+	}
+
+	handle /api/v1/* {
+		reverse_proxy 127.0.0.1:__PORT__
+	}
+
+	handle /health {
+		reverse_proxy 127.0.0.1:__PORT__
+	}
+
+	# 兜底：必须放在 handle 块里。
+	# 不能写成顶层的裸 `respond 404`——Caddy 的 directive 排序会把 respond 提到
+	# reverse_proxy 之前执行，从而拦掉上面三条代理规则。
+	handle {
+		respond 404
+	}
+
+	encode zstd gzip
+}
