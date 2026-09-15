@@ -384,9 +384,7 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 
 ## 许可证
 
-MIT。自托管、自修改、自商用均无限制。
-
-> ⚠️ 仓库根目录的 `LICENSE` 文件尚待补充（`Cargo.toml` 已声明 `license = "MIT"`）。
+MIT（见仓库根目录 [`LICENSE`](LICENSE)）。自托管、自修改、自商用均无限制。
 
 ---
 
