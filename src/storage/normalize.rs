@@ -8,8 +8,10 @@
 use crate::domain::{EntityInput, ObservationInput, RelationInput};
 use crate::error::StorageError;
 
-/// 规范化单个实体：名称去空白后不得为空；类型为空则落为 `unknown`。
-pub fn entity(input: &EntityInput) -> Result<(String, String), StorageError> {
+/// 规范化单个实体：名称去空白后不得为空；类型为空则落为 `unknown`；来源仅去空白（可空）。
+///
+/// 返回三元组 `(name, entity_type, source)`。
+pub fn entity(input: &EntityInput) -> Result<(String, String, String), StorageError> {
     let name = input.name.trim();
     if name.is_empty() {
         return Err(StorageError::InvalidInput(
@@ -20,15 +22,15 @@ pub fn entity(input: &EntityInput) -> Result<(String, String), StorageError> {
         "" => "unknown".to_string(),
         t => t.to_string(),
     };
-    Ok((name.to_string(), entity_type))
+    Ok((name.to_string(), entity_type, input.source.trim().to_string()))
 }
 
 /// 规范化实体批次。
-pub fn entities(inputs: &[EntityInput]) -> Result<Vec<(String, String)>, StorageError> {
+pub fn entities(inputs: &[EntityInput]) -> Result<Vec<(String, String, String)>, StorageError> {
     inputs.iter().map(entity).collect()
 }
 
-/// 规范化关系批次：两端与关系类型均不得为空。
+/// 规范化关系批次：两端与关系类型均不得为空；来源仅去空白（可空）。
 pub fn relations(inputs: &[RelationInput]) -> Result<Vec<RelationKey>, StorageError> {
     inputs
         .iter()
@@ -47,15 +49,16 @@ pub fn relations(inputs: &[RelationInput]) -> Result<Vec<RelationKey>, StorageEr
                 from_name.to_string(),
                 to_name.to_string(),
                 relation_type.to_string(),
+                r.source.trim().to_string(),
             ))
         })
         .collect()
 }
 
-/// 规范化观测批次：实体名与每条内容均不得为空。
+/// 规范化观测批次：实体名与每条内容均不得为空；来源仅去空白（可空）。
 pub fn observations(
     inputs: &[ObservationInput],
-) -> Result<Vec<(String, Vec<String>)>, StorageError> {
+) -> Result<Vec<(String, Vec<String>, String)>, StorageError> {
     inputs
         .iter()
         .map(|o| {
@@ -73,13 +76,14 @@ pub fn observations(
             Ok((
                 entity_name.to_string(),
                 o.contents.iter().map(|c| c.trim().to_string()).collect(),
+                o.source.trim().to_string(),
             ))
         })
         .collect()
 }
 
-/// 关系三元组：(起点, 终点, 关系类型)。
-pub type RelationKey = (String, String, String);
+/// 关系四元组：(起点, 终点, 关系类型, 来源)。
+pub type RelationKey = (String, String, String, String);
 
 /// 宽松规范化实体名列表：去空白、丢弃空项、按首次出现去重。
 ///
@@ -107,11 +111,11 @@ mod tests {
     fn entity_trims_and_defaults_type() {
         assert_eq!(
             entity(&EntityInput::new("  alice  ", " person ")).unwrap(),
-            ("alice".to_string(), "person".to_string())
+            ("alice".to_string(), "person".to_string(), String::new())
         );
         assert_eq!(
             entity(&EntityInput::new("alice", "   ")).unwrap(),
-            ("alice".to_string(), "unknown".to_string())
+            ("alice".to_string(), "unknown".to_string(), String::new())
         );
         assert_eq!(
             entity(&EntityInput::new("  ", "person")),
@@ -134,7 +138,7 @@ mod tests {
     fn relations_require_both_endpoints_and_type() {
         assert_eq!(
             relations(&[RelationInput::new(" a ", " b ", " knows ")]).unwrap(),
-            vec![("a".to_string(), "b".to_string(), "knows".to_string())]
+            vec![("a".to_string(), "b".to_string(), "knows".to_string(), String::new())]
         );
         assert!(relations(&[RelationInput::new("a", "", "knows")]).is_err());
         assert!(relations(&[RelationInput::new("a", "b", "  ")]).is_err());
@@ -144,7 +148,7 @@ mod tests {
     fn observations_reject_blank_content() {
         assert_eq!(
             observations(&[ObservationInput::new("a", vec![" x ".to_string()])]).unwrap(),
-            vec![("a".to_string(), vec!["x".to_string()])]
+            vec![("a".to_string(), vec!["x".to_string()], String::new())]
         );
         assert!(observations(&[ObservationInput::single("a", "   ")]).is_err());
         assert!(observations(&[ObservationInput::new(
@@ -152,6 +156,32 @@ mod tests {
             vec!["ok".to_string(), "".to_string()]
         )])
         .is_err());
+    }
+
+    /// 来源标识只去首尾空白，允许为空（未声明来源是合法状态）。
+    #[test]
+    fn source_is_trimmed_but_optional() {
+        let (name, _, source) =
+            entity(&EntityInput::new("alice", "person").with_source("  workbuddy  ")).unwrap();
+        assert_eq!(name, "alice");
+        assert_eq!(source, "workbuddy");
+
+        let (_, _, source) = entity(&EntityInput::new("alice", "person")).unwrap();
+        assert_eq!(source, "", "未声明来源应落为空串");
+
+        let (from, to, rtype, source) =
+            relations(&[RelationInput::new("a", "b", "knows").with_source(" cursor ")])
+                .unwrap()
+                .remove(0);
+        assert_eq!((from.as_str(), to.as_str(), rtype.as_str()), ("a", "b", "knows"));
+        assert_eq!(source, "cursor");
+
+        let (_, contents, source) =
+            observations(&[ObservationInput::new("a", vec!["x".to_string()]).with_source("w")])
+                .unwrap()
+                .remove(0);
+        assert_eq!(contents, vec!["x".to_string()]);
+        assert_eq!(source, "w");
     }
 
     /// `name_list` 与 `entity` 的去空白规则必须一致，否则「写入后按名回读」会漏命中。
@@ -166,7 +196,7 @@ mod tests {
         ];
         assert_eq!(name_list(&input), vec!["a".to_string(), "b".to_string()]);
 
-        let (canonical, _) = entity(&EntityInput::new("  a  ", "")).unwrap();
+        let (canonical, _, _) = entity(&EntityInput::new("  a  ", "")).unwrap();
         assert_eq!(
             name_list(&["  a  ".to_string()]),
             vec![canonical],

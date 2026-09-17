@@ -32,19 +32,22 @@ use tokio::sync::Mutex;
 /// 项目库建表语句（幂等：全部 IF NOT EXISTS）。
 ///
 /// @intent 不引入迁移框架：项目库结构简单且只增不改，`CREATE ... IF NOT EXISTS`
-///         已足够；`memory_fts.obs_id` 为 UNINDEXED 列，仅用于把检索行映射回观测，
-///         以便删除观测时精确清理索引。
+///         已足够；`source` 列记录写入来源（客户端 / 助手标识，空串 = 未声明），
+///         由 [`ensure_source_columns`] 对旧库轻量补齐。`memory_fts.obs_id` 为
+///         UNINDEXED 列，仅用于把检索行映射回观测，以便删除观测时精确清理索引。
 const MEMORY_SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS entities (\
         name TEXT PRIMARY KEY, \
         entity_type TEXT NOT NULL DEFAULT 'unknown', \
-        created_at INTEGER NOT NULL\
+        created_at INTEGER NOT NULL, \
+        source TEXT NOT NULL DEFAULT ''\
     )",
     "CREATE TABLE IF NOT EXISTS observations (\
         id INTEGER PRIMARY KEY AUTOINCREMENT, \
         entity_name TEXT NOT NULL, \
         content TEXT NOT NULL, \
-        created_at INTEGER NOT NULL\
+        created_at INTEGER NOT NULL, \
+        source TEXT NOT NULL DEFAULT ''\
     )",
     "CREATE INDEX IF NOT EXISTS idx_observations_entity ON observations(entity_name)",
     "CREATE TABLE IF NOT EXISTS relations (\
@@ -52,7 +55,8 @@ const MEMORY_SCHEMA: &[&str] = &[
         from_name TEXT NOT NULL, \
         to_name TEXT NOT NULL, \
         relation_type TEXT NOT NULL, \
-        created_at INTEGER NOT NULL\
+        created_at INTEGER NOT NULL, \
+        source TEXT NOT NULL DEFAULT ''\
     )",
     "CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_name)",
     "CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_name)",
@@ -112,6 +116,35 @@ pub async fn init_memory_db(db: &DatabaseConnection) -> Result<(), StorageError>
     for sql in MEMORY_SCHEMA {
         db.execute(Statement::from_string(DbBackend::Sqlite, *sql))
             .await?;
+    }
+    ensure_source_columns(db).await
+}
+
+/// 旧库轻量迁移：缺 `source` 列的三张表逐个补齐。
+///
+/// @intent 旧版本项目库由不含 `source` 的 schema 建成，`CREATE TABLE IF NOT EXISTS`
+///         不会补列；不加迁移则旧库首次写入带来源的数据会直接报 SQL 错误。
+///         `ALTER TABLE ADD COLUMN ... DEFAULT ''` 让既有行自动落为未声明来源，
+///         与「来源可选」的语义一致；逐表查 `PRAGMA table_info` 保证幂等。
+async fn ensure_source_columns(db: &DatabaseConnection) -> Result<(), StorageError> {
+    for table in ["entities", "observations", "relations"] {
+        let rows = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("PRAGMA table_info({table})"),
+            ))
+            .await?;
+        let has_source = rows
+            .iter()
+            .any(|row| row.try_get::<String>("", "name").map(|n| n == "source") == Ok(true));
+
+        if !has_source {
+            db.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("ALTER TABLE {table} ADD COLUMN source TEXT NOT NULL DEFAULT ''"),
+            ))
+            .await?;
+        }
     }
     Ok(())
 }
@@ -248,6 +281,7 @@ impl SqliteMemoryRepo {
                 entity_name: o.entity_name,
                 content: o.content,
                 created_at: o.created_at,
+                source: o.source,
             });
         }
 
@@ -258,6 +292,7 @@ impl SqliteMemoryRepo {
                 name: e.name,
                 entity_type: e.entity_type,
                 created_at: e.created_at,
+                source: e.source,
             })
             .collect())
     }
@@ -279,10 +314,10 @@ impl SqliteMemoryRepo {
 
     async fn tx_create_entities(
         txn: &DatabaseTransaction,
-        normalized: Vec<(String, String)>,
+        normalized: Vec<(String, String, String)>,
     ) -> Result<(), StorageError> {
         let ts = now();
-        for (name, entity_type) in normalized {
+        for (name, entity_type, source) in normalized {
             let exists = entities::Entity::find()
                 .filter(entities::Column::Name.eq(name.as_str()))
                 .one(txn)
@@ -295,6 +330,7 @@ impl SqliteMemoryRepo {
                 name: Set(name.clone()),
                 entity_type: Set(entity_type.clone()),
                 created_at: Set(ts),
+                source: Set(source),
             })
             .exec(txn)
             .await?;
@@ -310,7 +346,7 @@ impl SqliteMemoryRepo {
         normalized: Vec<normalize::RelationKey>,
     ) -> Result<(), StorageError> {
         let ts = now();
-        for (from_name, to_name, relation_type) in normalized {
+        for (from_name, to_name, relation_type, source) in normalized {
             let exists = relations::Entity::find()
                 .filter(relations::Column::FromName.eq(from_name.as_str()))
                 .filter(relations::Column::ToName.eq(to_name.as_str()))
@@ -326,6 +362,7 @@ impl SqliteMemoryRepo {
                 to_name: Set(to_name),
                 relation_type: Set(relation_type),
                 created_at: Set(ts),
+                source: Set(source),
                 ..Default::default()
             })
             .exec(txn)
@@ -336,9 +373,9 @@ impl SqliteMemoryRepo {
 
     async fn tx_add_observations(
         txn: &DatabaseTransaction,
-        normalized: Vec<(String, Vec<String>)>,
+        normalized: Vec<(String, Vec<String>, String)>,
     ) -> Result<(), StorageError> {
-        for (entity_name, _) in &normalized {
+        for (entity_name, _, _) in &normalized {
             let exists = entities::Entity::find()
                 .filter(entities::Column::Name.eq(entity_name.as_str()))
                 .one(txn)
@@ -350,12 +387,13 @@ impl SqliteMemoryRepo {
         }
 
         let ts = now();
-        for (entity_name, contents) in normalized {
+        for (entity_name, contents, source) in normalized {
             for content in contents {
                 let result = observations::Entity::insert(observations::ActiveModel {
                     entity_name: Set(entity_name.clone()),
                     content: Set(content.clone()),
                     created_at: Set(ts),
+                    source: Set(source.clone()),
                     ..Default::default()
                 })
                 .exec(txn)
@@ -507,6 +545,7 @@ impl MemoryRepository for SqliteMemoryRepo {
                 entity_name: o.entity_name,
                 content: o.content,
                 created_at: o.created_at,
+                source: o.source,
             });
         }
 
@@ -518,6 +557,7 @@ impl MemoryRepository for SqliteMemoryRepo {
                     name: e.name,
                     entity_type: e.entity_type,
                     created_at: e.created_at,
+                    source: e.source,
                 })
                 .collect(),
             relations: relation_rows
@@ -528,6 +568,7 @@ impl MemoryRepository for SqliteMemoryRepo {
                     to_name: r.to_name,
                     relation_type: r.relation_type,
                     created_at: r.created_at,
+                    source: r.source,
                 })
                 .collect(),
         })
@@ -973,6 +1014,60 @@ mod tests {
         init_memory_db(&db).await.unwrap();
         init_memory_db(&db).await.unwrap();
         assert_eq!(backend.kind(), BackendKind::SqliteFile);
+    }
+
+    /// 旧版本项目库（无 `source` 列）打开时必须自动补齐，且写入带来源的数据可回读。
+    ///
+    /// @intent 存量用户的 mem.db 由旧 schema 建成，`CREATE TABLE IF NOT EXISTS` 不会
+    ///         补列；迁移缺失会导致首次写入带 source 的数据直接报 SQL 错误。
+    #[tokio::test]
+    async fn init_memory_db_migrates_legacy_databases_without_source_column() {
+        let dir = temp_data_dir();
+        let path = dir.join("legacy").join("mem.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = Database::connect(format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+
+        // 用 v1.0 旧 schema 手工建库（三张表均无 source 列）
+        for sql in [
+            "CREATE TABLE entities (\
+                name TEXT PRIMARY KEY, \
+                entity_type TEXT NOT NULL DEFAULT 'unknown', \
+                created_at INTEGER NOT NULL)",
+            "CREATE TABLE observations (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                entity_name TEXT NOT NULL, \
+                content TEXT NOT NULL, \
+                created_at INTEGER NOT NULL)",
+            "CREATE TABLE relations (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                from_name TEXT NOT NULL, \
+                to_name TEXT NOT NULL, \
+                relation_type TEXT NOT NULL, \
+                created_at INTEGER NOT NULL)",
+        ] {
+            db.execute(Statement::from_string(DbBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+
+        // 打开旧库：迁移应自动补列
+        init_memory_db(&db).await.unwrap();
+
+        let repo = SqliteMemoryRepo { db };
+        repo.create_entities(vec![EntityInput::new("legacy-e", "note").with_source("workbuddy")])
+            .await
+            .unwrap();
+        repo.add_observations(vec![
+            ObservationInput::new("legacy-e", vec!["带来源的事实".to_string()]).with_source("x"),
+        ])
+        .await
+        .unwrap();
+
+        let graph = repo.read_graph().await.unwrap();
+        assert_eq!(graph.entities[0].source, "workbuddy");
+        assert_eq!(graph.entities[0].observations[0].source, "x");
     }
 
     /// 非法 project_id 必须被拒绝，防止越出 DATA_DIR 写文件。

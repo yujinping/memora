@@ -55,6 +55,7 @@ fn entity_view(e: crate::domain::Entity) -> EntityView {
         name: e.name,
         entity_type: e.entity_type,
         created_at: e.created_at,
+        source: e.source,
         observations: e
             .observations
             .into_iter()
@@ -62,6 +63,7 @@ fn entity_view(e: crate::domain::Entity) -> EntityView {
                 id: o.id,
                 content: o.content,
                 created_at: o.created_at,
+                source: o.source,
             })
             .collect(),
     }
@@ -75,6 +77,7 @@ fn relation_view(r: crate::domain::Relation) -> RelationView {
         to_name: r.to_name,
         relation_type: r.relation_type,
         created_at: r.created_at,
+        source: r.source,
     }
 }
 
@@ -102,7 +105,9 @@ pub async fn create_entities(
     let inputs: Vec<EntityInput> = req
         .entities
         .iter()
-        .map(|e| EntityInput::new(e.name.clone(), e.entity_type.clone()))
+        .map(|e| {
+            EntityInput::new(e.name.clone(), e.entity_type.clone()).with_source(e.source.clone())
+        })
         .collect();
 
     // 先用共享规范化器取「规范名」，再据此回读：写路径与读路径必须用同一套去空白规则，
@@ -110,7 +115,7 @@ pub async fn create_entities(
     let names: Vec<String> = normalize::entities(&inputs)
         .map_err(tool_error)?
         .into_iter()
-        .map(|(name, _)| name)
+        .map(|(name, _, _)| name)
         .collect();
 
     repo.create_entities(inputs).await.map_err(tool_error)?;
@@ -137,6 +142,7 @@ pub async fn create_relations(
                 r.to_name.clone(),
                 r.relation_type.clone(),
             )
+            .with_source(r.source.clone())
         })
         .collect();
 
@@ -158,6 +164,7 @@ pub async fn create_relations(
                 r.from_name.clone(),
                 r.to_name.clone(),
                 r.relation_type.clone(),
+                r.source.clone(),
             ))
         })
         .map(relation_view)
@@ -173,13 +180,16 @@ pub async fn add_observations(
     let inputs: Vec<ObservationInput> = req
         .observations
         .iter()
-        .map(|o| ObservationInput::new(o.entity_name.clone(), o.contents.clone()))
+        .map(|o| {
+            ObservationInput::new(o.entity_name.clone(), o.contents.clone())
+                .with_source(o.source.clone())
+        })
         .collect();
 
     let names: Vec<String> = normalize::observations(&inputs)
         .map_err(tool_error)?
         .into_iter()
-        .map(|(name, _)| name)
+        .map(|(name, _, _)| name)
         .collect();
 
     repo.add_observations(inputs).await.map_err(tool_error)?;
@@ -310,6 +320,7 @@ mod tests {
         EntityParam {
             name: name.to_string(),
             entity_type: ty.to_string(),
+            source: String::new(),
         }
     }
 
@@ -318,6 +329,7 @@ mod tests {
             from_name: from.to_string(),
             to_name: to.to_string(),
             relation_type: ty.to_string(),
+            source: String::new(),
         }
     }
 
@@ -325,6 +337,7 @@ mod tests {
         ObservationParam {
             entity_name: name.to_string(),
             contents: contents.iter().map(|c| c.to_string()).collect(),
+            source: String::new(),
         }
     }
 
@@ -734,18 +747,25 @@ mod tests {
                 name: "alpha".to_string(),
                 entity_type: "person".to_string(),
                 created_at: 1,
+                source: "workbuddy".to_string(),
                 observations: vec![ObservationView {
                     id: 7,
                     content: "备注".to_string(),
                     created_at: 2,
+                    source: "claude-code".to_string(),
                 }],
             }],
         };
         let value = serde_json::to_value(&resp).unwrap();
         assert_eq!(value["entities"][0]["name"], "alpha");
         assert_eq!(value["entities"][0]["entity_type"], "person");
+        assert_eq!(value["entities"][0]["source"], "workbuddy");
         assert_eq!(value["entities"][0]["observations"][0]["id"], 7);
         assert_eq!(value["entities"][0]["observations"][0]["content"], "备注");
+        assert_eq!(
+            value["entities"][0]["observations"][0]["source"],
+            "claude-code"
+        );
 
         let graph = GraphResponse {
             entities: vec![],
@@ -755,12 +775,91 @@ mod tests {
                 to_name: "b".to_string(),
                 relation_type: "knows".to_string(),
                 created_at: 4,
+                source: "cursor".to_string(),
             }],
         };
         let value = serde_json::to_value(&graph).unwrap();
         assert_eq!(value["relations"][0]["from_name"], "a");
         assert_eq!(value["relations"][0]["to_name"], "b");
         assert_eq!(value["relations"][0]["relation_type"], "knows");
+        assert_eq!(value["relations"][0]["source"], "cursor");
+    }
+
+    /// 写侧携带的 `source` 必须穿透工具层落库，并随读路径完整返回。
+    ///
+    /// @intent 「事后按客户端审计」是 P5 前的过渡能力：入参可选、出参必带；
+    ///         未携带来源的写入应落为空串而非编造值。
+    #[tokio::test]
+    async fn source_flows_through_write_tools_and_round_trips() {
+        let repo = repo().await;
+
+        let mut e = entity("src-e", "note");
+        e.source = "workbuddy".to_string();
+        create_entities(
+            &*repo,
+            CreateEntitiesRequest { entities: vec![e] },
+        )
+        .await
+        .unwrap();
+
+        let mut o = observation("src-e", &["来自 claude-code"]);
+        o.source = "claude-code".to_string();
+        add_observations(
+            &*repo,
+            AddObservationsRequest {
+                observations: vec![o, observation("src-e", &["未声明来源"])],
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut r = relation("src-e", "src-e", "self_ref");
+        r.source = "cursor".to_string();
+        create_relations(
+            &*repo,
+            CreateRelationsRequest { relations: vec![r] },
+        )
+        .await
+        .unwrap();
+
+        let graph = read_graph(&*repo).await.unwrap();
+        let e = &graph.entities[0];
+        assert_eq!(e.source, "workbuddy");
+        let obs_with = e
+            .observations
+            .iter()
+            .find(|o| o.content == "来自 claude-code")
+            .unwrap();
+        let obs_without = e
+            .observations
+            .iter()
+            .find(|o| o.content == "未声明来源")
+            .unwrap();
+        assert_eq!(obs_with.source, "claude-code");
+        assert_eq!(obs_without.source, "", "未携带来源应落为空串");
+        assert_eq!(graph.relations[0].source, "cursor");
+    }
+
+    /// 入参省略 `source` 时必须可反序列化为空串（对旧客户端零改造）。
+    #[test]
+    fn omitted_source_deserializes_to_empty_string() {
+        let e: CreateEntitiesRequest = serde_json::from_value(serde_json::json!({
+            "entities": [{ "name": "alpha", "entity_type": "person" }]
+        }))
+        .unwrap();
+        assert_eq!(e.entities[0].source, "");
+
+        let r: CreateRelationsRequest = serde_json::from_value(serde_json::json!({
+            "relations": [{ "from_name": "a", "to_name": "b", "relation_type": "knows" }]
+        }))
+        .unwrap();
+        assert_eq!(r.relations[0].source, "");
+
+        let o: AddObservationsRequest = serde_json::from_value(serde_json::json!({
+            "observations": [{ "entity_name": "alpha", "contents": ["x"] }]
+        }))
+        .unwrap();
+        assert_eq!(o.observations[0].source, "");
     }
 
     /// 官方 camelCase 写法需被容忍，避免照抄旧 schema 的模型调用失败。

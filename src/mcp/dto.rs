@@ -22,6 +22,9 @@ pub struct EntityParam {
     /// 实体类型，如 person / project / concept；省略或留空时落为 `unknown`
     #[serde(default, alias = "entityType")]
     pub entity_type: String,
+    /// 写入来源标识（哪个客户端 / 助手），省略或留空落为空串；仅首次登记生效
+    #[serde(default)]
+    pub source: String,
 }
 
 /// `create_relations` 的元素。
@@ -36,6 +39,9 @@ pub struct RelationParam {
     /// 关系类型，如 works_at / depends_on
     #[serde(alias = "relationType")]
     pub relation_type: String,
+    /// 写入来源标识，省略或留空落为空串；仅首次落库生效（不参与判重）
+    #[serde(default)]
+    pub source: String,
 }
 
 /// `add_observations` 的元素：一次调用为同一实体追加多条事实。
@@ -46,6 +52,9 @@ pub struct ObservationParam {
     pub entity_name: String,
     /// 追加的事实内容列表
     pub contents: Vec<String>,
+    /// 写入来源标识，省略或留空落为空串
+    #[serde(default)]
+    pub source: String,
 }
 
 /// `create_entities` 入参。
@@ -119,6 +128,8 @@ pub struct ObservationView {
     pub content: String,
     /// 创建时间（Unix 秒）
     pub created_at: i64,
+    /// 写入来源标识，空串 = 未声明
+    pub source: String,
 }
 
 /// 实体视图（含其全部观测）。
@@ -130,6 +141,8 @@ pub struct EntityView {
     pub entity_type: String,
     /// 创建时间（Unix 秒）
     pub created_at: i64,
+    /// 登记来源标识，空串 = 未声明
+    pub source: String,
     /// 该实体的观测（按 id 升序）
     pub observations: Vec<ObservationView>,
 }
@@ -147,6 +160,8 @@ pub struct RelationView {
     pub relation_type: String,
     /// 创建时间（Unix 秒）
     pub created_at: i64,
+    /// 写入来源标识，空串 = 未声明
+    pub source: String,
 }
 
 /// 实体集合出参：`create_entities` / `add_observations` / `open_nodes` / `search_nodes` 共用。

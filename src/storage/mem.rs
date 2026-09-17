@@ -22,6 +22,8 @@ struct EntityRecord {
     entity_type: String,
     /// 创建时间（Unix 秒）
     created_at: i64,
+    /// 登记来源标识（首次登记生效），空串表示未声明
+    source: String,
 }
 
 /// 单项目内存状态。
@@ -74,6 +76,7 @@ impl InMemMemoryRepo {
                     name: name.clone(),
                     entity_type: rec.entity_type.clone(),
                     created_at: rec.created_at,
+                    source: rec.source.clone(),
                     observations: store
                         .observations
                         .iter()
@@ -94,10 +97,11 @@ impl MemoryRepository for InMemMemoryRepo {
 
         let ts = now();
         let mut store = self.store.lock().unwrap();
-        for (name, entity_type) in normalized {
+        for (name, entity_type, source) in normalized {
             store.entities.entry(name).or_insert(EntityRecord {
                 entity_type,
                 created_at: ts,
+                source,
             });
         }
         Ok(())
@@ -107,7 +111,7 @@ impl MemoryRepository for InMemMemoryRepo {
         let normalized = normalize::relations(&relations)?;
         let mut store = self.store.lock().unwrap();
         let ts = now();
-        for (from, to, rtype) in normalized {
+        for (from, to, rtype, source) in normalized {
             let exists = store
                 .relations
                 .iter()
@@ -123,6 +127,7 @@ impl MemoryRepository for InMemMemoryRepo {
                 to_name: to,
                 relation_type: rtype,
                 created_at: ts,
+                source,
             });
         }
         Ok(())
@@ -136,14 +141,14 @@ impl MemoryRepository for InMemMemoryRepo {
         let normalized = normalize::observations(&observations)?;
 
         let mut store = self.store.lock().unwrap();
-        for (entity_name, _) in &normalized {
+        for (entity_name, _, _) in &normalized {
             if !store.entities.contains_key(entity_name) {
                 return Err(StorageError::EntityNotFound(entity_name.clone()));
             }
         }
 
         let ts = now();
-        for (entity_name, contents) in normalized {
+        for (entity_name, contents, source) in normalized {
             for content in contents {
                 store.next_observation_id += 1;
                 let id = store.next_observation_id;
@@ -152,6 +157,7 @@ impl MemoryRepository for InMemMemoryRepo {
                     entity_name: entity_name.clone(),
                     content,
                     created_at: ts,
+                    source: source.clone(),
                 });
             }
         }

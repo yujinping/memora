@@ -53,6 +53,9 @@ pub mod memory {
             /// 创建时间（Unix 秒）
             #[sea_orm(column_type = "BigInteger")]
             pub created_at: i64,
+            /// 登记来源标识，空串 = 未声明
+            #[sea_orm(column_type = "Text", default_value = "")]
+            pub source: String,
         }
 
         #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -80,6 +83,9 @@ pub mod memory {
             /// 创建时间（Unix 秒）
             #[sea_orm(column_type = "BigInteger")]
             pub created_at: i64,
+            /// 写入来源标识，空串 = 未声明
+            #[sea_orm(column_type = "Text", default_value = "")]
+            pub source: String,
         }
 
         #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -110,6 +116,9 @@ pub mod memory {
             /// 创建时间（Unix 秒）
             #[sea_orm(column_type = "BigInteger")]
             pub created_at: i64,
+            /// 写入来源标识，空串 = 未声明
+            #[sea_orm(column_type = "Text", default_value = "")]
+            pub source: String,
         }
 
         #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

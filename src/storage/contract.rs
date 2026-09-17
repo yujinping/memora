@@ -28,6 +28,7 @@ pub async fn run_all(repo: &dyn MemoryRepository) {
     phase_10_delete_relations_by_id(repo).await;
     phase_11_delete_entities_cascades(repo).await;
     phase_12_delete_is_idempotent(repo).await;
+    phase_13_sources_persist_and_round_trip(repo).await;
 }
 
 /// 执行后端级契约用例：项目生命周期（取用幂等 / 项目隔离 / 丢弃项目）。
@@ -473,6 +474,75 @@ async fn phase_12_delete_is_idempotent(repo: &dyn MemoryRepository) {
             .iter()
             .all(|r| r.from_name != "c2-bob" && r.to_name != "c2-bob"),
         "删除实体应级联清掉其两端关系，不得只删一半"
+    );
+}
+
+/// `source`（写入来源标识）必须持久化并随读路径完整返回。
+///
+/// @intent 支撑「事后按客户端审计」：写侧三个工具均可携带来源，读侧三个模型必须原样带回；
+///         未携带来源的写入落为空串，不得默认成别的值。
+async fn phase_13_sources_persist_and_round_trip(repo: &dyn MemoryRepository) {
+    repo.create_entities(vec![EntityInput::new("c13-src", "note").with_source("workbuddy")])
+        .await
+        .unwrap();
+    // 同名重复创建不得覆盖首次登记的来源（与 entity_type 同规则）
+    repo.create_entities(vec![EntityInput::new("c13-src", "note").with_source("cursor")])
+        .await
+        .unwrap();
+
+    repo.add_observations(vec![
+        ObservationInput::new("c13-src", vec!["来自 claude-code 的事实".to_string()])
+            .with_source("claude-code"),
+        ObservationInput::new("c13-src", vec!["未声明来源的事实".to_string()]),
+    ])
+    .await
+    .unwrap();
+
+    repo.create_relations(vec![
+        RelationInput::new("c13-src", "c2-alice", "mentions").with_source("cursor"),
+        RelationInput::new("c13-src", "c2-alice", "refs"),
+    ])
+    .await
+    .unwrap();
+
+    let e = open(repo, "c13-src").await;
+    assert_eq!(e.source, "workbuddy", "实体来源应持久化且首次登记优先");
+    let by_content = |needle: &str| {
+        e.observations
+            .iter()
+            .find(|o| o.content.contains(needle))
+            .expect("前置写入的观测应存在")
+            .source
+            .clone()
+    };
+    assert_eq!(by_content("claude-code"), "claude-code", "观测来源应持久化");
+    assert_eq!(by_content("未声明来源"), "", "未携带来源的观测应落为空串");
+
+    let g = graph(repo).await;
+    let rel = |rtype: &str| {
+        g.relations
+            .iter()
+            .find(|r| r.from_name == "c13-src" && r.relation_type == rtype)
+            .expect("前置写入的关系应存在")
+            .source
+            .clone()
+    };
+    assert_eq!(rel("mentions"), "cursor", "关系来源应持久化");
+    assert_eq!(rel("refs"), "", "未携带来源的关系应落为空串");
+
+    // 来源字段不得影响既有语义：重复三元组仍按三元组去重（来源不参与判重）
+    repo.create_relations(vec![RelationInput::new("c13-src", "c2-alice", "refs").with_source("x")])
+        .await
+        .unwrap();
+    assert_eq!(
+        graph(repo)
+            .await
+            .relations
+            .iter()
+            .filter(|r| r.from_name == "c13-src" && r.relation_type == "refs")
+            .count(),
+        1,
+        "重复三元组即使来源不同也应被跳过"
     );
 }
 

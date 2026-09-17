@@ -119,7 +119,8 @@ CREATE TABLE projects (
 CREATE TABLE entities (
   name        TEXT PRIMARY KEY,
   entity_type TEXT NOT NULL DEFAULT 'unknown',
-  created_at  INTEGER NOT NULL
+  created_at  INTEGER NOT NULL,
+  source      TEXT NOT NULL DEFAULT ''   -- 写入来源（客户端/助手标识，'' = 未声明；同名首次登记生效）
 );
 
 -- 观测（实体的属性 / 事实，可多条）
@@ -128,6 +129,7 @@ CREATE TABLE observations (
   entity_name TEXT NOT NULL,
   content     TEXT NOT NULL,
   created_at  INTEGER NOT NULL,
+  source      TEXT NOT NULL DEFAULT '',  -- 写入来源，'' = 未声明
   FOREIGN KEY(entity_name) REFERENCES entities(name)
 );
 
@@ -137,7 +139,8 @@ CREATE TABLE relations (
   from_name     TEXT NOT NULL,
   to_name       TEXT NOT NULL,
   relation_type TEXT NOT NULL,
-  created_at    INTEGER NOT NULL
+  created_at    INTEGER NOT NULL,
+  source        TEXT NOT NULL DEFAULT '' -- 写入来源，'' = 未声明；来源不参与三元组判重
 );
 
 -- 全文检索（FTS5，写入时同步维护，删除时清理）
@@ -194,7 +197,7 @@ CREATE INDEX idx_conv_session ON conversations(session_id, created_at);
 
 **出参约定**
 - `Json<T>` 包装：响应同时给出 `content[0].text`（JSON 字符串）与 `structuredContent`，兼容只看 `content` 的旧客户端与支持结构化输出的新客户端。
-- 实体视图为 `{name, entity_type, created_at, observations[]}`；观测视图为 `{id, content, created_at}`；关系视图为 `{id, from_name, to_name, relation_type, created_at}`。
+- 实体视图为 `{name, entity_type, created_at, source, observations[]}`；观测视图为 `{id, content, created_at, source}`；关系视图为 `{id, from_name, to_name, relation_type, created_at, source}`。`source` 为写入来源标识，空串 = 未声明。
 - **必须回读 id**：`create_relations` / `add_observations` 回读 id 是刻意的——`delete_relations` / `delete_observations` 只接受 id，不回读则调用方拿不到句柄，记忆的「可修订」闭环无法成立。
 - **入参别名**：接受官方 schema 的 camelCase 写法（`entityType` / `relationType` / `entityName` / `from` / `to`），容忍模型照抄旧 schema；别名不进入 JSON Schema，对外只宣传规范字段名。
 

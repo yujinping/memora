@@ -16,15 +16,24 @@ pub struct EntityInput {
     pub name: String,
     /// 实体类型，如 person / project / concept；缺省为 unknown
     pub entity_type: String,
+    /// 写入来源标识（哪个客户端 / 助手），空串表示未声明；仅首次登记生效
+    pub source: String,
 }
 
 impl EntityInput {
-    /// 构造实体输入；`entity_type` 传空串时由存储层落为 `unknown`。
+    /// 构造实体输入；`entity_type` 传空串时由存储层落为 `unknown`（来源未声明）。
     pub fn new(name: impl Into<String>, entity_type: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             entity_type: entity_type.into(),
+            source: String::new(),
         }
+    }
+
+    /// 链式声明来源（`EntityInput::new(..).with_source("workbuddy")`）。
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = source.into();
+        self
     }
 }
 
@@ -37,10 +46,12 @@ pub struct RelationInput {
     pub to_name: String,
     /// 关系类型，如 works_at / depends_on
     pub relation_type: String,
+    /// 写入来源标识，空串表示未声明；仅首次落库生效（来源不参与判重）
+    pub source: String,
 }
 
 impl RelationInput {
-    /// 构造关系输入。
+    /// 构造关系输入（来源未声明）。
     pub fn new(
         from_name: impl Into<String>,
         to_name: impl Into<String>,
@@ -50,7 +61,14 @@ impl RelationInput {
             from_name: from_name.into(),
             to_name: to_name.into(),
             relation_type: relation_type.into(),
+            source: String::new(),
         }
+    }
+
+    /// 链式声明来源。
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = source.into();
+        self
     }
 }
 
@@ -61,15 +79,24 @@ pub struct ObservationInput {
     pub entity_name: String,
     /// 追加的事实内容列表
     pub contents: Vec<String>,
+    /// 写入来源标识，空串表示未声明
+    pub source: String,
 }
 
 impl ObservationInput {
-    /// 构造观测输入。
+    /// 构造观测输入（来源未声明）。
     pub fn new(entity_name: impl Into<String>, contents: Vec<String>) -> Self {
         Self {
             entity_name: entity_name.into(),
             contents,
+            source: String::new(),
         }
+    }
+
+    /// 链式声明来源。
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = source.into();
+        self
     }
 
     /// 便捷构造：单条观测。
@@ -92,6 +119,8 @@ pub struct Observation {
     pub content: String,
     /// 创建时间（Unix 秒）
     pub created_at: i64,
+    /// 写入来源标识，空串表示未声明
+    pub source: String,
 }
 
 /// 实体（含其全部观测）。
@@ -105,6 +134,8 @@ pub struct Entity {
     pub entity_type: String,
     /// 创建时间（Unix 秒）
     pub created_at: i64,
+    /// 登记来源标识，空串表示未声明；同名实体首次登记生效
+    pub source: String,
     /// 该实体的观测列表，按 id 升序
     pub observations: Vec<Observation>,
 }
@@ -122,6 +153,8 @@ pub struct Relation {
     pub relation_type: String,
     /// 创建时间（Unix 秒）
     pub created_at: i64,
+    /// 写入来源标识，空串表示未声明
+    pub source: String,
 }
 
 /// 全图快照：实体（含观测）+ 关系。
