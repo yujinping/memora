@@ -21,12 +21,13 @@ Type=simple
 # 专用非 root 用户。若以普通用户运行，请修改 User/Group 并确保该用户对数据目录有写权限。
 User=memora
 Group=memora
-# CWD 会决定 `.env` 探测的首个候选路径，故显式固定为数据目录。
-# 配置本身经 EnvironmentFile 注入，不依赖 CWD。
+# CWD 不再影响配置解析（默认配置路径是绝对路径），这里固定为数据目录，
+# 让服务产生的相对路径操作都落在数据目录内。
 WorkingDirectory=__DATA_DIR__
-ExecStart=__EXE__ run
-# 前缀 `-` 表示文件缺失不算错误；生产建议把 ADMIN_TOKEN 等放在该文件的 600 权限版本里
-EnvironmentFile=-/etc/memora/memora.env
+ExecStart=__EXE__ run --config __CONFIG__
+# 不需要 EnvironmentFile：运行配置已集中在 __CONFIG__ 这份 TOML 里。
+# 仍可用环境变量做临时覆盖（优先级高于配置文件），例如：
+#   Environment=PORT=6790 RUST_LOG=debug
 # 崩溃/异常退出后自动拉起
 Restart=always
 RestartSec=3

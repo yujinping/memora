@@ -10,6 +10,13 @@
 //!         `status` / `init`）、配置来源显式化、优雅退出。
 //!         `run` 是前台形态（供 systemd / 容器托管），其余子命令构成自守护形态，
 //!         两种部署方式共用同一份二进制。
+//!
+//! @intent P4.3 配置体系整改：单实例 + XDG 绝对默认路径 + TOML。
+//!         原先默认配置取「`CWD/.env` → 可执行文件目录/.env → `DATA_DIR/.env`」
+//!         中首个命中者，而 `CWD` 既是相对路径又排第一，于是「你在跟哪个实例说话」
+//!         取决于你在哪个目录敲命令：`status` 假报「未运行」，`stop` 打印
+//!         「未运行」并返回 0 而进程照旧在跑。改为绝对默认路径后，
+//!         任何目录下的 `memora status` 都指向同一实例。
 
 mod admin;
 mod auth;
@@ -19,9 +26,9 @@ mod daemon;
 mod domain;
 mod entity;
 mod error;
+mod instance;
 mod mcp;
 mod meta;
-mod pidfile;
 mod reply;
 mod routes;
 mod state;
@@ -36,16 +43,16 @@ use anyhow::Result;
 use sea_orm::Database;
 
 use cli::Command;
-use config::Config;
-use pidfile::PidFile;
+use config::{Config, DEFAULT_LOG};
+use instance::InstanceFile;
 use state::AppState;
 use storage::StorageRegistry;
 
 /// 进程入口：解析命令行并按子命令分发。
 ///
-/// @intent 命令解析与配置加载**先于日志初始化**：`RUST_LOG` 可能写在 `.env` 里，
-///         而 `.env` 是在 `Config::load` 中加载的。顺序颠倒会让 `.env` 中的
-///         `RUST_LOG` 永远不生效——P4.2 修正了这一处隐性缺陷。
+/// @intent 命令解析与配置加载**先于日志初始化**：日志级别可能写在配置文件里，
+///         而配置文件是在 `Config::load*` 中读取的。顺序颠倒会让配置文件中的
+///         `log` 永远不生效——P4.2 修正了这一处隐性缺陷。
 fn main() -> ExitCode {
     // Rust 运行时会忽略 SIGPIPE，于是 `memora --help | head -1` 这类用法会在管道
     // 提前关闭时把 `println!` 的 EPIPE 变成 panic 并打印堆栈。恢复 SIGPIPE 的默认
@@ -74,17 +81,32 @@ fn main() -> ExitCode {
             println!("memora {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Command::Init { force } => finish(daemon::init(Path::new("."), force)),
-        command => {
-            let (config, source) = match Config::load(&parsed.overrides, parsed.env_file.as_deref())
-            {
-                Ok(loaded) => loaded,
+        Command::Init { force } => {
+            // `init` 的职责就是生成配置文件，故用容忍缺失的策略：
+            // 否则 `memora init --config ~/.config/memora/config.toml`
+            // 会因为那个文件尚不存在而永远无法创建它。
+            match Config::load_for_init(&parsed.overrides, parsed.config_path.as_deref()) {
+                Ok((config, source)) => {
+                    init_tracing(&config.log);
+                    source.log();
+                    finish(daemon::init(&config, force))
+                }
                 Err(err) => {
                     eprintln!("error: {err:#}");
-                    return ExitCode::from(2);
+                    ExitCode::from(2)
                 }
-            };
-            init_tracing();
+            }
+        }
+        command => {
+            let (config, source) =
+                match Config::load(&parsed.overrides, parsed.config_path.as_deref()) {
+                    Ok(loaded) => loaded,
+                    Err(err) => {
+                        eprintln!("error: {err:#}");
+                        return ExitCode::from(2);
+                    }
+                };
+            init_tracing(&config.log);
 
             finish(match command {
                 // 配置来源只对「启动类」命令有意义：`stop` / `status` 每次执行都打一遍
@@ -109,11 +131,15 @@ fn main() -> ExitCode {
 
 /// 初始化日志。
 ///
-/// @intent 默认 info 级别：启动横幅与后端装配信息是排查部署问题的第一手线索；
-///         同时把 sqlx / sea-orm 压到 warn，避免每条 SQL 都刷日志。
-fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,sqlx=warn,sea_orm=warn"));
+/// @intent 级别来自已解析的配置（`RUST_LOG` > 配置文件的 `log` > 默认值），
+///         故「日志级别改在哪里」只有一个答案。默认 info：启动横幅与后端装配信息
+///         是排查部署问题的第一手线索；同时把 sqlx / sea-orm 压到 warn，
+///         避免每条 SQL 都刷日志。
+fn init_tracing(log: &str) {
+    let filter = tracing_subscriber::EnvFilter::try_new(log).unwrap_or_else(|err| {
+        eprintln!("warning: invalid log filter {log:?} ({err}); falling back to {DEFAULT_LOG:?}");
+        tracing_subscriber::EnvFilter::new(DEFAULT_LOG)
+    });
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
@@ -171,6 +197,7 @@ async fn serve(config: Config) -> Result<()> {
         pid = std::process::id(),
         address = %addr,
         data_dir = %config.data_dir,
+        config_file = %config.config_path.display(),
         "Memora (忆庐) listening on http://{addr}"
     );
 
@@ -178,9 +205,9 @@ async fn serve(config: Config) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // 自守护场景下 PID 文件由 `start` 写入；若确实是本进程的，退出时顺手清掉，
-    // 避免留下需要靠「陈旧 PID 清理」兜底的文件。
-    remove_own_pid_file(&config);
+    // 自守护场景下实例记录由 `start` 写入；若确实是本进程的，退出时顺手清掉，
+    // 避免留下需要靠「陈旧记录清理」兜底的文件。
+    remove_own_instance_file(&config);
     tracing::info!("stopped");
     Ok(())
 }
@@ -192,9 +219,10 @@ async fn serve(config: Config) -> Result<()> {
 fn warn_about_risky_config(config: &Config) {
     if config.admin_token.is_empty() {
         tracing::warn!(
-            "ADMIN_TOKEN is not set: every /api/v1 request will be rejected with 401 \
-             (project creation and statistics are unavailable). Set ADMIN_TOKEN in .env \
-             or the process environment"
+            config_file = %config.config_path.display(),
+            "admin_token is not set: every /api/v1 request will be rejected with 401 \
+             (project creation and statistics are unavailable). Set it in the config file \
+             or via the ADMIN_TOKEN environment variable"
         );
     }
 
@@ -203,7 +231,7 @@ fn warn_about_risky_config(config: &Config) {
     if config.mcp_allowed_hosts.is_empty() {
         tracing::warn!(
             allowed_hosts = ?config.effective_mcp_allowed_hosts(),
-            "MCP_ALLOWED_HOSTS is not set: only loopback Hosts are accepted. \
+            "mcp_allowed_hosts is not set: only loopback Hosts are accepted. \
              Public deployments behind a reverse proxy must add their domain, \
              otherwise MCP requests are rejected with 403"
         );
@@ -215,14 +243,17 @@ fn warn_about_risky_config(config: &Config) {
     }
 }
 
-/// 若 PID 文件记录的是本进程，则删除它。
-fn remove_own_pid_file(config: &Config) {
-    let pid_file = PidFile::new(Path::new(&config.data_dir));
-    if let Ok(Some(pid)) = pid_file.read() {
-        if pid == std::process::id() as i32 {
-            match pid_file.remove() {
-                Ok(()) => tracing::debug!(path = %pid_file.path().display(), "removed pid file"),
-                Err(err) => tracing::warn!(error = %err, "failed to remove pid file"),
+/// 若实例记录里的 pid 是本进程，则删除它。
+fn remove_own_instance_file(config: &Config) {
+    let instance_file = InstanceFile::new(Path::new(&config.data_dir));
+    if let Ok(Some(record)) = instance_file.read() {
+        if record.pid == std::process::id() as i32 {
+            match instance_file.remove() {
+                Ok(()) => tracing::debug!(
+                    path = %instance_file.path().display(),
+                    "removed instance record"
+                ),
+                Err(err) => tracing::warn!(error = %err, "failed to remove the instance record"),
             }
         }
     }

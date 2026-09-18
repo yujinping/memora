@@ -75,7 +75,7 @@
 # 1. 构建（无外部依赖，开箱即用）
 cargo build --release          # 产物：target/release/memora
 
-# 2. 生成配置与部署模板（.env / systemd unit / Caddyfile 片段）
+# 2. 生成配置与部署模板（config.toml / systemd unit / Caddyfile 片段）
 ./target/release/memora init
 
 # 3. 启动（二选一，共用同一个二进制）
@@ -104,17 +104,26 @@ curl -s -X POST localhost:6789/api/v1/projects \
 
 ### 配置
 
-配置优先级为 **命令行选项 > 进程环境变量 > `.env` > 内置默认值**。
+运行配置集中在**一份 TOML 文件**里，默认路径是**绝对路径**，与当前工作目录无关：
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `PORT` | `6789` | 监听端口 |
-| `DATA_DIR` | `./data` | 数据目录（元库 + 各项目库） |
-| `ADMIN_TOKEN` | — | 管理 API 凭据，**生产必须设置且足够随机** |
-| `STORAGE_BACKEND` | `sqlite_file` | 新项目默认后端（既有项目以元库登记值为准） |
-| `MCP_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | MCP Host 白名单（防 DNS 重绑定），**公网部署必须加对外域名** |
-| `RUST_LOG` | `info,sqlx=warn,sea_orm=warn` | 日志级别 |
-| `EMBEDDING_API_KEY` | — | 可选，语义检索（规划中） |
+```
+$XDG_CONFIG_HOME/memora/config.toml   →   $HOME/.config/memora/config.toml   →   ./config.toml
+```
+
+因此**任何目录下**的 `memora status` / `memora stop` 都指向同一个实例，日常操作无需带任何参数；只有「为某个实例单独指定配置」时才需要 `--config /path/to/config.toml`。
+
+配置优先级为 **命令行选项 > 进程环境变量 > 配置文件 > 内置默认值**。
+
+| 键（TOML） | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `port` | `PORT` | `6789` | 监听端口 |
+| `data_dir` | `DATA_DIR` | `$XDG_DATA_HOME/memora`（通常 `~/.local/share/memora`） | 数据目录（元库 + 各项目库） |
+| `admin_token` | `ADMIN_TOKEN` | — | 管理 API 凭据，**生产必须设置且足够随机** |
+| `storage_backend` | `STORAGE_BACKEND` | `sqlite_file` | 新项目默认后端（既有项目以元库登记值为准） |
+| `mcp_allowed_hosts` | `MCP_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | MCP Host 白名单（防 DNS 重绑定），**公网部署必须加对外域名** |
+| `log` | `RUST_LOG` | `info,sqlx=warn,sea_orm=warn` | 日志级别（`RUST_LOG` 优先级更高，便于临时排查） |
+
+> **键名写错会直接报错**，而不是被静默忽略——「改了配置却没生效」这类误诊由此根除。找不到默认配置文件不算错误（走内置默认值），但 `--config` 显式指向一个不存在的文件会硬失败。
 
 ---
 
@@ -124,8 +133,8 @@ curl -s -X POST localhost:6789/api/v1/projects \
 
 > **部署前置（最容易踩的坑）**：MCP 传输层强制校验请求的 `Host`（防 DNS 重绑定），默认只接受回环地址。经 Caddy 反代时反代会透传真实域名，因此公网部署**必须**把域名写进白名单，否则 MCP 请求会被协议层以 `403` 拒绝，而错误信息并不指向这个配置项：
 >
-> ```bash
-> MCP_ALLOWED_HOSTS=mem.example.com,localhost,127.0.0.1
+> ```toml
+> mcp_allowed_hosts = ["mem.example.com", "localhost", "127.0.0.1"]
 > ```
 
 **WorkBuddy**（`~/.workbuddy/mcp.json`）与 **Cursor**（`~/.cursor/mcp.json`）：
@@ -244,15 +253,15 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 main   → cli / daemon / routes
 routes → mcp::server → mcp::tools → storage::repo (trait) / domain
 routes → admin      → storage (trait / 注册表) / meta / domain
-daemon → config / pidfile          （进程管理不触碰存储与路由）
+daemon → config / instance         （进程管理不触碰存储与路由）
 mcp::dto 只被 tools 与 server 使用
 ```
 
 | 层 | 职责 | 关键约束 |
 |---|---|---|
 | `cli.rs` | 子命令与全局选项解析 | 零依赖手写；无子命令等价于 `run`，既有部署零改动 |
-| `daemon.rs` | `start` / `stop` / `restart` / `status` / `init` | 以 `/health` 通过为唯一成功判据；**不依赖存储层** |
-| `pidfile.rs` | PID 文件与进程存活探测 | `kill(pid,0)` 判定，`EPERM` 视为存活；损坏内容报错而非当作「未运行」 |
+| `daemon.rs` | `start` / `stop` / `restart` / `status` / `init` | 以 `/health` 通过为唯一成功判据；`status` / `stop` 以**实例记录**（pid + port + data_dir + 启动时间 + 版本）为准，而非重新推导配置；**不依赖存储层** |
+| `instance.rs` | 实例记录与进程存活探测 | `kill(pid,0)` 判定，`EPERM` 视为存活；损坏内容报错而非当作「未运行」；记录端口可消除「探错端口」误诊 |
 | `mcp/dto.rs` | 9 个工具的入参 / 出参契约（serde + JsonSchema） | 只描述协议，不含逻辑 |
 | `mcp/tools.rs` | 工具语义实现 | **只依赖 `Arc<dyn MemoryRepository>`**，可脱离 MCP 传输层用内存后端快速单测 |
 | `mcp/server.rs` | rmcp 宏装配 + 从请求上下文取仓库 | **唯一允许 `use rmcp` 的地方** |
@@ -279,7 +288,7 @@ mcp::dto 只被 tools 与 server 使用
 - `contract::run_all`——**仓库级** 12 阶段契约：实体 CRUD 幂等、整批非法不落库、观测追加与 `EntityNotFound`、关系去重、检索命中名/类型/内容、CJK 子串、级联删除、幂等删除、跨项目隔离。
 - `contract::run_backend_contract`——**项目生命周期级**契约：取用幂等、项目隔离、丢弃项目、丢弃幂等、非法 id 拒绝。
 
-因此新增一种持久化后端 = **1 个 impl 文件 + 工厂里 1 行注册 + 2 行契约调用**；切换生效后端 = **改 1 个环境变量**。`projects` 表记录每个项目所用的后端，不同项目可以并存不同存储策略。
+因此新增一种持久化后端 = **1 个 impl 文件 + 工厂里 1 行注册 + 2 行契约调用**；切换生效后端 = **改 1 处配置**（`storage_backend`，或等价的 `STORAGE_BACKEND`）。`projects` 表记录每个项目所用的后端，不同项目可以并存不同存储策略。
 
 ---
 
@@ -293,7 +302,7 @@ cargo build --release
 sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
 sudo mkswap /swapfile && sudo swapon /swapfile
 
-# 3. 生成配置与系统模板
+# 3. 生成配置与系统模板（写入 ~/.config/memora/config.toml，权限 600）
 ./target/release/memora init
 ```
 
@@ -337,6 +346,9 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 | **同一项目的连接池必须串行创建** | `PRAGMA journal_mode=WAL` 需要独占锁，且**不受 `busy_timeout` 保护**（SQLite 在独占锁场景遇 BUSY 立即返回以避免死锁）。并发首次访问本会各自建出一个指向同一文件的连接池，其中一方必然 `database is locked`。修复：每项目一把建池闸门 + 双重检查。**这类缺陷在串行验证中永不出现，只有真实并发才暴露** |
 | **不引入 clap** | 选项只有 6 个，而 clap 带来可观编译时间与约 300KB 体积增长，与「2GB 服务器上的单二进制」定位不符 |
 | **Host 白名单必须可配** | rmcp 默认只信回环 Host；不暴露该配置项时，公网经反代的线上表现是费解的 `403` |
+| **配置默认路径必须是绝对路径** | 相对路径 + CWD 探测会让「实例身份」随执行目录漂移：`status` / `stop` 竟要带参数才能找到同一实例。改成 XDG 绝对默认路径后，任何目录下无参数操作都指向同一实例；多实例由 `--config` 显式指定 |
+| **配置文件用 TOML 而非 `.env`** | `.env` 无类型且**未知键静默忽略**（把 `ADMIN_TOKEN` 拼错后服务照常启动、鉴权全 401）。TOML 让键名写错在启动期硬失败，默认路径固定后也不必再记「探测顺序」 |
+| **`status` / `stop` 以实例记录为准** | 记录含 pid + 端口 + 数据目录 + 启动时间 + 版本，故按**记录**探活与终止，而不是按当前配置重新推导——「探错端口」与「配置改过但进程没重启」两类误诊由此根除 |
 
 更多取舍（含每期的验证结果与踩坑记录）见 [`docs/memory-system-design.md`](docs/memory-system-design.md)。
 
@@ -346,9 +358,9 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 
 | 项目 | 现状 |
 |---|---|
-| `cargo test` | **144 项全部通过** |
+| `cargo test` | **168 项全部通过** |
 | `cargo clippy --all-targets` | **零告警** |
-| 测试构成 | 仓库契约（双后端各跑一遍）、后端生命周期契约、MCP 工具语义（脱离协议栈）、路由协议级端到端（`initialize` / `tools/list` / `tools/call`）、CLI 与进程管理（子命令解析、PID 存活探测、退出码语义）、配置来源与优先级、并发写入回归、鉴权与隔离 |
+| 测试构成 | 仓库契约（双后端各跑一遍）、后端生命周期契约、MCP 工具语义（脱离协议栈）、路由协议级端到端（`initialize` / `tools/list` / `tools/call`）、CLI 与进程管理（子命令解析、实例记录与存活探测、退出码语义）、配置来源与优先级（TOML 解析、XDG 默认路径解析、`--config` 硬失败）、并发写入回归、鉴权与隔离 |
 | 并发验证 | 4 项目 × 40 次工具调用（每项目 8 并发）：**零失败**、统计与写入一致、跨项目零泄漏 |
 | 开发方式 | 全程 TDD：先写测试并观察其失败，再写实现 |
 
@@ -365,6 +377,7 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 | P3 | MCP 工具层接入（rmcp，9 个工具） | ✅ |
 | P4.1 | REST 管理面：项目增删 + 用量统计 | ✅ |
 | P4.2 | 运行形态：自守护 CLI + 配置显式化 + systemd / Caddy + 优雅退出 | ✅ |
+| P4.3 | 配置单实例化：TOML + XDG 绝对路径 + 实例记录（`status` / `stop` 无需带参数） | ✅ |
 | P5 | 会话表与跨机器会话恢复（`log_turn` / `get_session` / `list_sessions`） | 🔜 |
 | 后续 | 远程 embedding 语义检索、记忆版本与回滚、Web 看板、导入导出 | 💡 |
 
@@ -377,8 +390,8 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 | 文档 | 内容 |
 |---|---|
 | [`docs/memory-system-design.md`](docs/memory-system-design.md) | 完整技术设计蓝图：数据模型、接口契约、鉴权与多租户、检索策略、部署方案、分期计划与全部实现取舍 |
-| [`deploy/`](deploy) | systemd unit、Caddyfile 片段、环境变量模板（由 `memora init` 渲染） |
-| [`.env.example`](.env.example) | 全量配置项与注释 |
+| [`deploy/`](deploy) | systemd unit、Caddyfile 片段、`config.toml` 模板（由 `memora init` 渲染） |
+| [`deploy/config.toml.template`](deploy/config.toml.template) | 全量配置项与注释（键名、默认值、优先级、权限说明） |
 
 ---
 

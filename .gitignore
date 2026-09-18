@@ -1,5 +1,8 @@
 /target
 /data
+# 本地运行配置（含 admin_token，不应入库）；部署模板见 deploy/config.toml.template
+config.toml
+# 旧版 `.env` 配置已被 config.toml 取代，保留忽略规则以防历史文件被误提交
 .env
 *.db
 *.db-shm

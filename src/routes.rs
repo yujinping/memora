@@ -124,7 +124,7 @@ mod tests {
             .unwrap();
         }
 
-        let config = Config::for_test(0, data_dir.to_string_lossy(), "admin", "sqlite_file");
+        let config = Config::for_test(0, &data_dir.to_string_lossy(), "admin", "sqlite_file");
         let state = AppState {
             meta: db,
             storage: Arc::new(StorageRegistry::from_config(&config).unwrap()),
@@ -168,7 +168,11 @@ mod tests {
     }
 
     /// 以合法 Host 发起一次 MCP JSON-RPC 调用。
-    async fn rpc(app: Router, token: Option<&str>, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    async fn rpc(
+        app: Router,
+        token: Option<&str>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         mcp_send(app, token, "localhost", Some(body)).await
     }
 
@@ -192,7 +196,11 @@ mod tests {
         body["result"]["structuredContent"].clone()
     }
 
-    async fn get_with_token(app: Router, uri: &str, token: Option<&str>) -> (StatusCode, serde_json::Value) {
+    async fn get_with_token(
+        app: Router,
+        uri: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
         let mut builder = Request::builder().uri(uri);
         if let Some(token) = token {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -209,7 +217,12 @@ mod tests {
     async fn health_is_public_and_ok() {
         let (app, _dir) = setup().await;
         let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -219,7 +232,13 @@ mod tests {
     #[tokio::test]
     async fn mcp_without_token_is_401() {
         let (app, _dir) = setup().await;
-        let (status, _) = mcp_send(app, None, "localhost", Some(request(1, "tools/list", serde_json::json!({})))).await;
+        let (status, _) = mcp_send(
+            app,
+            None,
+            "localhost",
+            Some(request(1, "tools/list", serde_json::json!({}))),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -243,7 +262,12 @@ mod tests {
     #[tokio::test]
     async fn mcp_with_invalid_token_is_401() {
         let (app, _dir) = setup().await;
-        let (status, _) = rpc(app, Some("wrong"), request(1, "tools/list", serde_json::json!({}))).await;
+        let (status, _) = rpc(
+            app,
+            Some("wrong"),
+            request(1, "tools/list", serde_json::json!({})),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -300,14 +324,22 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "响应体：{body}");
         assert_eq!(body["result"]["serverInfo"]["name"], "memora");
-        assert_eq!(body["result"]["capabilities"]["tools"], serde_json::json!({}));
+        assert_eq!(
+            body["result"]["capabilities"]["tools"],
+            serde_json::json!({})
+        );
     }
 
     /// `tools/list` 暴露的工具必须与文档承诺的 9 个一致。
     #[tokio::test]
     async fn mcp_tools_list_exposes_the_nine_tools() {
         let (app, _dir) = setup().await;
-        let (status, body) = rpc(app, Some("secret"), request(2, "tools/list", serde_json::json!({}))).await;
+        let (status, body) = rpc(
+            app,
+            Some("secret"),
+            request(2, "tools/list", serde_json::json!({})),
+        )
+        .await;
 
         assert_eq!(status, StatusCode::OK, "响应体：{body}");
         let mut names: Vec<String> = body["result"]["tools"]
@@ -319,7 +351,10 @@ mod tests {
         assert_eq!(names.len(), 9, "响应体：{body}");
         names.sort();
 
-        let mut expected: Vec<String> = mcp::tools::TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        let mut expected: Vec<String> = mcp::tools::TOOL_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         expected.sort();
         assert_eq!(names, expected);
     }
@@ -375,7 +410,12 @@ mod tests {
             .unwrap_or_else(|| panic!("关系未回读 id：{relations}"));
         assert!(relation_id > 0);
 
-        let (_, graph) = rpc(app, Some("secret"), tool_call(5, "read_graph", serde_json::json!({}))).await;
+        let (_, graph) = rpc(
+            app,
+            Some("secret"),
+            tool_call(5, "read_graph", serde_json::json!({})),
+        )
+        .await;
         let graph = structured(&graph);
         assert_eq!(graph["entities"].as_array().unwrap().len(), 2);
         assert_eq!(graph["relations"].as_array().unwrap().len(), 1);
@@ -389,7 +429,11 @@ mod tests {
         rpc(
             app.clone(),
             Some("secret"),
-            tool_call(1, "create_entities", serde_json::json!({ "entities": [{ "name": "alpha" }] })),
+            tool_call(
+                1,
+                "create_entities",
+                serde_json::json!({ "entities": [{ "name": "alpha" }] }),
+            ),
         )
         .await;
 
@@ -404,10 +448,13 @@ mod tests {
         )
         .await;
         let obs = &structured(&added)["entities"][0]["observations"][0];
-        let obs_id = obs["id"].as_i64().unwrap_or_else(|| panic!("未回读观测 id：{added}"));
+        let obs_id = obs["id"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("未回读观测 id：{added}"));
         assert_eq!(obs["content"], "偏好深色主题");
         assert_eq!(
-            structured(&added)["entities"][0]["entity_type"], "unknown",
+            structured(&added)["entities"][0]["entity_type"],
+            "unknown",
             "省略 entity_type 时应规范化为 unknown"
         );
 
@@ -422,7 +469,11 @@ mod tests {
         let (_, deleted) = rpc(
             app,
             Some("secret"),
-            tool_call(4, "delete_observations", serde_json::json!({ "ids": [obs_id] })),
+            tool_call(
+                4,
+                "delete_observations",
+                serde_json::json!({ "ids": [obs_id] }),
+            ),
         )
         .await;
         assert_eq!(structured(&deleted)["ids"][0], obs_id);
@@ -471,7 +522,12 @@ mod tests {
             .await
             .unwrap();
 
-        let (status, body) = rpc(app, Some("secret"), tool_call(1, "read_graph", serde_json::json!({}))).await;
+        let (status, body) = rpc(
+            app,
+            Some("secret"),
+            tool_call(1, "read_graph", serde_json::json!({})),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "响应体：{body}");
         let graph = structured(&body);
         assert_eq!(graph["entities"].as_array().unwrap().len(), 2);
@@ -493,12 +549,25 @@ mod tests {
             .await
             .unwrap();
 
-        let (_, demo) = rpc(app.clone(), Some("secret"), tool_call(1, "read_graph", serde_json::json!({}))).await;
-        let (_, other) = rpc(app, Some("mem-token"), tool_call(2, "read_graph", serde_json::json!({}))).await;
+        let (_, demo) = rpc(
+            app.clone(),
+            Some("secret"),
+            tool_call(1, "read_graph", serde_json::json!({})),
+        )
+        .await;
+        let (_, other) = rpc(
+            app,
+            Some("mem-token"),
+            tool_call(2, "read_graph", serde_json::json!({})),
+        )
+        .await;
 
         assert_eq!(structured(&demo)["entities"].as_array().unwrap().len(), 1);
         assert!(
-            structured(&other)["entities"].as_array().unwrap().is_empty(),
+            structured(&other)["entities"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
             "另一项目不得看到 demo 的数据"
         );
     }
@@ -614,10 +683,7 @@ mod tests {
 
         // 明文 token 绝不落库：库内只应有 SHA-256 摘要
         let raw = meta_db_bytes(&dir);
-        assert!(
-            !raw.is_empty(),
-            "前置：元库应已写入（否则本断言是空断言）"
-        );
+        assert!(!raw.is_empty(), "前置：元库应已写入（否则本断言是空断言）");
         assert!(
             !contains_bytes(&raw, token.as_bytes()),
             "明文 token 不得出现在元库任何文件中"
@@ -649,7 +715,8 @@ mod tests {
         assert_eq!(body["project_id"], "custom");
         assert_eq!(body["backend"], "in_mem");
 
-        let (status, body) = get_with_token(app, "/api/v1/projects/custom/stats", Some("admin")).await;
+        let (status, body) =
+            get_with_token(app, "/api/v1/projects/custom/stats", Some("admin")).await;
         assert_eq!(status, StatusCode::OK, "响应体：{body}");
         assert_eq!(body["backend"], "in_mem");
     }
@@ -748,16 +815,27 @@ mod tests {
         let file = dir.join("doomed").join("mem.db");
         assert!(file.exists(), "前置：项目库应已落盘");
 
-        let (status, body) = delete_with_token(app.clone(), "/api/v1/projects/doomed", Some("admin")).await;
+        let (status, body) =
+            delete_with_token(app.clone(), "/api/v1/projects/doomed", Some("admin")).await;
         assert_eq!(status, StatusCode::OK, "响应体：{body}");
         assert_eq!(body["data_removed"], true);
 
-        let (status, _) = rpc(app.clone(), Some(&token), request(1, "tools/list", serde_json::json!({}))).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "注销后原 token 必须立即失效");
+        let (status, _) = rpc(
+            app.clone(),
+            Some(&token),
+            request(1, "tools/list", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "注销后原 token 必须立即失效"
+        );
         assert!(!file.exists(), "项目库文件必须被删除");
         assert!(!dir.join("doomed").exists(), "项目目录必须被删除");
 
-        let (status, _) = delete_with_token(app.clone(), "/api/v1/projects/doomed", Some("admin")).await;
+        let (status, _) =
+            delete_with_token(app.clone(), "/api/v1/projects/doomed", Some("admin")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "重复注销应报 404");
 
         let (status, _) = get_with_token(app, "/api/v1/projects/doomed/stats", Some("admin")).await;
@@ -818,7 +896,9 @@ mod tests {
             .unwrap();
         repos
             .memory
-            .create_relations(vec![crate::domain::RelationInput::new("s-a", "s-b", "knows")])
+            .create_relations(vec![crate::domain::RelationInput::new(
+                "s-a", "s-b", "knows",
+            )])
             .await
             .unwrap();
         repos
@@ -831,7 +911,8 @@ mod tests {
             .unwrap();
         drop(repos);
 
-        let (status, body) = get_with_token(app, "/api/v1/projects/stats-proj/stats", Some("admin")).await;
+        let (status, body) =
+            get_with_token(app, "/api/v1/projects/stats-proj/stats", Some("admin")).await;
         assert_eq!(status, StatusCode::OK, "响应体：{body}");
         assert_eq!(body["project_id"], "stats-proj");
         assert_eq!(body["backend"], "sqlite_file");
@@ -844,7 +925,8 @@ mod tests {
     #[tokio::test]
     async fn admin_stats_missing_project_is_404() {
         let (app, _dir) = setup().await;
-        let (status, body) = get_with_token(app, "/api/v1/projects/ghost/stats", Some("admin")).await;
+        let (status, body) =
+            get_with_token(app, "/api/v1/projects/ghost/stats", Some("admin")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "响应体：{body}");
     }
 

@@ -11,7 +11,9 @@ axum = "0.8"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
-dotenvy = "0.15"
+# TOML 配置解析。取代 dotenvy：`.env` 无类型、无嵌套、且未知键静默忽略，
+# 正是「改了配置却没生效」的温床；TOML 可借 serde 拒绝未知键。
+toml = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

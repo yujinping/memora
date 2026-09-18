@@ -26,9 +26,9 @@ pub enum Command {
     Restart,
     /// 查看运行状态；未运行时退出码为 3
     Status,
-    /// 生成 `.env` 与部署模板
+    /// 生成配置文件与部署模板
     Init {
-        /// 已存在 `.env` 时是否覆盖
+        /// 已存在配置文件时是否覆盖
         force: bool,
     },
     /// 打印用法
@@ -40,7 +40,7 @@ pub enum Command {
 /// flag 层覆盖项（配置的四层优先级中最高的一层）。
 ///
 /// @intent 字段与 [`crate::config::Config`] 一一对应，但全部为 `Option`：
-///         `None` 表示「本层未表态」，交由下层（进程环境变量 / `.env` / 内置默认值）决定。
+///         `None` 表示「本层未表态」，交由下层（进程环境变量 / 配置文件 / 内置默认值）决定。
 ///         这样「覆盖」与「未指定」在类型上即不可混淆，无需哨兵字符串。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Overrides {
@@ -63,8 +63,8 @@ pub struct Cli {
     pub command: Command,
     /// flag 层覆盖项
     pub overrides: Overrides,
-    /// `--env-file` 显式指定的配置文件；`None` 表示按探测顺序自动查找
-    pub env_file: Option<PathBuf>,
+    /// `--config` 显式指定的配置文件路径；`None` 表示使用 XDG 默认绝对路径
+    pub config_path: Option<PathBuf>,
 }
 
 /// 解析错误。
@@ -101,13 +101,18 @@ impl fmt::Display for CliError {
                 f,
                 "unknown command `{name}`; expected one of: run, start, stop, restart, status, init"
             ),
-            CliError::UnknownFlag(flag) => write!(f, "unknown option `{flag}`; see `memora --help`"),
+            CliError::UnknownFlag(flag) => {
+                write!(f, "unknown option `{flag}`; see `memora --help`")
+            }
             CliError::MissingValue(flag) => write!(f, "option `{flag}` requires a value"),
             CliError::InvalidValue {
                 flag,
                 value,
                 expected,
-            } => write!(f, "invalid value `{value}` for `{flag}`: expected {expected}"),
+            } => write!(
+                f,
+                "invalid value `{value}` for `{flag}`: expected {expected}"
+            ),
             CliError::UnexpectedArgument(arg) => {
                 write!(f, "unexpected argument `{arg}`; see `memora --help`")
             }
@@ -125,11 +130,11 @@ pub fn usage() -> String {
          \n\
          用法：\n\
          \x20 memora [run] [选项]           前台运行（默认；供 systemd / 容器托管）\n\
-         \x20 memora start [选项]           后台启动（自守护，写入 PID 文件）\n\
-         \x20 memora stop                  停止后台进程\n\
-         \x20 memora restart               重启后台进程\n\
-         \x20 memora status                查看运行状态（未运行退出码 3）\n\
-         \x20 memora init [--force]        生成 .env 与部署模板\n\
+         \x20 memora start [选项]           后台启动（自守护，写入实例记录）\n\
+         \x20 memora stop [选项]            停止后台进程\n\
+         \x20 memora restart [选项]         重启后台进程\n\
+         \x20 memora status [选项]          查看运行状态（未运行退出码 3）\n\
+         \x20 memora init [--force]        生成 config.toml 与部署模板\n\
          \n\
          选项：\n\
          \x20 -p, --port <PORT>            监听端口\n\
@@ -137,11 +142,13 @@ pub fn usage() -> String {
          \x20     --admin-token <TOKEN>    管理员令牌（/api/v1 鉴权）\n\
          \x20     --storage-backend <NAME> 新项目默认存储后端\n\
          \x20     --mcp-allowed-hosts <CSV> MCP 允许的 Host 白名单（逗号分隔）\n\
-         \x20     --env-file <PATH>        指定 .env 路径（默认自动探测）\n\
+         \x20     --config <PATH>          指定配置文件（默认 $XDG_CONFIG_HOME/memora/config.toml）\n\
          \x20 -h, --help                   显示本帮助\n\
          \x20 -V, --version                显示版本\n\
          \n\
-         配置优先级：命令行选项 > 进程环境变量 > .env > 内置默认值\n",
+         配置优先级：命令行选项 > 进程环境变量 > 配置文件 > 内置默认值\n\
+         默认路径是绝对路径，与当前目录无关：任何目录下的 `memora status` 都指向同一实例，\n\
+         故日常操作无需带参数。为某个实例单独指定配置时才需要 `--config`。\n",
         version = env!("CARGO_PKG_VERSION")
     )
 }
@@ -165,19 +172,19 @@ where
         return Ok(Cli {
             command: Command::Help,
             overrides: Overrides::default(),
-            env_file: None,
+            config_path: None,
         });
     }
     if argv.iter().any(|a| a == "-V" || a == "--version") {
         return Ok(Cli {
             command: Command::Version,
             overrides: Overrides::default(),
-            env_file: None,
+            config_path: None,
         });
     }
 
     let mut overrides = Overrides::default();
-    let mut env_file: Option<PathBuf> = None;
+    let mut config_path: Option<PathBuf> = None;
     let mut command: Option<Command> = None;
     let mut force = false;
 
@@ -215,9 +222,9 @@ where
                     let value = value_of(inline, &mut it, "--mcp-allowed-hosts")?;
                     overrides.mcp_allowed_hosts = Some(value);
                 }
-                "env-file" => {
-                    let value = value_of(inline, &mut it, "--env-file")?;
-                    env_file = Some(PathBuf::from(value));
+                "config" => {
+                    let value = value_of(inline, &mut it, "--config")?;
+                    config_path = Some(PathBuf::from(value));
                 }
                 "force" => force = true,
                 other => return Err(CliError::UnknownFlag(format!("--{other}"))),
@@ -254,7 +261,7 @@ where
     Ok(Cli {
         command,
         overrides,
-        env_file,
+        config_path,
     })
 }
 
@@ -323,7 +330,7 @@ mod tests {
         let cli = parse_args(&[]).unwrap();
         assert_eq!(cli.command, Command::Run);
         assert_eq!(cli.overrides, Overrides::default());
-        assert_eq!(cli.env_file, None);
+        assert_eq!(cli.config_path, None);
     }
 
     /// 向后兼容：既有部署方式 `PORT=6790 ./memora` 不带子命令，等价于 `run`。
@@ -355,10 +362,27 @@ mod tests {
 
     #[test]
     fn subcommand_accepts_options_after_it() {
-        let cli = parse_args(&["start", "--port=6791", "--env-file", "/etc/memora.env"]).unwrap();
+        let cli = parse_args(&["start", "--port=6791", "--config", "/etc/memora.toml"]).unwrap();
         assert_eq!(cli.command, Command::Start);
         assert_eq!(cli.overrides.port, Some(6791));
-        assert_eq!(cli.env_file, Some(PathBuf::from("/etc/memora.env")));
+        assert_eq!(cli.config_path, Some(PathBuf::from("/etc/memora.toml")));
+    }
+
+    /// `--config` 可写作内联形式，与 `--port=6791` 保持一致。
+    #[test]
+    fn config_accepts_inline_value() {
+        let cli = parse_args(&["status", "--config=/tmp/a.toml"]).unwrap();
+        assert_eq!(cli.config_path, Some(PathBuf::from("/tmp/a.toml")));
+    }
+
+    /// 旧开关已被移除，不得留下「两套心智长期并存」的残留：
+    /// 写成 `--env-file` 必须直接报未知选项，而不是被默默忽略。
+    #[test]
+    fn env_file_is_no_longer_accepted() {
+        assert_eq!(
+            parse_args(&["start", "--env-file", "/etc/memora.env"]).unwrap_err(),
+            CliError::UnknownFlag("--env-file".to_string())
+        );
     }
 
     #[test]
@@ -414,7 +438,10 @@ mod tests {
 
     #[test]
     fn help_and_version_win_from_any_position() {
-        assert_eq!(parse_args(&["start", "--help"]).unwrap().command, Command::Help);
+        assert_eq!(
+            parse_args(&["start", "--help"]).unwrap().command,
+            Command::Help
+        );
         assert_eq!(parse_args(&["--help"]).unwrap().command, Command::Help);
         assert_eq!(parse_args(&["-h"]).unwrap().command, Command::Help);
         assert_eq!(
@@ -431,8 +458,23 @@ mod tests {
             assert!(text.contains(name), "帮助文本缺少子命令 {name}");
         }
         assert!(
-            text.contains("命令行选项 > 进程环境变量 > .env > 内置默认值"),
+            text.contains("命令行选项 > 进程环境变量 > 配置文件 > 内置默认值"),
             "帮助文本必须写明配置优先级"
+        );
+    }
+
+    /// 用户要的是「不带参数也能问到同一个实例」，故默认配置路径必须写进帮助文本。
+    #[test]
+    fn help_text_documents_the_default_config_path_and_config_flag() {
+        let text = usage();
+        assert!(text.contains("--config"), "帮助文本必须写明 --config");
+        assert!(
+            text.contains("$XDG_CONFIG_HOME/memora/config.toml"),
+            "帮助文本必须写明默认配置路径"
+        );
+        assert!(
+            !text.contains("--env-file"),
+            "已移除的开关不得残留在帮助文本中"
         );
     }
 
@@ -454,7 +496,10 @@ mod tests {
             parse_args(&["start", "--force"]).unwrap_err(),
             CliError::ForceRequiresInit
         );
-        assert_eq!(parse_args(&["--force"]).unwrap_err(), CliError::ForceRequiresInit);
+        assert_eq!(
+            parse_args(&["--force"]).unwrap_err(),
+            CliError::ForceRequiresInit
+        );
     }
 
     #[test]

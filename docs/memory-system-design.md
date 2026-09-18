@@ -65,7 +65,7 @@
 | Web / MCP 框架 | Axum | 异步、生态成熟、dashboard 已在用 |
 | ORM | sea-orm | tb-console 已用；类型安全 + 迁移管理 |
 | 存储 | SQLite（每项目一文件） | 零运维、单文件即备份、硬隔离 |
-| 配置 | dotenvy | dashboard 已用，PORT 等变量一致 |
+| 配置 | TOML（`toml` crate） | 单文件且未知键硬失败；默认路径为 XDG 绝对路径，与 CWD 无关 |
 | 传输 | MCP Streamable HTTP | 当前 MCP 主流，取代旧 SSE |
 | 反代 / TLS | Caddy | 自动证书，命令行环境最省心 |
 | 测试 | tokio::test + reqwest + rstest | 契合 TDD 习惯 |
@@ -315,38 +315,40 @@ MCP_ALLOWED_HOSTS=mem.example.com,localhost,127.0.0.1
 
 | 子命令 | 行为 | 退出码 |
 |---|---|---|
-| `run` | 前台运行；收到 SIGTERM / SIGINT 后优雅退出（在途请求收尾、WAL 落盘、清理自身 PID 文件） | 0 |
-| `start` | 后台启动：`setsid` 脱离控制终端、日志追加到 `DATA_DIR/memora.log`、写 PID 文件，**`/health` 通过才返回 0** | 0 / 1 |
-| `stop` | SIGTERM 等待至多 10s，超时升级 SIGKILL；未运行时幂等成功 | 0 |
+| `run` | 前台运行；收到 SIGTERM / SIGINT 后优雅退出（在途请求收尾、WAL 落盘、清理自身实例记录） | 0 |
+| `start` | 后台启动：`setsid` 脱离控制终端、日志追加到 `<data_dir>/memora.log`、写实例记录，**`/health` 通过才返回 0** | 0 / 1 |
+| `stop` | 按**实例记录**中的 pid 发 SIGTERM，等待至多 10s，超时升级 SIGKILL；未运行时幂等成功 | 0 |
 | `restart` | 等价于 `stop` + `start`，未运行时可直接拉起 | 0 / 1 |
-| `status` | 打印 pid / 端口 / 健康状态 / 数据目录 / 日志路径 | 0 健康 · 1 存活但不健康 · **3 未运行** |
-| `init [--force]` | 生成 `.env` 与 systemd / Caddy 模板（模板经 `include_str!` 内嵌二进制，`init` 不依赖部署目录） | 0 |
+| `status` | 打印 pid / 端口 / 健康状态 / 数据目录 / 日志路径；端口以**实例记录**为准（与配置不一致时另加提示） | 0 健康 · 1 存活但不健康 · **3 未运行** |
+| `init [--force]` | 按**已解析的配置**生成 `config.toml`（权限 600）与 systemd / Caddy 模板（模板经 `include_str!` 内嵌二进制，`init` 不依赖部署目录） | 0 |
 | `-h/--help`、`-V/--version` | 用法与版本 | 0 |
 
 **无子命令时等价于 `run`**，因此既有部署方式（`PORT=... ./memora`）零改动。未知子命令 / 选项返回 2。
 
-PID 文件与日志都锚定在 `DATA_DIR` 下（`memora.pid` / `memora.log`），使控制面与数据同生命周期——迁移或备份数据目录时不会留下指向旧机器的 PID 文件。
+实例记录与日志都锚定在 `data_dir` 下（`memora.pid` / `memora.log`），使控制面与数据同生命周期——迁移或备份数据目录时不会留下指向旧机器的记录文件。
 
 ### 8.2 配置来源与优先级
 
 四层叠加，高者胜：
 
-1. **命令行选项** —— `--port` / `--data-dir` / `--admin-token` / `--storage-backend` / `--mcp-allowed-hosts` / `--env-file`
-2. **进程环境变量** —— systemd `EnvironmentFile=` 注入
-3. **`.env` 文件**
+1. **命令行选项** —— `--config`（唯一指路开关）+ `--port` / `--data-dir` / `--admin-token` / `--storage-backend` / `--mcp-allowed-hosts`（临时覆盖）
+2. **进程环境变量** —— `PORT` / `DATA_DIR` / `ADMIN_TOKEN` / `STORAGE_BACKEND` / `MCP_ALLOWED_HOSTS` / `RUST_LOG`
+3. **配置文件（TOML）**
 4. **内置默认值**
 
-`.env` 探测顺序：`CWD/.env` → **可执行文件所在目录/.env** → `DATA_DIR/.env`，取首个存在者；启动日志会打印实际命中的路径，未命中时列出**全部**探测过的路径。`--env-file` 为显式指定：文件缺失或语法错误一律硬失败。同理 `PORT` 取值非法（`abc` / `0` / `70000`）直接报错退出，**不静默回退默认值**。
+配置文件路径**默认是绝对路径**：`$XDG_CONFIG_HOME/memora/config.toml` → `$HOME/.config/memora/config.toml` → `./config.toml`（仅前两者皆无时）。因此**与 CWD 无关**，任何目录下的 `memora status` / `memora stop` 都指向同一实例——这正是「日常操作无需带参数」的前提；多实例由 `--config <path>` 显式指定。
 
-> 为什么仍推荐 systemd 注入？不是「环境变量优于 `.env`」，而是**位置确定性**：`.env` 的查找依赖 CWD，而 systemd 下 CWD 由 `WorkingDirectory=` 决定，不等于二进制所在目录；`EnvironmentFile=` 不依赖 CWD。两者并不冲突——`dotenvy` 不覆盖已存在的进程环境变量，故可同时使用。
+键名必须与 schema 严格一致：**未知键直接报错**而非静默忽略。默认路径的文件不存在不算错误（走内置默认值），但 `--config` 指向的文件不存在会硬失败。取值非法（`port = 0` / `abc` / `70000`）同样直接报错退出，**不静默回退默认值**。
+
+> 为什么弃用 `.env`？两个真实痛点：**查找依赖 CWD**（「改了却没生效」最常见的成因）与**未知键静默忽略**（把 `ADMIN_TOKEN` 拼错后服务照常启动、鉴权全 401）。TOML 把「配置在哪」固定为绝对路径、把「键名写错」变成启动期硬失败，两者都不再依赖人记住约定。systemd 侧也因而不需要 `EnvironmentFile=`：配置集中在 unit 里 `--config` 指向的那份文件，环境变量只用于临时覆盖。
 
 ### 8.3 部署步骤
 
 1. `cargo build --release` 产单二进制（约 13MB，可选 musl 静态链接）。
 2. 建 **2GB swap** 文件作为安全垫。
-3. `memora init` 生成 `.env` 与部署模板；至少设置 `ADMIN_TOKEN`（`openssl rand -hex 32`），并把 `.env` 权限收紧为 `600`。
-4. `memora start`；或安装 systemd unit（`init` 的输出即一份可直接使用的 unit，环境变量含 `PORT`、`DATA_DIR`、`ADMIN_TOKEN`、`STORAGE_BACKEND`、`MCP_ALLOWED_HOSTS`）。
-5. **Caddy** 反代 `/mcp`、`/api/v1`、`/health`，其余路径一律 404（`init` 输出的 Caddyfile 已按此写好），自动 Let's Encrypt 证书。**`MCP_ALLOWED_HOSTS` 必须包含对外域名**，否则反代后的 MCP 请求会被协议层以 403 拒绝（见 §5.3）。
+3. `memora init` 生成 `config.toml`（默认 `~/.config/memora/config.toml`，权限 600）与部署模板；至少把 `admin_token` 换成足够随机的值（`openssl rand -hex 32`）。
+4. `memora start`；或安装 systemd unit（`init` 的输出即一份可直接使用的 unit，内部以 `run --config <path>` 启动，只有临时覆盖才用环境变量）。
+5. **Caddy** 反代 `/mcp`、`/api/v1`、`/health`，其余路径一律 404（`init` 输出的 Caddyfile 已按此写好），自动 Let's Encrypt 证书。**`mcp_allowed_hosts` 必须包含对外域名**，否则反代后的 MCP 请求会被协议层以 403 拒绝（见 §5.3）。
 6. SQLite 调优由后端在建池时完成：`journal_mode=WAL`、`synchronous=NORMAL`；同一项目的建池按项目串行化（原因见 §9 P4.2 取舍）。
 
 **资源预估**：二进制 + SQLite 常驻 < 100MB，2GB 服务器余量充足，可并行运行其他服务。
@@ -422,7 +424,18 @@ PID 文件与日志都锚定在 `DATA_DIR` 下（`memora.pid` / `memora.log`）�
     6. **`.env` 来源显式化**：原先 `dotenvy::dotenv().ok()` 依赖 CWD 且失败被静默吞掉，症状是「`.env` 明明填了却没生效」而日志无线索。现在探测路径写入日志（未命中时列出全部候选）、`--env-file` 缺失或语法错误硬失败、`PORT` 非法值硬失败。解析逻辑（`env_candidates` / `resolve_port` / `resolve_text`）做成纯函数，使配置语义可被单测穷尽覆盖，而不必在测试中改进程环境（并发测试下不安全）。
     7. **修正 `RUST_LOG` 的加载顺序**：原先日志初始化早于配置加载，导致写在 `.env` 里的 `RUST_LOG` **永远不生效**。现改为「解析命令行 → 加载配置（含 `.env`）→ 初始化日志」，并由冒烟实测确认（`.env` 中 `RUST_LOG=debug` 后能观察到 `DEBUG memora::auth: rejected request`）。
     8. **恢复 SIGPIPE 默认处置**：Rust 运行时忽略 SIGPIPE，导致 `memora restart | head -1` 这类用法在管道提前关闭时把 `println!` 的 EPIPE 变成 panic 并打印堆栈。启动最早期恢复默认处置后，进程被 SIGPIPE 正常终止，符合 Unix 工具惯例。
-    9. **配置来源日志只对启动类命令打印**：`stop` / `status` 每次执行都打一遍只会变成噪声，而它们的输出已包含 PID 文件路径，足以定位目录。
+    9. **配置来源日志只对启动类命令打印**：`stop` / `status` 每次执行都打一遍只会变成噪声，而它们的输出已包含实例记录路径，足以定位目录。
+- **P4.3 配置单实例化已完成**：把「配置在哪」从 CWD 相对探测改为 XDG 绝对路径，`.env` 换成 TOML，PID 文件升级为实例记录。
+  - 起因：`status` / `stop` 竟需带参数才指向同一实例——这暴露出「实例身份由 CWD 决定」的根本问题，也说明「相对路径优先」的探测顺序本身就是误诊来源。
+  - 变更：`config.rs` 重写为 TOML + 四层优先级 + XDG 默认绝对路径；`pidfile.rs` 改名 `instance.rs`，记录升级为 JSON（pid + port + data_dir + started_at + version）；`--config` 取代 `--env-file`（旧开关按未知选项报错，杜绝「写了却不生效」）；`init` 按已解析的配置渲染 `config.toml`（600）与部署模板；systemd unit 去掉 `EnvironmentFile=`。
+  - **`status` / `stop` 以记录为准，而非重新推导配置**：端口取记录中的值，并在记录端口与配置端口分歧时提示 `restart`，从根上消除「探错端口」与「配置改过但进程没重启」两类误诊。
+  - **验证结果**：`cargo test` **168 项全部通过**（新增默认路径解析、TOML 解析与未知键拒绝、`--config` 缺失硬失败、记录端口优先、按记录终止进程、模板转义与「渲染结果能被解析回原值」等用例）；`cargo clippy --all-targets` 零告警。
+  - 关键实现取舍：
+    1. **未知键必须报错**：`deny_unknown_fields` 让拼错键名在启动期暴露，代价是配置文件不能随意加注释性字段——值得，因为静默忽略正是「改了没生效」的主因。
+    2. **默认路径必须是绝对路径**：一旦回退成 `./config.toml`，「无参数也操作同一实例」就不成立；相对回退仅在 `HOME`/`XDG_*` 全缺失（容器、systemd 早期）时启用，并以日志告警。
+    3. **不引入 `dirs` / `chrono`**：XDG 基准目录与 RFC3339 时间戳各自只需几十行纯函数（`xdg_base` / `civil_from_days`），换来零依赖与可穷尽单测。
+    4. **子进程透传 `--config` 有前提**：仅当配置确实来自文件时才追加该参数——显式指向不存在的文件是硬失败，无文件时照传会让子进程启动即失败；临时 flag 覆盖写不进文件，故仍以环境变量注入。
+    5. **`stop` 幂等**：未运行时打印提示并返回 0，使「停止」在脚本里可重复执行。
     10. **部署模板内嵌二进制**：`deploy/` 三份模板经 `include_str!` 编译进二进制，`memora init` 因而**不依赖部署目录**——这与「单文件交付」的定位一致，也避免「模板文件没跟着二进制走」的部署事故。Caddyfile 用 `handle` 块而非顶层 `reverse_proxy` + 兜底 `respond`：Caddy 的 directive 排序会把 `respond` 提到 `reverse_proxy` 之前执行，从而拦掉代理规则。
     11. **PID 文件内容损坏时报错而非视作「未运行」**：后者会直接覆盖一个可能仍在运行的服务。存活探测用 `kill(pid, 0)`，且 **`EPERM` 判为存活**（进程存在但不属于当前用户），其余错误保守判为存活。
     12. **`stop` 幂等成功而 `status` 未运行返回 3**：脚本可无条件调用 `memora stop`，而「是否在运行」的判断交给 `status` 的退出码（遵循 LSB init 脚本惯例）。
@@ -548,11 +561,11 @@ src/
   main.rs                   入口：子命令分发（print 形态与自守护形态）、优雅退出、日志初始化
   cli.rs                     命令行解析（子命令 + 全局选项 + --help/--version 短路）
   daemon.rs                  自守护进程管理：start/stop/restart/status/init + 健康探测 + 模板渲染
-  pidfile.rs                 PID 文件读写与清理、kill(pid,0) 存活探测、SIGTERM/SIGKILL 发送
+  instance.rs                实例记录（pid/port/data_dir/started_at/version）读写与清理、kill(pid,0) 存活探测、SIGTERM/SIGKILL 发送
   domain.rs                 领域模型（Entity / Relation / Observation / Graph + 各类 Input）
   entity.rs                 sea-orm 实体：project（元库）+ memory::{entities, observations, relations}
   meta.rs                   元库建表 / backend 列迁移 / 项目登记查询（含 find / delete）
-  config.rs                 运行配置：四层来源叠加 + .env 显式探测（EnvSource）+ 纯函数式解析
+  config.rs                 运行配置：TOML 文件 + 四层来源叠加 + XDG 默认绝对路径 + 纯函数式解析
   error.rs                  AuthError / StorageError / ProjectResolveError
   reply.rs                  统一 400 / 401 / 404 / 409 / 500 响应
   state.rs                  AppState：元库连接 + 配置 + StorageRegistry；token → 仓库集合的解析入口
@@ -575,14 +588,14 @@ src/
 deploy/
   memora.service            systemd unit 模板（`memora init` 渲染后输出）
   Caddyfile                 反向代理模板（同上）
-  env.template              `.env` 模板（同上）
+  config.toml.template      `config.toml` 模板（同上）
 ```
 
 **分层依赖方向**（单向，不得回指）：
 `main` → `cli` / `daemon` / `routes`；
 `routes` → `mcp::server` → `mcp::tools` → `storage::repo`（trait）/ `domain`；
 `routes` → `admin` → `storage`（trait / 注册表）/ `meta` / `domain`；
-`daemon` → `config` / `pidfile`（**不触碰存储与路由**，进程管理与业务完全解耦）；
+`daemon` → `config` / `instance`（**不触碰存储与路由**，进程管理与业务完全解耦）；
 `mcp::dto` 只被 `tools` 与 `server` 使用。**`rmcp` 仅出现在 `mcp::server` 与 `mcp::mod`**，
 故工具语义的测试不依赖任何协议栈；**`admin` 不引用任何具体后端**，只经 `StorageRegistry` 取 trait 对象。
 

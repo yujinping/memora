@@ -1,0 +1,34 @@
+# Memora (忆庐) 运行配置 —— 由 `memora init` 生成
+#
+# 配置优先级（高 → 低）：
+#   命令行选项 > 进程环境变量 > 本文件 > 内置默认值
+#
+# 本文件默认位于 $XDG_CONFIG_HOME/memora/config.toml（通常是 ~/.config/memora/config.toml），
+# 是**绝对路径**，与当前工作目录无关——因此在任何目录下执行 `memora status` / `memora stop`
+# 都指向同一实例。为某个实例单独指定配置时才需要 `--config /path/to/config.toml`。
+#
+# 键名写错会直接报错而不是被忽略（这是刻意的）：「改了配置却没生效」不再静默发生。
+
+# 监听端口（1..=65535；0 会被内核解释为“随机端口”，故被拒绝）
+port = __PORT__
+
+# 数据目录：元库、各项目库、后台日志与实例记录都在这里
+data_dir = __DATA_DIR__
+
+# 管理员令牌：REST 管理层（/api/v1）鉴权。
+# 生产环境务必改成足够随机的值（本文件权限已收紧为 600）：
+#   openssl rand -hex 32
+admin_token = __ADMIN_TOKEN__
+
+# 新项目的默认存储后端（既有项目以其在 _meta.db 中的登记值为准）
+# 可选：sqlite_file（默认）| in_mem（仅测试，进程退出即丢失）
+storage_backend = __STORAGE_BACKEND__
+
+# MCP 端点允许的 Host 白名单（防 DNS 重绑定）。默认仅 localhost / 127.0.0.1 / ::1。
+# **公网部署必须加入对外域名**：Caddy 反代会透传真实 Host，不在白名单内会被协议层以
+# 403 拒绝，且错误信息并不指向配置项。
+mcp_allowed_hosts = __MCP_ALLOWED_HOSTS__
+
+# 日志级别（可选）。默认 info，并把 sqlx / sea-orm 压到 warn。
+# 环境变量 RUST_LOG 优先级更高，便于临时排查而不改文件。
+log = __LOG__

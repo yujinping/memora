@@ -5,7 +5,7 @@
 #   2. 将本片段并入 /etc/caddy/Caddyfile（同域名存在时请合并，不要重复定义站点）；
 #   3. sudo systemctl reload caddy
 #
-# ⚠ 关键前置：`.env` 中的 MCP_ALLOWED_HOSTS 必须包含下面的域名。
+# ⚠ 关键前置：`config.toml` 中的 `mcp_allowed_hosts` 必须包含下面的域名。
 #   rmcp 的 Streamable HTTP 传输默认只信回环 Host（防 DNS 重绑定），而反代会透传
 #   真实域名；白名单未命中时 MCP 请求会被协议层以 403 拒绝，且错误信息并不指向配置项。
 #
