@@ -65,7 +65,7 @@
 | **标准 MCP** | Streamable HTTP 传输，9 个对齐官方语义的记忆工具，兼容主流 MCP 客户端 |
 | **自带进程管理** | caddy 式 CLI：`run` / `start` / `stop` / `restart` / `status` / `init`——没有 systemd、没有 root 也能运维 |
 | **可换成能的后端** | Repository + 共享契约测试：新增一种持久化后端 = 1 个 impl 文件 + 1 行注册，业务层**零改动** |
-| **TDD 交付** | 141 项测试全通过，`clippy --all-targets` 零告警；后端行为由一份契约同时约束 |
+| **TDD 交付** | 170 项测试全通过，`clippy --all-targets` 零告警；后端行为由一份契约同时约束 |
 
 ---
 
@@ -187,7 +187,7 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 
 | 工具 | 关键参数 | 行为 | 返回 |
 |---|---|---|---|
-| `create_entities` | `entities[{name, entity_type}]` | 批量建实体，重名忽略（不覆盖原类型） | 请求名在调用后的状态（含观测） |
+| `create_entities` | `entities[{name, entity_type}]` | 批量建实体，重名忽略（不覆盖原类型）。**不接收 `observations` 字段**——观测须另调 `add_observations`，多传的字段会被静默忽略 | 请求名在调用后的状态（含观测） |
 | `create_relations` | `relations[{from_name, to_name, relation_type}]` | 批量建关系，三元组重复跳过 | 实际落库的关系（**含 id**） |
 | `add_observations` | `observations[{entity_name, contents[]}]` | 追加观测；实体不存在报 `-32602` | 受影响实体（**含新观测 id**） |
 | `delete_entities` | `names[]` | 级联删除关系 / 观测 / 检索索引 | 确实存在并被删除的名字 |
@@ -349,6 +349,7 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 | **配置默认路径必须是绝对路径** | 相对路径 + CWD 探测会让「实例身份」随执行目录漂移：`status` / `stop` 竟要带参数才能找到同一实例。改成 XDG 绝对默认路径后，任何目录下无参数操作都指向同一实例；多实例由 `--config` 显式指定 |
 | **配置文件用 TOML 而非 `.env`** | `.env` 无类型且**未知键静默忽略**（把 `ADMIN_TOKEN` 拼错后服务照常启动、鉴权全 401）。TOML 让键名写错在启动期硬失败，默认路径固定后也不必再记「探测顺序」 |
 | **`status` / `stop` 以实例记录为准** | 记录含 pid + 端口 + 数据目录 + 启动时间 + 版本，故按**记录**探活与终止，而不是按当前配置重新推导——「探错端口」与「配置改过但进程没重启」两类误诊由此根除 |
+| **`start` 前试绑端口，而非事后确认子进程存活** | `start` 的成功判据是「该端口上 `/health` 通」，而占用该端口的可能是**另一个** memora 实例——它的响应同样是 `200 ok`，响应体校验无从区分。此时新子进程因 `EADDRINUSE` 立即退出，父进程却判定成功：命令返回 0、实例记录指向一个已死的 pid。故在 spawn **之前**以 `0.0.0.0`（与服务实际监听地址一致）试绑一次：端口不可独占 ⇒ 本实例必然起不来，这是确定性前置条件，不存在「子进程还没死」的时序竞态 |
 
 更多取舍（含每期的验证结果与踩坑记录）见 [`docs/memory-system-design.md`](docs/memory-system-design.md)。
 
@@ -358,13 +359,14 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 
 | 项目 | 现状 |
 |---|---|
-| `cargo test` | **168 项全部通过** |
+| `cargo test` | **170 项全部通过** |
 | `cargo clippy --all-targets` | **零告警** |
+| `scripts/smoke-e2e.py` | **28 项全通过**——对**已运行**实例做黑盒验证：MCP 握手与 9 工具闭环、管理面状态码、错误码分流、跨项目隔离、Host 白名单与 `Accept` 协商 |
 | 测试构成 | 仓库契约（双后端各跑一遍）、后端生命周期契约、MCP 工具语义（脱离协议栈）、路由协议级端到端（`initialize` / `tools/list` / `tools/call`）、CLI 与进程管理（子命令解析、实例记录与存活探测、退出码语义）、配置来源与优先级（TOML 解析、XDG 默认路径解析、`--config` 硬失败）、并发写入回归、鉴权与隔离 |
 | 并发验证 | 4 项目 × 40 次工具调用（每项目 8 并发）：**零失败**、统计与写入一致、跨项目零泄漏 |
 | 开发方式 | 全程 TDD：先写测试并观察其失败，再写实现 |
 
-值得单独一提的用例：**注入式恶意检索串不报错**、**跨项目误写被隔离**、**非白名单 Host 返回 403**、**明文 token 不在元库任何文件中出现**、**并发首次取用同一项目只建立一个连接池**（最后一条是压测发现的真实缺陷，见下节）。
+值得单独一提的用例：**注入式恶意检索串不报错**、**跨项目误写被隔离**、**非白名单 Host 返回 403**、**明文 token 不在元库任何文件中出现**、**并发首次取用同一项目只建立一个连接池**、**端口被另一实例占用时 `start` 必须失败**（后两条都是实机复现发现的真实缺陷，见下节）。
 
 ---
 
@@ -390,6 +392,7 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 | 文档 | 内容 |
 |---|---|
 | [`docs/memory-system-design.md`](docs/memory-system-design.md) | 完整技术设计蓝图：数据模型、接口契约、鉴权与多租户、检索策略、部署方案、分期计划与全部实现取舍 |
+| [`docs/testing-guide.md`](docs/testing-guide.md) | 分层测试指南：五层策略、退出码契约、沙箱搭建、部署后自检清单与已知的坑 |
 | [`deploy/`](deploy) | systemd unit、Caddyfile 片段、`config.toml` 模板（由 `memora init` 渲染） |
 | [`deploy/config.toml.template`](deploy/config.toml.template) | 全量配置项与注释（键名、默认值、优先级、权限说明） |
 

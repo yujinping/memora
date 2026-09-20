@@ -124,6 +124,10 @@ pub fn start(config: &Config) -> Result<i32> {
         );
     }
 
+    // 端口不可独占 ⇒ 子进程必然 bind 失败，而健康探测可能命中占用该端口的**另一个**
+    // 实例从而假成功。故在 spawn 之前先失败——详见 ensure_port_available 的 @intent。
+    ensure_port_available(config.port)?;
+
     let exe = std::env::current_exe().context("cannot determine the current executable path")?;
     let log_path = InstanceFile::log_path(&data_dir);
     let spec = child_spec(&exe, config, &log_path);
@@ -167,6 +171,33 @@ pub fn start(config: &Config) -> Result<i32> {
     println!("  pid:  {}", instance_file.path().display());
     println!("  stop: memora stop");
     Ok(0)
+}
+
+/// 预检端口可否被本实例独占监听；不可用则返回错误，调用方不应继续启动。
+///
+/// @intent `start` 的成功判据是「该端口上 `/health` 通」，但端口上可能是**另一个** memora
+///         实例——它的 `/health` 同样返回 `200 ok`，[`probe_health`] 的响应体校验无从区分。
+///         此时刚拉起的子进程会因 `EADDRINUSE` 立即退出，父进程却判定成功：命令返回 0、
+///         实例记录写向一个已死的 pid，而调用方以为「刚起的这个实例」在服务。
+///
+///         在 spawn **之前**试绑一次即可根除该误判：端口不可独占 ⇒ 本实例必然起不来，
+///         这是与子进程时序无关的确定性前置条件（不像「自检后再查子进程是否存活」那样
+///         存在竞态）。地址取 `0.0.0.0`，与 `main.rs` 中服务的实际监听地址一致——只试绑
+///         回环的话，占用者监听在 `0.0.0.0` 时会被误判为可用。
+fn ensure_port_available(port: u16) -> Result<()> {
+    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    match std::net::TcpListener::bind(addr) {
+        // 立即释放：此处只做可用性探测，真正监听由子进程完成。
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(err) => bail!(
+            "port {port} is already in use (address {addr}): {err}; \
+             another process — possibly another memora instance — is holding it. \
+             Stop that process, or pick another port with `--port`"
+        ),
+    }
 }
 
 /// 停止后台进程：SIGTERM 优雅退出，超时升级 SIGKILL。
@@ -617,6 +648,31 @@ mod tests {
         assert!(!probe_health(unhealthy));
 
         assert!(!probe_health(closed_port()));
+    }
+
+    /// 端口已被监听时，`start` 的前置预检必须拒绝。
+    ///
+    /// @intent 这是实机复现过的缺陷：目标端口被**另一个 memora 实例**占用时，新子进程因
+    ///         `EADDRINUSE` 立即退出，父进程的 `wait_for_health` 却命中了那个旧实例
+    ///         （它的 `/health` 同样是 `200 ok`，`probe_health` 无从区分），于是 `start`
+    ///         返回 0、打印 "memora started"，并把实例记录写向一个已死的 pid。
+    ///         仅靠响应体校验挡不住同类进程，故必须在 spawn 之前确认端口可独占监听。
+    #[test]
+    fn ensure_port_available_rejects_a_port_someone_else_is_listening_on() {
+        let occupant = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = occupant.local_addr().unwrap().port();
+
+        let err = ensure_port_available(port).expect_err("已被监听的端口必须被拒绝");
+        assert!(
+            err.to_string().contains("already in use"),
+            "错误信息应指明端口已被占用，实际：{err}"
+        );
+    }
+
+    /// 端口空闲时必须放行，否则正常启动路径会被误拦。
+    #[test]
+    fn ensure_port_available_accepts_a_free_port() {
+        assert!(ensure_port_available(closed_port()).is_ok());
     }
 
     #[test]
