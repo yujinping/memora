@@ -26,7 +26,6 @@
 
 use std::fs;
 use std::io::{self, ErrorKind, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -138,12 +137,15 @@ impl InstanceFile {
         // 且 `rename` 保留源文件权限，故替换后仍是 0600。
         let tmp = self.path.with_extension("pid.tmp");
         {
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
+            let mut options = fs::OpenOptions::new();
+            options.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Windows 无 POSIX 权限位；私有性由用户目录 ACL 承担，此处只收紧 Unix 侧。
+                options.mode(0o600);
+            }
+            let mut file = options.open(&tmp)?;
             file.write_all(body.as_bytes())?;
             writeln!(file)?;
             file.sync_all()?;
@@ -192,6 +194,7 @@ impl InstanceFile {
 ///
 /// @intent `EPERM` 视为存活（见模块文档）；`ESRCH` 视为不存在；其余错误保守判为存活，
 ///         宁可让 `start` 报「已在运行」也不冒覆盖他人记录的风险。
+#[cfg(unix)]
 pub fn is_alive(pid: i32) -> bool {
     // pid <= 0 有特殊含义：0 表示「当前进程组」，负数表示整个进程组。
     // 用作探测会波及无关进程，故直接判为「不存活」。
@@ -210,14 +213,58 @@ pub fn is_alive(pid: i32) -> bool {
     }
 }
 
+/// Windows 版探活：`OpenProcess` + `GetExitCodeProcess`（退出码 `STILL_ACTIVE` 即存活）。
+///
+/// @intent 打开失败（进程不存在 / 权限不足）一律判不存活：同用户自托管场景下
+///         「进程存在但打不开」几乎不存在，简单判死即可让陈旧记录被及时清理。
+#[cfg(windows)]
+pub fn is_alive(pid: i32) -> bool {
+    // pid <= 0 有特殊含义（与 Unix 一致），直接判为「不存活」。
+    if pid <= 0 {
+        return false;
+    }
+    let handle = unsafe {
+        crate::process::OpenProcess(
+            crate::process::PROCESS_QUERY_LIMITED_INFORMATION,
+            crate::process::FALSE,
+            pid as u32,
+        )
+    };
+    if handle.is_null() {
+        return false;
+    }
+    let mut exit_code: u32 = 0;
+    let ok = unsafe { crate::process::GetExitCodeProcess(handle, &mut exit_code) };
+    let alive = ok != crate::process::FALSE && exit_code == crate::process::STILL_ACTIVE;
+    unsafe { crate::process::CloseHandle(handle) };
+    alive
+}
+
 /// 发送 SIGTERM（请求优雅退出）。
+#[cfg(unix)]
 pub fn terminate(pid: i32) -> io::Result<()> {
     send_signal(pid, libc::SIGTERM)
 }
 
 /// 发送 SIGKILL（强杀；仅在 SIGTERM 超时后使用）。
+#[cfg(unix)]
 pub fn force_kill(pid: i32) -> io::Result<()> {
     send_signal(pid, libc::SIGKILL)
+}
+
+/// Windows 版进程终止。
+///
+/// @intent Windows 没有可移植的「优雅退出」信号（WM_CLOSE 只对 GUI 窗口有效），
+///         `TerminateProcess` 是唯一通用手段，语义上接近 SIGKILL。因此 terminate 与
+///         force_kill 在 Windows 上都走同一实现；需要干净退出时由进程自身配合退出通道。
+#[cfg(windows)]
+pub fn terminate(pid: i32) -> io::Result<()> {
+    send_signal(pid, 0)
+}
+
+#[cfg(windows)]
+pub fn force_kill(pid: i32) -> io::Result<()> {
+    send_signal(pid, 0)
 }
 
 /// 当前时刻的 RFC3339 表示（UTC，秒级精度）。
@@ -272,6 +319,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// 向指定进程发送信号。
+#[cfg(unix)]
 fn send_signal(pid: i32, signal: i32) -> io::Result<()> {
     if pid <= 0 {
         return Err(io::Error::new(
@@ -282,6 +330,30 @@ fn send_signal(pid: i32, signal: i32) -> io::Result<()> {
     // SAFETY: 同 `is_alive`，纯 FFI 调用。
     let rc = unsafe { libc::kill(pid, signal) };
     if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Windows 版：`TerminateProcess`（无信号语义，`signal` 参数仅为占位）。
+#[cfg(windows)]
+fn send_signal(pid: i32, _signal: i32) -> io::Result<()> {
+    if pid <= 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("refusing to signal pid {pid}: only positive pids are accepted"),
+        ));
+    }
+    let handle = unsafe {
+        crate::process::OpenProcess(crate::process::PROCESS_TERMINATE, crate::process::FALSE, pid as u32)
+    };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let ok = unsafe { crate::process::TerminateProcess(handle, 1) };
+    unsafe { crate::process::CloseHandle(handle) };
+    if ok != crate::process::FALSE {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -330,6 +402,7 @@ mod tests {
 
     /// 记录含数据目录与端口，不应被同组用户或他人读到。
     #[test]
+    #[cfg(unix)]
     fn record_file_is_not_world_readable() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -451,6 +524,7 @@ mod tests {
 
     /// `stop` 的真实语义：SIGTERM 必须能终止子进程，且进程随即不再被判定为存活。
     #[test]
+    #[cfg(unix)]
     fn terminate_actually_stops_a_child_process() {
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -473,6 +547,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn force_kill_stops_a_child_that_ignores_sigterm() {
         // `sh` 捕获并忽略 TERM，模拟不响应优雅退出的进程
         let mut child = std::process::Command::new("sh")

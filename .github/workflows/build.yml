@@ -25,6 +25,10 @@ jobs:
             os: macos-latest
             cli_artifact: target/aarch64-apple-darwin/release/memora
             cli_target: aarch64-apple-darwin
+          - platform: windows-x64
+            os: windows-latest
+            cli_artifact: target/release/memora.exe
+            cli_target: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -40,7 +44,8 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      # 原生构建：linux。daemon 守护进程管理依赖 POSIX 接口，Windows 无法编译，故不构建
+      # 原生构建：linux / windows。daemon 的进程管理按平台分体（setsid vs creation_flags），
+      # 实例探活/终止也分体（libc::kill vs OpenProcess/TerminateProcess）。
       # SQLite 走 libsqlite3-sys bundled，无需系统库
       - name: Build CLI (release)
         if: matrix.cli_target == ''

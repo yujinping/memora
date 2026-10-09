@@ -302,6 +302,7 @@ pub fn init(config: &Config, force: bool) -> Result<i32> {
 }
 
 /// 以 `0600` 写入文本文件（配置文件含 admin_token，不应被同组用户或他人读到）。
+#[cfg(unix)]
 fn write_private(path: &Path, contents: &str) -> Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -319,6 +320,21 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
     // `mode()` 只作用于新建文件；`--force` 覆盖已存在的 0644 文件时须显式收紧。
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("cannot tighten permissions of {}", path.display()))
+}
+
+/// Windows 版 `write_private`：无 POSIX 权限位，私有性由用户目录 ACL 承担。
+#[cfg(not(unix))]
+fn write_private(path: &Path, contents: &str) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("cannot flush {}", path.display()))
 }
 
 /// 渲染 `config.toml` 模板（占位符替换为本次解析出的实际取值）。
@@ -381,6 +397,7 @@ pub fn render_deploy_templates(exe: &Path, config: &Config) -> String {
 }
 
 /// 分离地启动子进程：新建会话（setsid）并把 I/O 重定向到日志文件。
+#[cfg(unix)]
 fn spawn_detached(spec: &ChildSpec) -> Result<Child> {
     use std::os::unix::process::CommandExt;
 
@@ -415,6 +432,43 @@ fn spawn_detached(spec: &ChildSpec) -> Result<Child> {
             Ok(())
         });
     }
+
+    command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", spec.exe.display()))
+}
+
+/// Windows 版分离启动：新进程组 + 脱离控制台 + 不弹窗口（对应 POSIX setsid）。
+///
+/// @intent 无 `pre_exec` 钩子，改为 `creation_flags` 在创建进程时完成分离；
+///         CREATE_NEW_PROCESS_GROUP 让子进程与父进程的控制台 Ctrl+C 隔离，
+///         DETACHED_PROCESS 脱离父进程控制台，CREATE_NO_WINDOW 无窗口弹出。
+#[cfg(not(unix))]
+fn spawn_detached(spec: &ChildSpec) -> Result<Child> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let stdout = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&spec.log_path)
+        .with_context(|| format!("cannot open log file {}", spec.log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .context("cannot duplicate the log file handle")?;
+
+    let mut command = Command::new(&spec.exe);
+    command
+        .args(&spec.args)
+        // stdin 接到空设备：服务不接受交互输入
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .envs(spec.envs.iter().cloned())
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
 
     command
         .spawn()
@@ -579,6 +633,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn wait_for_exit_detects_a_live_process() {
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id() as i32;
@@ -592,6 +647,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn wait_for_exit_detects_an_exited_process() {
         let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
         let pid = child.id() as i32;
@@ -714,6 +770,7 @@ mod tests {
     /// `stop` 必须只依赖记录：即便配置里的端口/目录与实例无关，
     /// 也要能把记录中的进程真正停下来（整改前会打印「未运行」并返回 0，进程照旧在跑）。
     #[test]
+    #[cfg(unix)]
     fn stop_terminates_the_recorded_process() {
         let dir = std::env::temp_dir().join(format!(
             "memora_p4_stop_{}_{}",
@@ -810,6 +867,7 @@ mod tests {
 
     /// 配置文件含 admin_token，必须是 0600。
     #[test]
+    #[cfg(unix)]
     fn init_writes_config_with_private_permissions() {
         use std::os::unix::fs::PermissionsExt;
 

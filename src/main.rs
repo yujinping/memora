@@ -29,6 +29,8 @@ mod error;
 mod instance;
 mod mcp;
 mod meta;
+#[cfg(windows)]
+mod process;
 mod reply;
 mod routes;
 mod state;
@@ -59,6 +61,7 @@ fn main() -> ExitCode {
     // 处置（终止进程）才能符合 Unix 工具惯例。
     //
     // SAFETY: 启动最早期、尚无线程与异步运行时，`signal(2)` 只影响本进程的信号处置。
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -259,10 +262,11 @@ fn remove_own_instance_file(config: &Config) {
     }
 }
 
-/// 等待 SIGTERM / SIGINT。
+/// 等待 SIGTERM / SIGINT（Unix 版）。
 ///
 /// @intent 两个信号都接：SIGTERM 来自 `memora stop` 与 systemd，SIGINT 来自交互式
 ///         Ctrl-C。任一到达即触发优雅退出。
+#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -284,5 +288,17 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = terminate.recv() => tracing::info!("received SIGTERM, shutting down gracefully"),
         _ = interrupt.recv() => tracing::info!("received SIGINT, shutting down gracefully"),
+    }
+}
+
+/// 等待 Ctrl+C / Ctrl+Break（Windows 版）。
+///
+/// @intent Windows 没有可移植的 SIGTERM 通道（WM_CLOSE 同样只对 GUI 窗口有效），
+///         `ctrl_c` 已覆盖 Ctrl+C 与 Ctrl+Break 两种控制台手势，作为优雅退出入口。
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!("received Ctrl+C, shutting down gracefully"),
+        Err(err) => tracing::error!(error = %err, "cannot install Ctrl+C handler"),
     }
 }
