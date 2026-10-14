@@ -6,18 +6,17 @@
 //!         协议侧的宏、会话、HTTP 细节全部留在 `mcp::server`。
 //!         这也是 docs §12.5「handler 层对存储实现完全盲视」在 MCP 侧的落点。
 
-use crate::domain::{EntityInput, ObservationInput, RelationInput};
+use crate::domain::{HandoffInput, HandoffResolution, EntityInput, ObservationInput, RelationInput};
 use crate::error::StorageError;
 use crate::mcp::dto::*;
-use crate::storage::{normalize, MemoryRepository};
+use crate::storage::{normalize, HandoffRepository, MemoryRepository};
 use rmcp::ErrorData;
 
-/// 工具名清单（顺序即 `tools/list` 的稳定顺序）。
+/// 官方对齐的记忆工具名（顺序即 `tools/list` 的稳定顺序）。
 ///
-/// @intent 这是「对外承诺的工具面」的单一来源：`mcp::build_service` 在启动时用它做装配自检，
-///         路由层测试用它校验 `tools/list` 的实际返回值。文档写了 9 个工具、
-///         实际只注册 8 个这类问题因此无法静默存在。
-pub const TOOL_NAMES: [&str; 9] = [
+/// @intent 这 9 个名字**一个都不改**：它们是「与官方 MCP Memory 语义对齐」的承诺，
+///         客户端与既有提示词据此零改造接入。交接工具另立家族，见下。
+pub const MEMORY_TOOL_NAMES: [&str; 9] = [
     "create_entities",
     "create_relations",
     "add_observations",
@@ -27,6 +26,37 @@ pub const TOOL_NAMES: [&str; 9] = [
     "read_graph",
     "search_nodes",
     "open_nodes",
+];
+
+/// 交接工具名（家族前缀 `handoff_*`）。
+///
+/// @intent 用家族前缀而非续用「动词_名词」：工具面从「单一官方家族」扩为两个家族，
+///         前缀让模型与人在 `tools/list` 里一眼分组（docs §5.1）。
+pub const HANDOFF_TOOL_NAMES: [&str; 4] = [
+    "handoff_save",
+    "handoff_load",
+    "handoff_list",
+    "handoff_ack",
+];
+
+/// 对外承诺的完整工具面 = 两个家族之和（供 `mcp::mod::assert_tool_manifest` 使用）。
+///
+/// @intent 用**常量索引**拼出来而不是再抄一遍 13 个字符串：抄一遍就多一个漂移点，
+///         而漂移的后果是「启动自检通过、但清单与实际不符」——自检本身失去意义。
+pub const TOOL_NAMES: [&str; 13] = [
+    MEMORY_TOOL_NAMES[0],
+    MEMORY_TOOL_NAMES[1],
+    MEMORY_TOOL_NAMES[2],
+    MEMORY_TOOL_NAMES[3],
+    MEMORY_TOOL_NAMES[4],
+    MEMORY_TOOL_NAMES[5],
+    MEMORY_TOOL_NAMES[6],
+    MEMORY_TOOL_NAMES[7],
+    MEMORY_TOOL_NAMES[8],
+    HANDOFF_TOOL_NAMES[0],
+    HANDOFF_TOOL_NAMES[1],
+    HANDOFF_TOOL_NAMES[2],
+    HANDOFF_TOOL_NAMES[3],
 ];
 
 /// 存储错误 → 工具错误。
@@ -320,6 +350,143 @@ pub async fn open_nodes(
     })
 }
 
+// ---------------------------------------------------------------------------
+// 交接（handoff）工具：语义实现（后端无关）
+// ---------------------------------------------------------------------------
+
+/// 交接领域模型 → 出参视图。
+pub(crate) fn handoff_view(h: crate::domain::Handoff) -> HandoffView {
+    HandoffView {
+        task_id: h.task_id,
+        revision: h.revision,
+        goal: h.goal,
+        state: h.state,
+        next_steps: h.next_steps,
+        files: h.files,
+        decisions: h.decisions,
+        open_questions: h.open_questions,
+        client: h.client,
+        session_id: h.session_id,
+        created_at: h.created_at,
+        acked_at: h.acked_at,
+        acked_by: h.acked_by,
+    }
+}
+
+/// 摘要 → 出参视图。
+pub(crate) fn handoff_summary_view(s: crate::domain::HandoffSummary) -> HandoffSummaryView {
+    HandoffSummaryView {
+        task_id: s.task_id,
+        revision: s.revision,
+        goal: s.goal,
+        state_excerpt: s.state_excerpt,
+        client: s.client,
+        session_id: s.session_id,
+        created_at: s.created_at,
+        acked: s.acked,
+        acked_by: s.acked_by,
+        next_step_count: s.next_step_count,
+    }
+}
+
+/// 寻址结果 → `(状态, 完整记录?, 候选摘要)`。
+///
+/// @intent 三种结果都映射成 `status` 而不是错误：`none` 是「第一次接手时还没有交接」
+///         这一正常状态，`ambiguous` 是「服务端不替调用方决定接哪条」（docs §5.1）。
+pub(crate) fn resolution_parts(
+    resolution: HandoffResolution,
+) -> (HandoffStatus, Option<HandoffView>, Vec<HandoffSummaryView>) {
+    match resolution {
+        HandoffResolution::Found(h) => (HandoffStatus::Found, Some(handoff_view(*h)), Vec::new()),
+        HandoffResolution::None => (HandoffStatus::None, None, Vec::new()),
+        HandoffResolution::Ambiguous(list) => (
+            HandoffStatus::Ambiguous,
+            None,
+            list.into_iter().map(handoff_summary_view).collect(),
+        ),
+    }
+}
+
+/// `handoff_save`：追加一条不可变修订。
+///
+/// @intent 缺 `task_id` 时落 `current@<client>` 分片槽位——**不同客户端的待办互不遮蔽**
+///         （docs §3.7）。出参回传最终 `task_id`，代理原样带回即「继续同一工作项」。
+pub async fn handoff_save(
+    repo: &dyn HandoffRepository,
+    req: HandoffSaveRequest,
+) -> Result<HandoffSaveResponse, ErrorData> {
+    let input = HandoffInput {
+        task_id: req.task_id,
+        goal: req.goal,
+        state: req.state,
+        next_steps: req.next_steps,
+        files: req.files,
+        decisions: req.decisions,
+        open_questions: req.open_questions,
+        client: req.client,
+        session_id: req.session_id,
+    };
+
+    let saved = repo.save_handoff(input).await.map_err(tool_error)?;
+    Ok(HandoffSaveResponse {
+        task_id: saved.task_id.clone(),
+        revision: saved.revision,
+        handoff: handoff_view(saved),
+    })
+}
+
+/// `handoff_load`：不给 `task_id` = 取当前待接手的那条；给了则精确取。
+pub async fn handoff_load(
+    repo: &dyn HandoffRepository,
+    req: HandoffLoadRequest,
+) -> Result<HandoffLoadResponse, ErrorData> {
+    let resolution = repo
+        .resolve_handoff(req.task_id.as_deref())
+        .await
+        .map_err(tool_error)?;
+    let (status, handoff, candidates) = resolution_parts(resolution);
+    Ok(HandoffLoadResponse {
+        status,
+        handoff,
+        candidates,
+    })
+}
+
+/// `handoff_list`：列出「有哪些活等着我」，接手选择界面的数据来源。
+pub async fn handoff_list(
+    repo: &dyn HandoffRepository,
+    req: HandoffListRequest,
+) -> Result<HandoffListResponse, ErrorData> {
+    let listed = repo
+        .list_handoffs(req.prefix.as_deref(), req.unacked_only, req.limit)
+        .await
+        .map_err(tool_error)?;
+    Ok(HandoffListResponse {
+        handoffs: listed.into_iter().map(handoff_summary_view).collect(),
+    })
+}
+
+/// `handoff_ack`：标记接手（CAS）。
+///
+/// @intent `won=false` 是**正常竞态结果**而不是错误：后到者据此看到「谁先接的」，
+///         进而决定停下来问人，而不是两个客户端同时改同一份代码（docs §4.4）。
+pub async fn handoff_ack(
+    repo: &dyn HandoffRepository,
+    req: HandoffAckRequest,
+) -> Result<HandoffAckResponse, ErrorData> {
+    let outcome = repo
+        .ack_handoff(req.task_id.as_deref(), &req.client)
+        .await
+        .map_err(tool_error)?;
+    let (status, handoff, candidates) = resolution_parts(outcome.resolution);
+    Ok(HandoffAckResponse {
+        status,
+        won: outcome.won,
+        handoff,
+        candidates,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +505,30 @@ mod tests {
             .await
             .unwrap()
             .memory
+    }
+
+    /// 每个用例独立的交接仓库（同一后端，但走 `handoff` 字段）。
+    async fn handoff_repo() -> Arc<dyn HandoffRepository> {
+        InMemBackend::new()
+            .repositories_for("t")
+            .await
+            .unwrap()
+            .handoff
+    }
+
+    /// 便捷构造 save 入参（测试里只关心差异字段）。
+    fn save_req(goal: &str, state: &str) -> HandoffSaveRequest {
+        HandoffSaveRequest {
+            goal: goal.to_string(),
+            state: state.to_string(),
+            next_steps: Vec::new(),
+            files: Vec::new(),
+            decisions: Vec::new(),
+            open_questions: Vec::new(),
+            task_id: None,
+            client: String::new(),
+            session_id: String::new(),
+        }
     }
 
     fn entity(name: &str, ty: &str) -> EntityParam {
@@ -1043,12 +1234,359 @@ mod tests {
         }
     }
 
-    /// 工具名清单必须与 `tools/list` 暴露的 9 个工具一致（防改名 / 漏接）。
+    /// 官方语义的 9 个记忆工具一个都不许改名（客户端零改造的承诺）。
     #[test]
-    fn tool_names_cover_the_nine_memory_tools() {
-        assert_eq!(TOOL_NAMES.len(), 9);
-        let unique: std::collections::HashSet<&&str> = TOOL_NAMES.iter().collect();
+    fn memory_tool_names_are_stable_and_untouched() {
+        assert_eq!(MEMORY_TOOL_NAMES.len(), 9);
+        let unique: std::collections::HashSet<&&str> = MEMORY_TOOL_NAMES.iter().collect();
         assert_eq!(unique.len(), 9, "工具名不得重复");
-        assert!(TOOL_NAMES.contains(&"read_graph"));
+        assert!(MEMORY_TOOL_NAMES.contains(&"read_graph"));
+    }
+
+    /// 两个家族无重名、合起来 13 个，且 `TOOL_NAMES` 确实是两者的并集。
+    ///
+    /// @intent 这条钉住「对外承诺的工具面」本身：`assert_tool_manifest` 只比对清单与宏
+    ///         实注册数，若清单自己漏了一族，自检会「一致地错」。
+    #[test]
+    fn tool_families_are_disjoint_and_cover_the_manifest() {
+        let all: std::collections::HashSet<&&str> = TOOL_NAMES.iter().collect();
+        assert_eq!(TOOL_NAMES.len(), 13);
+        assert_eq!(all.len(), 13, "对外清单不得有重名");
+
+        for name in MEMORY_TOOL_NAMES {
+            assert!(all.contains(&name), "记忆工具 {name} 不在对外清单里");
+        }
+        for name in HANDOFF_TOOL_NAMES {
+            assert!(all.contains(&name), "交接工具 {name} 不在对外清单里");
+            assert!(
+                name.starts_with("handoff_"),
+                "交接工具应统一用 family 前缀：{name}"
+            );
+        }
+        assert_eq!(HANDOFF_TOOL_NAMES.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // 交接工具的语义（脱离 MCP 传输层，直接打内存后端）
+    // -----------------------------------------------------------------------
+
+    /// 空仓库 load：`status="none"` 是正常状态，不是错误。
+    #[tokio::test]
+    async fn handoff_load_on_empty_repo_reports_none() {
+        let repo = handoff_repo().await;
+        let res = handoff_load(&*repo, HandoffLoadRequest::default()).await.unwrap();
+        assert_eq!(res.status, HandoffStatus::None);
+        assert!(res.handoff.is_none());
+        assert!(res.candidates.is_empty());
+    }
+
+    /// save 回传最终 task_id（分片槽位）——代理据此继续同一工作项，人无需参与。
+    #[tokio::test]
+    async fn handoff_save_returns_the_sharded_task_id() {
+        let repo = handoff_repo().await;
+        let mut req = save_req("把交接做出来", "设计完成");
+        req.client = "zed".to_string();
+        req.session_id = "A1".to_string();
+        req.next_steps = vec!["写 repo".to_string()];
+
+        let res = handoff_save(&*repo, req).await.unwrap();
+        assert_eq!(res.task_id, "current@zed");
+        assert_eq!(res.revision, 1);
+        assert_eq!(res.handoff.session_id, "A1");
+        assert_eq!(res.handoff.next_steps, vec!["写 repo".to_string()]);
+        // 出参的 task_id 与 handoff.task_id 必须一致，否则代理会带错 ID 回去
+        assert_eq!(res.handoff.task_id, res.task_id);
+    }
+
+    /// 零参数 load 命中唯一一条：`status="found"` 且带上完整正文。
+    #[tokio::test]
+    async fn handoff_load_without_id_finds_the_only_pending() {
+        let repo = handoff_repo().await;
+        handoff_save(&*repo, save_req("唯一的活", "进行中")).await.unwrap();
+
+        let res = handoff_load(&*repo, HandoffLoadRequest::default()).await.unwrap();
+        assert_eq!(res.status, HandoffStatus::Found);
+        let h = res.handoff.expect("found 必须带回完整记录");
+        assert_eq!(h.goal, "唯一的活");
+        assert!(h.acked_at.is_none());
+        assert!(res.candidates.is_empty());
+    }
+
+    /// 多条待接手：返回候选摘要而不是错误，让调用方挑选后再精确取。
+    #[tokio::test]
+    async fn handoff_load_returns_candidates_when_ambiguous() {
+        let repo = handoff_repo().await;
+        let mut a = save_req("alpha", "起步");
+        a.task_id = Some("alpha".to_string());
+        let mut b = save_req("beta", "起步");
+        b.task_id = Some("beta".to_string());
+        handoff_save(&*repo, a).await.unwrap();
+        handoff_save(&*repo, b).await.unwrap();
+
+        let res = handoff_load(&*repo, HandoffLoadRequest::default()).await.unwrap();
+        assert_eq!(res.status, HandoffStatus::Ambiguous);
+        assert!(res.handoff.is_none());
+        let mut ids: Vec<String> = res.candidates.iter().map(|c| c.task_id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// list 缺省只看待接手，且缺省 `limit` 与 REST 面一致（10）。
+    #[tokio::test]
+    async fn handoff_list_defaults_to_pending_only() {
+        let repo = handoff_repo().await;
+        let mut ack = save_req("要做掉的活", "进行中");
+        ack.task_id = Some("done-one".to_string());
+        handoff_save(&*repo, ack).await.unwrap();
+        handoff_ack(
+            &*repo,
+            HandoffAckRequest {
+                task_id: Some("done-one".to_string()),
+                client: "zed".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let pending = handoff_list(
+            &*repo,
+            HandoffListRequest {
+                unacked_only: true,
+                limit: DEFAULT_HANDOFF_LIST_LIMIT,
+                prefix: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(pending.handoffs.is_empty(), "已接手的不得出现在缺省列表里");
+
+        let all = handoff_list(
+            &*repo,
+            HandoffListRequest {
+                unacked_only: false,
+                limit: DEFAULT_HANDOFF_LIST_LIMIT,
+                prefix: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.handoffs.len(), 1);
+        assert!(all.handoffs[0].acked);
+        assert_eq!(all.handoffs[0].acked_by, "zed");
+    }
+
+    /// ack 的两种结局都不是错误：首次 `won=true`，重复 `won=false` 且不覆盖接手方。
+    #[tokio::test]
+    async fn handoff_ack_reports_win_then_loses_idempotently() {
+        let repo = handoff_repo().await;
+        let mut req = save_req("抢手的事", "待接");
+        req.task_id = Some("race".to_string());
+        handoff_save(&*repo, req).await.unwrap();
+
+        let first = handoff_ack(
+            &*repo,
+            HandoffAckRequest {
+                task_id: Some("race".to_string()),
+                client: "zed".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status, HandoffStatus::Found);
+        assert!(first.won);
+        assert_eq!(first.handoff.unwrap().acked_by, "zed");
+
+        let second = handoff_ack(
+            &*repo,
+            HandoffAckRequest {
+                task_id: Some("race".to_string()),
+                client: "cursor".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!second.won, "后到者不得再次抢到");
+        assert_eq!(
+            second.handoff.unwrap().acked_by,
+            "zed",
+            "接手方必须保持首次值"
+        );
+    }
+
+    /// 非法入参 → `-32602`（调用方改参数即可），而不是服务端故障。
+    #[tokio::test]
+    async fn handoff_save_maps_invalid_input_to_invalid_params() {
+        let repo = handoff_repo().await;
+        let err = handoff_save(&*repo, save_req("", "空目标")).await.unwrap_err();
+        assert_eq!(err.code.0, INVALID_PARAMS);
+
+        let mut bad_id = save_req("目标", "有进展");
+        bad_id.task_id = Some("bad/id".to_string());
+        let err = handoff_save(&*repo, bad_id).await.unwrap_err();
+        assert_eq!(err.code.0, INVALID_PARAMS);
+    }
+
+    // -----------------------------------------------------------------------
+    // §11 回归（docs/handoff-integration-design.md 七条回归的 MCP 层钉死）
+    // -----------------------------------------------------------------------
+
+    /// 回归 #3：`search_nodes` 不受交接影响——写入多条交接前后，记忆检索结果一致
+    /// （钉死 §2 的「交接与记忆分表」决策：交接正文不得渗进记忆检索）。
+    #[tokio::test]
+    async fn handoff_writes_leave_search_nodes_untouched() {
+        let backend = InMemBackend::new();
+        let repos = backend.repositories_for("t").await.unwrap();
+        create_entities(
+            &*repos.memory,
+            CreateEntitiesRequest {
+                entities: vec![entity("深色主题", "preference")],
+            },
+        )
+        .await
+        .unwrap();
+        add_observations(
+            &*repos.memory,
+            AddObservationsRequest {
+                observations: vec![observation("深色主题", &["用户偏好深色界面"])],
+            },
+        )
+        .await
+        .unwrap();
+
+        let before = search_nodes(
+            &*repos.memory,
+            SearchNodesRequest {
+                query: "深色".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 写入多条交接：目标/状态里刻意包含检索词「深色」——
+        // 若交接表混进记忆检索，此处必然污染快照
+        let handoff = &*repos.handoff;
+        handoff_save(handoff, save_req("深色主题迁移", "深色改造进行中"))
+            .await
+            .unwrap();
+        handoff_save(handoff, save_req("深色收尾", "待验收"))
+            .await
+            .unwrap();
+
+        let after = search_nodes(
+            &*repos.memory,
+            SearchNodesRequest {
+                query: "深色".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(before, after, "交接写入不得改变记忆检索结果");
+    }
+
+    /// 回归 #4：零 ID 主路径端到端——`handoff_save`（不给 task_id）→ 另一客户端
+    /// `handoff_load{}` → `handoff_ack` 成功接手，全程**没有任何人手输的标识符**；
+    /// task_id 只在工具出参里流动（§3.7 UX 承诺的唯一硬保障）。
+    #[tokio::test]
+    async fn zero_id_path_is_end_to_end_without_user_supplied_ids() {
+        let repo = handoff_repo().await;
+        // 写入方：什么都不给 task_id
+        handoff_save(
+            &*repo,
+            save_req("交接功能收尾", "测试全绿，待另一台机器接手验收"),
+        )
+        .await
+        .unwrap();
+
+        // 接手方：零参数 load
+        let res = handoff_load(&*repo, HandoffLoadRequest::default()).await.unwrap();
+        assert_eq!(res.status, HandoffStatus::Found);
+        let h = res.handoff.expect("零 ID 主路径必须直接命中");
+        let task_id = h.task_id; // ← 标识符唯一来源是工具出参
+
+        // 接手方 ack：task_id 同样取自出参，不是用户记忆
+        let ack = handoff_ack(
+            &*repo,
+            HandoffAckRequest {
+                task_id: Some(task_id),
+                client: "cursor".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(ack.won, "唯一待接手必须被 ack 命中");
+        assert_eq!(ack.handoff.unwrap().acked_by, "cursor");
+    }
+
+    /// 回归 #5：多写入方零 ID 保存互不遮蔽——两个 client 各存一条后，零参数 load
+    /// 必须返回 ambiguous 且候选同时含两者（H8 的 MCP 层钉死，防「后写遮蔽先写」回归）。
+    #[tokio::test]
+    async fn two_writers_zero_id_saves_stay_mutually_visible() {
+        let repo = handoff_repo().await;
+        let mut a = save_req("zed 上的活", "进行中");
+        a.client = "zed".to_string();
+        let mut b = save_req("cursor 上的活", "进行中");
+        b.client = "cursor".to_string();
+        handoff_save(&*repo, a).await.unwrap();
+        handoff_save(&*repo, b).await.unwrap();
+
+        let res = handoff_load(&*repo, HandoffLoadRequest::default()).await.unwrap();
+        assert_eq!(res.status, HandoffStatus::Ambiguous);
+        assert!(res.handoff.is_none(), "歧义时绝不代选");
+        let mut ids: Vec<String> = res.candidates.iter().map(|c| c.task_id.clone()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["current@cursor".to_string(), "current@zed".to_string()]
+        );
+    }
+
+    /// 回归 #6：列表可用性端到端——A 端带 `session_id` 存，B 端只靠 `handoff_list`
+    /// 的摘要（session_id + state_excerpt）认出它，再用摘要里的 task_id 完成 load + ack。
+    /// 「人在列表里认、不靠记忆」这一交互被此用例钉住：删掉摘要字段它才会红。
+    #[tokio::test]
+    async fn list_summary_carries_enough_to_finish_the_job() {
+        let repo = handoff_repo().await;
+        let mut req = save_req("广西频道评审修复", "GX-25-01~31 修复中");
+        req.session_id = "A1".to_string();
+        handoff_save(&*repo, req).await.unwrap();
+
+        let list = handoff_list(
+            &*repo,
+            HandoffListRequest {
+                unacked_only: true,
+                limit: DEFAULT_HANDOFF_LIST_LIMIT,
+                prefix: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(list.handoffs.len(), 1);
+        let summary = &list.handoffs[0];
+        assert_eq!(summary.session_id, "A1", "摘要必须带 session_id 供人辨认");
+        assert!(
+            summary.state_excerpt.contains("GX-25"),
+            "摘要必须带状态片段"
+        );
+
+        let loaded = handoff_load(
+            &*repo,
+            HandoffLoadRequest {
+                task_id: Some(summary.task_id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.status, HandoffStatus::Found);
+
+        let ack = handoff_ack(
+            &*repo,
+            HandoffAckRequest {
+                task_id: Some(summary.task_id.clone()),
+                client: "workbuddy".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(ack.won);
     }
 }

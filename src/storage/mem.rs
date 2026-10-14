@@ -5,10 +5,13 @@
 //!         正确，以「与内存后端跑同一份契约测试」为准；同时使 P3 的 MCP 工具层
 //!          可以在不触碰文件系统的前提下做端到端测试。
 
-use crate::domain::{Entity, EntityInput, Graph, Observation, ObservationInput, Relation, RelationInput};
+use crate::domain::{
+    AckOutcome, Entity, EntityInput, Graph, Handoff, HandoffInput, HandoffResolution,
+    HandoffSummary, Observation, ObservationInput, Relation, RelationInput,
+};
 use crate::error::StorageError;
 use crate::storage::normalize;
-use crate::storage::repo::MemoryRepository;
+use crate::storage::repo::{HandoffRepository, MemoryRepository};
 use crate::storage::{BackendKind, ProjectRepos, StorageBackend};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
@@ -238,10 +241,170 @@ impl MemoryRepository for InMemMemoryRepo {
     }
 }
 
+/// 单项目的内存交接仓库。
+///
+/// @intent `BTreeMap<task_id, Vec<Handoff>>`：按任务分桶、桶内按修订号升序追加。
+///         一次 save 只追加、绝不改写既有元素——与 SQLite 后端「不可变修订」一致。
+pub struct InMemHandoffRepo {
+    /// 项目交接状态（`std::sync::Mutex`：临界区内无 await，不会跨 await 持锁）
+    store: Mutex<BTreeMap<String, Vec<Handoff>>>,
+}
+
+impl InMemHandoffRepo {
+    /// 构造空仓库。
+    fn new() -> Self {
+        Self {
+            store: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// 每任务最新修订的摘要（已排序、已截断）。
+    ///
+    /// @intent 排序与截断一律走共用的 [`normalize::order_handoff_summaries`]，
+    ///         不在本文件里另写一份 `sort_by`：排序口径分叉是 H6 / H11 最先失效的地方。
+    fn list_latest(
+        store: &BTreeMap<String, Vec<Handoff>>,
+        prefix: Option<&str>,
+        unacked_only: bool,
+        limit: usize,
+    ) -> Vec<HandoffSummary> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let items = store
+            .values()
+            .filter_map(|revs| revs.last())
+            .filter(|h| prefix.is_none_or(|p| h.task_id.starts_with(p)))
+            .filter(|h| !unacked_only || h.is_pending())
+            .map(normalize::handoff_summary)
+            .collect();
+        normalize::order_handoff_summaries(items, limit)
+    }
+}
+
+#[async_trait]
+impl HandoffRepository for InMemHandoffRepo {
+    async fn save_handoff(&self, input: HandoffInput) -> Result<Handoff, StorageError> {
+        // 先整批校验、再落库：非法输入不产生半条修订（docs §3.5）
+        let normalized = normalize::handoff(&input)?;
+
+        let mut store = self.store.lock().unwrap();
+        let revs = store.entry(normalized.task_id.clone()).or_default();
+        let saved = Handoff {
+            task_id: normalized.task_id,
+            revision: revs.last().map_or(1, |h| h.revision + 1),
+            goal: normalized.goal,
+            state: normalized.state,
+            next_steps: normalized.next_steps,
+            files: normalized.files,
+            decisions: normalized.decisions,
+            open_questions: normalized.open_questions,
+            client: normalized.client,
+            session_id: normalized.session_id,
+            created_at: now(),
+            // 新修订一律重新回到待接手：内容变了，上一次接手不算数（docs §7.2）
+            acked_at: None,
+            acked_by: String::new(),
+        };
+        revs.push(saved.clone());
+        Ok(saved)
+    }
+
+    async fn resolve_handoff(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<HandoffResolution, StorageError> {
+        let store = self.store.lock().unwrap();
+        match task_id {
+            Some(id) => Ok(match store.get(id.trim()).and_then(|revs| revs.last()) {
+                Some(h) => HandoffResolution::Found(Box::new(h.clone())),
+                None => HandoffResolution::None,
+            }),
+            None => {
+                // 与 SQLite 后端同源：候选口径来自 list，避免「列表有一条、load 说没有」
+                let candidates = Self::list_latest(&store, None, true, usize::MAX);
+                match candidates.len() {
+                    0 => Ok(HandoffResolution::None),
+                    1 => {
+                        let h = store
+                            .get(&candidates[0].task_id)
+                            .and_then(|revs| revs.last())
+                            .cloned();
+                        Ok(match h {
+                            Some(h) => HandoffResolution::Found(Box::new(h)),
+                            // 同一把锁内不可能发生；防御性写法而非 panic
+                            None => HandoffResolution::None,
+                        })
+                    }
+                    _ => Ok(HandoffResolution::Ambiguous(candidates)),
+                }
+            }
+        }
+    }
+
+    async fn list_handoffs(
+        &self,
+        prefix: Option<&str>,
+        unacked_only: bool,
+        limit: usize,
+    ) -> Result<Vec<HandoffSummary>, StorageError> {
+        let store = self.store.lock().unwrap();
+        Ok(Self::list_latest(&store, prefix, unacked_only, limit))
+    }
+
+    async fn ack_handoff(
+        &self,
+        task_id: Option<&str>,
+        client: &str,
+    ) -> Result<AckOutcome, StorageError> {
+        // 无 ID 的共享规则在锁外执行（它会回调 resolve_handoff，而 std Mutex 不可重入）
+        let Some(id) = task_id else {
+            return crate::storage::ack_resolving_none(self, client).await;
+        };
+
+        let id = id.trim().to_string();
+        let mut store = self.store.lock().unwrap();
+        let Some(latest) = store
+            .get_mut(&id)
+            .and_then(|revs| revs.last_mut())
+        else {
+            return Ok(AckOutcome {
+                resolution: HandoffResolution::None,
+                won: false,
+            });
+        };
+
+        // 单把锁内完成「判断 + 写入」＝天然 CAS；已接手则为幂等空操作
+        let won = latest.acked_at.is_none();
+        if won {
+            latest.acked_at = Some(now());
+            latest.acked_by = client.trim().to_string();
+        }
+        Ok(AckOutcome {
+            resolution: HandoffResolution::Found(Box::new(latest.clone())),
+            won,
+        })
+    }
+
+    async fn delete_handoff(&self, task_id: &str) -> Result<(), StorageError> {
+        // 幂等：不存在视为成功
+        self.store.lock().unwrap().remove(task_id.trim());
+        Ok(())
+    }
+}
+
+/// 单项目的内存仓库集合（记忆 + 交接共享同一个项目条目，丢弃项目时一并消失）。
+struct InMemProject {
+    /// 记忆仓库
+    memory: Arc<InMemMemoryRepo>,
+    /// 交接仓库
+    handoff: Arc<InMemHandoffRepo>,
+}
+
 /// 内存后端：按项目产出 `InMemMemoryRepo`，进程内不落盘。
 pub struct InMemBackend {
-    /// 项目 → 仓库实例
-    projects: Mutex<HashMap<String, Arc<InMemMemoryRepo>>>,
+    /// 项目 → 仓库集合
+    projects: Mutex<HashMap<String, Arc<InMemProject>>>,
 }
 
 impl InMemBackend {
@@ -267,17 +430,23 @@ impl StorageBackend for InMemBackend {
 
     async fn repositories_for(&self, project_id: &str) -> Result<ProjectRepos, StorageError> {
         crate::storage::validate_project_id(project_id)?;
-        let repo = {
+        let project = {
             let mut guard = self.projects.lock().unwrap();
             guard
                 .entry(project_id.to_string())
-                .or_insert_with(|| Arc::new(InMemMemoryRepo::new()))
+                .or_insert_with(|| {
+                    Arc::new(InMemProject {
+                        memory: Arc::new(InMemMemoryRepo::new()),
+                        handoff: Arc::new(InMemHandoffRepo::new()),
+                    })
+                })
                 .clone()
         };
         Ok(ProjectRepos {
             project_id: project_id.to_string(),
             backend: BackendKind::InMem,
-            memory: repo,
+            memory: project.memory.clone(),
+            handoff: project.handoff.clone(),
         })
     }
 
@@ -308,6 +477,14 @@ mod tests {
     async fn in_mem_satisfies_backend_contract() {
         let backend = super::InMemBackend::new();
         contract::run_backend_contract(&backend).await;
+    }
+
+    /// 交接仓库契约：内存后端是 SQLite 后端的行为基准，两边必须逐条一致。
+    #[tokio::test]
+    async fn in_mem_satisfies_handoff_contract() {
+        let backend = super::InMemBackend::new();
+        let repos = backend.repositories_for("handoff-contract").await.unwrap();
+        contract::run_handoff_contract(&*repos.handoff).await;
     }
 
     /// 不同项目必须互不可见。

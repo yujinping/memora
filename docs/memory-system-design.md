@@ -339,6 +339,8 @@ memora 作为 HTTP 传输的外部服务二者皆无，因此必须用仓内声�
 
 ### 5.4 会话工具（P5 扩展，MCP）
 
+> **顺延标注（2026-10-15）**：P4.5 已落地**任务交接（handoff）**作为跨机器会话恢复的第一形态（`handoff_save/load/list/ack` 四工具 + 零 ID 主路径），设计见 `docs/handoff-integration-design.md`。本节细粒度会话工具（`log_turn`/`get_session`/`list_sessions`）顺延为 **P5.1**，其余不动。
+
 在标准 9 个记忆工具之外，新增会话类工具（独立命名，不污染标准语义），由代理驱动实现跨机器会话恢复：
 
 | 工具 | 关键参数 | 行为 |
@@ -433,7 +435,8 @@ memora 作为 HTTP 传输的外部服务二者皆无，因此必须用仓内声�
 | **P4.2 运行形态** | caddy 式自守护 CLI（`run`/`start`/`stop`/`restart`/`status`/`init`）+ `.env` 查找路径显式化 + release 构建 + systemd/Caddy + 压测 | 公网可用，且无 systemd 也能跑 | 负载 / 隔离验证、进程生命周期端到端 |
 | **P4.3 配置单实例化** | 配置改为 XDG 绝对默认路径 + TOML + `--config`；`.env` 与 `--env-file` 退役；PID 文件升级为实例记录 | 「实例身份」不再随 CWD 漂移 | 默认路径解析、TOML 未知键拒绝、按记录探活与终止 |
 | **P4.4 网页控制台** | `/admin` 页面 + 用户名/口令登录（Argon2id）+ 内存会话 + 建项目 / 复制 token / 记忆浏览；`init` 生成随机凭据 | 不用 `curl` 也能建项目并查看记忆 | 口令与会话单测 + 控制台协议级用例（含 CSRF 与凭据隔离）+ 页面静态自洽断言 |
-| **P5 会话** | `conversations` 表 + `log_turn`/`get_session`/`list_sessions` + Zed/WorkBuddy 接入指令落地 | 会话跨机器恢复 | 会话写入 / 恢复单测 + 双客户端联调 |
+| **P4.5 任务交接** | `handoffs` 表（追加式修订 + ack CAS）+ `handoff_save/load/list/ack` 四 MCP 工具 + 7 条管理 REST + CLI `handoff` 子命令；零 ID 主路径（无 task_id 落 `current@<client>` 槽位） | 跨客户端 / 跨机器工作交接可保存、可恢复、可确认 | 契约 H1–H18 + 工具语义 + REST + CLI 解析与端到端；设计见 `docs/handoff-integration-design.md` |
+| **P5.1 会话**（原 P5） | `conversations` 表 + `log_turn`/`get_session`/`list_sessions` + Zed/WorkBuddy 接入指令落地 | 会话跨机器恢复 | 会话写入 / 恢复单测 + 双客户端联调 |
 
 **实施进度（截至 2026-09-15）**
 

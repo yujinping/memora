@@ -234,6 +234,212 @@ pub struct DeleteRelationsResponse {
     pub ids: Vec<i64>,
 }
 
+// ---------------------------------------------------------------------------
+// 交接（handoff，P4.3）
+// ---------------------------------------------------------------------------
+
+/// `handoff_list` 的 `limit` 缺省值。
+///
+/// @intent 10 与 REST 管理面（`GET /handoffs`）保持一致：人和代理看到同一个条数，
+///         才不会出现「AI 说只有 3 条、我用 curl 看到 12 条」的认知差。
+pub const DEFAULT_HANDOFF_LIST_LIMIT: usize = 10;
+
+/// `handoff_save` 入参。
+///
+/// @intent 出参里会带回最终 `task_id`，代理后续 save 时原样传回即「继续同一工作项」
+///         ——ID 只在工具结果里流转，从不要求人输入（docs §3.7）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffSaveRequest {
+    /// 这活要达成什么（必填，非空）
+    pub goal: String,
+    /// 现在到哪了（必填，非空）：只写结论性状态，不写过程
+    pub state: String,
+    /// 下一步要做什么；空数组 = 明确的「无事可做」
+    #[serde(default)]
+    pub next_steps: Vec<String>,
+    /// 关键文件 / 位置：接手方最需要的东西（去哪看）
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// 已定但接手方不知道就会重开讨论的事
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    /// 需要人拍板的
+    #[serde(default)]
+    pub open_questions: Vec<String>,
+    /// 任务标识。**省略即落到 `current@<client>` 分片槽位**（零 ID 主路径）
+    #[serde(default, alias = "taskId")]
+    pub task_id: Option<String>,
+    /// 写入方标识（如 "zed" / "workbuddy"）。无 `task_id` 时它决定落哪个槽位
+    #[serde(default)]
+    pub client: String,
+    /// 写入方会话标签（如 "A1"），仅作溯源展示，不参与寻址
+    #[serde(default, alias = "sessionId")]
+    pub session_id: String,
+}
+
+/// `handoff_load` 入参。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffLoadRequest {
+    /// 省略 = 取当前待接手的那一条（只有一条时直接命中，多条时返回候选）
+    #[serde(default, alias = "taskId")]
+    pub task_id: Option<String>,
+}
+
+/// `handoff_list` 入参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffListRequest {
+    /// 缺省 `true`：只列待接手的。想考古（「上周交接了什么」）才显式传 `false`
+    #[serde(default = "default_handoff_unacked_only", alias = "unackedOnly")]
+    pub unacked_only: bool,
+    /// 最多返回多少条，缺省 10
+    #[serde(default = "default_handoff_limit")]
+    pub limit: usize,
+    /// 只列 `task_id` 以该前缀开头的条目
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+/// `handoff_ack` 入参。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffAckRequest {
+    /// 省略 = 接手当前唯一待接手的那条；多条时返回候选而**不代替调用方选择**
+    #[serde(default, alias = "taskId")]
+    pub task_id: Option<String>,
+    /// 接手方标识，只影响 `acked_by` 诊断信息，不影响寻址语义
+    #[serde(default)]
+    pub client: String,
+}
+
+/// `handoff_list` 的 `unacked_only` 缺省值（只列待接手）。
+fn default_handoff_unacked_only() -> bool {
+    true
+}
+
+/// `handoff_list` 的 `limit` 缺省值。
+fn default_handoff_limit() -> usize {
+    DEFAULT_HANDOFF_LIST_LIMIT
+}
+
+/// 寻址结果状态：三种都是**正常返回**，没有一种是错误（docs §5.1 错误码分流）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum HandoffStatus {
+    /// 命中唯一一条
+    Found,
+    /// 没有可接手的交接（从未有过，或全部已被接手）
+    None,
+    /// 有多条同时待接手，需要调用方挑选
+    Ambiguous,
+}
+
+/// 一条完整交接的出参视图。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffView {
+    /// 任务标识（后续 load / ack / save 原样传回即「同一工作项」）
+    pub task_id: String,
+    /// 修订号
+    pub revision: i64,
+    /// 目标
+    pub goal: String,
+    /// 进展（完整正文）
+    pub state: String,
+    /// 下一步
+    pub next_steps: Vec<String>,
+    /// 关键文件
+    pub files: Vec<String>,
+    /// 已定事项
+    pub decisions: Vec<String>,
+    /// 待拍板事项
+    pub open_questions: Vec<String>,
+    /// 写入方标识，空串 = 未声明
+    pub client: String,
+    /// 写入方会话标签，空串 = 未声明
+    pub session_id: String,
+    /// 创建时间（Unix 秒）
+    pub created_at: i64,
+    /// 接手时间；`null` = 尚未被接手
+    pub acked_at: Option<i64>,
+    /// 接手方标识，空串 = 未声明
+    pub acked_by: String,
+}
+
+/// 列表摘要出参：**选择界面**的数据来源。
+///
+/// @intent 字段取舍标准是「认得出是哪一条」，不是「信息完整」：正文不进摘要，
+///         否则一屏放不下。`state_excerpt` 与 `session_id` 是辨认的关键两列。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffSummaryView {
+    /// 任务标识（选中后用它精确 load / ack）
+    pub task_id: String,
+    /// 最新修订号
+    pub revision: i64,
+    /// 目标
+    pub goal: String,
+    /// 状态首行片段（≤ 120 字符，截断带 `…`）
+    pub state_excerpt: String,
+    /// 写入方标识
+    pub client: String,
+    /// 写入方会话标签（如 "A1"）：人认得出的那一列
+    pub session_id: String,
+    /// 创建时间（Unix 秒）
+    pub created_at: i64,
+    /// 最新修订是否已被接手
+    pub acked: bool,
+    /// 接手方标识
+    pub acked_by: String,
+    /// 下一步条数
+    pub next_step_count: usize,
+}
+
+/// `handoff_save` 出参。
+///
+/// @intent 刻意回传 `task_id`：它是「代理侧不需要人参与」的关键——代理拿到后原样带回，
+///         即可继续同一工作项（docs §3.7 ID 生命周期）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffSaveResponse {
+    /// 落库后的完整修订
+    pub handoff: HandoffView,
+    /// 最终任务标识（分片槽位或调用方指定）
+    pub task_id: String,
+    /// 修订号
+    pub revision: i64,
+}
+
+/// `handoff_load` 出参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffLoadResponse {
+    /// `found` / `none` / `ambiguous`
+    pub status: HandoffStatus,
+    /// 仅 `status=found` 时存在
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandoffView>,
+    /// 仅 `status=ambiguous` 时非空：候选摘要供挑选
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<HandoffSummaryView>,
+}
+
+/// `handoff_ack` 出参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffAckResponse {
+    /// 寻址结果状态
+    pub status: HandoffStatus,
+    /// 本次调用是否真的抢到了接手权；`false` 说明已被他人接手（正常竞态结果）
+    pub won: bool,
+    /// 当前最新修订（含接手状态；`won=false` 时据此看到「谁先接的」）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandoffView>,
+    /// 仅 `status=ambiguous` 时非空
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<HandoffSummaryView>,
+}
+
+/// `handoff_list` 出参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffListResponse {
+    /// 摘要列表（`created_at` 降序，同秒 `task_id` 升序）
+    pub handoffs: Vec<HandoffSummaryView>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,3 +545,4 @@ mod tests {
         }
     }
 }
+

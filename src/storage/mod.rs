@@ -14,7 +14,7 @@ pub mod sqlite_file;
 
 /// 常用类型的扁平重导出，便于上层 `use crate::storage::{...}` 一把取用。
 pub use mem::InMemBackend;
-pub use repo::MemoryRepository;
+pub use repo::{HandoffRepository, MemoryRepository};
 pub use sqlite_file::SqliteFileBackend;
 
 #[cfg(test)]
@@ -89,6 +89,32 @@ pub struct ProjectRepos {
     pub backend: BackendKind,
     /// 记忆仓库
     pub memory: Arc<dyn MemoryRepository>,
+    /// 交接仓库（P4.3）
+    pub handoff: Arc<dyn HandoffRepository>,
+}
+
+/// 无 ID 的 ack：先按 [`HandoffRepository::resolve_handoff`] 的同一套规则寻址，再落到具体任务上。
+///
+/// @intent 抽成共用函数而非两个后端各写一遍，是因为这里藏着**唯一一条不可漂移的交互规则**：
+///         0 条 → 什么都没接；1 条 → 接它；≥2 条 → **绝不替调用方猜**，把候选交回去
+///         （docs §3.7 R1、§4.3 H15）。若两处实现略有差异，就会出现「一个后端替人猜、
+///         另一个不猜」的语义分裂，而契约测试只会在事后发现。
+pub async fn ack_resolving_none(
+    repo: &dyn HandoffRepository,
+    client: &str,
+) -> Result<crate::domain::AckOutcome, StorageError> {
+    use crate::domain::{AckOutcome, HandoffResolution};
+    match repo.resolve_handoff(None).await? {
+        HandoffResolution::None => Ok(AckOutcome {
+            resolution: HandoffResolution::None,
+            won: false,
+        }),
+        HandoffResolution::Ambiguous(candidates) => Ok(AckOutcome {
+            resolution: HandoffResolution::Ambiguous(candidates),
+            won: false,
+        }),
+        HandoffResolution::Found(h) => repo.ack_handoff(Some(&h.task_id), client).await,
+    }
 }
 
 /// 存储后端：按 project_id 产出仓库集合。

@@ -5,7 +5,7 @@
 //!          规则由两个后端共用，避免内存后端与 SQLite 后端的语义漂移
 //!          （行为等价是「换后端不改业务代码」的前提）。
 
-use crate::domain::{EntityInput, ObservationInput, RelationInput};
+use crate::domain::{EntityInput, HandoffInput, ObservationInput, RelationInput};
 use crate::error::StorageError;
 
 /// 规范化单个实体：名称去空白后不得为空；类型为空则落为 `unknown`；来源仅去空白（可空）。
@@ -84,6 +84,249 @@ pub fn observations(
 
 /// 关系四元组：(起点, 终点, 关系类型, 来源)。
 pub type RelationKey = (String, String, String, String);
+
+// ---------------------------------------------------------------------------
+// 交接（handoff）校验（docs §3.2 / §3.5）
+// ---------------------------------------------------------------------------
+
+/// `goal` / `state` 单字段上限。
+pub const HANDOFF_TEXT_MAX_BYTES: usize = 16 * 1024;
+/// 数组单元素上限。
+pub const HANDOFF_ITEM_MAX_BYTES: usize = 4 * 1024;
+/// 每个数组的元素数上限。
+pub const HANDOFF_ITEMS_MAX: usize = 64;
+/// 整条交接的正文总量上限。
+pub const HANDOFF_TOTAL_MAX_BYTES: usize = 64 * 1024;
+/// `client` / `session_id` 这类标识字段的上限（它们不是正文，但同样不该无界）。
+pub const HANDOFF_IDENT_MAX_BYTES: usize = 256;
+/// `task_id` 长度上限（字符）。
+pub const HANDOFF_TASK_ID_MAX_CHARS: usize = 128;
+/// 列表摘要里状态片段的长度上限（字符）。
+pub const HANDOFF_EXCERPT_CHARS: usize = 120;
+
+/// 校验并规范化后的交接输入：字段一律去首尾空白，`task_id` 已确定（不再有 `None`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedHandoff {
+    /// 最终任务标识（显式指定或分片槽位）
+    pub task_id: String,
+    /// 目标
+    pub goal: String,
+    /// 进展
+    pub state: String,
+    /// 下一步
+    pub next_steps: Vec<String>,
+    /// 关键文件
+    pub files: Vec<String>,
+    /// 已定事项
+    pub decisions: Vec<String>,
+    /// 待拍板事项
+    pub open_questions: Vec<String>,
+    /// 写入方标识，空串 = 未声明
+    pub client: String,
+    /// 写入方会话标签，空串 = 未声明
+    pub session_id: String,
+}
+
+/// 校验并规范化一条交接输入。
+///
+/// @intent 与记忆写侧同源：**先整批校验、再落库**，非法输入不产生半条修订（docs §3.5）。
+///         `task_id` 为 `None` 时由 [`crate::domain::default_handoff_task_id`] 推导分片槽位；
+///         而 `Some("")` 是**显式给了个空 ID**，属于调用方笔误，故报错而非静默落默认槽位
+///         ——静默兜底会让「我明明指定了」与「系统给我换了一个」无法区分。
+pub fn handoff(input: &HandoffInput) -> Result<NormalizedHandoff, StorageError> {
+    let client = ident("client", &input.client)?;
+    let session_id = ident("session_id", &input.session_id)?;
+
+    let task_id = match input.task_id.as_deref() {
+        None => crate::domain::default_handoff_task_id(&client),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(StorageError::InvalidInput(
+                    "task_id must be non-empty when provided; omit it to use the default slot"
+                        .to_string(),
+                ));
+            }
+            if trimmed.chars().count() > HANDOFF_TASK_ID_MAX_CHARS {
+                return Err(StorageError::InvalidInput(format!(
+                    "task_id must be at most {HANDOFF_TASK_ID_MAX_CHARS} characters"
+                )));
+            }
+            if let Some(bad) = trimmed
+                .chars()
+                .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-')))
+            {
+                return Err(StorageError::InvalidInput(format!(
+                    "task_id contains an unsupported character {bad:?}; allowed: A-Z a-z 0-9 . _ @ -"
+                )));
+            }
+            trimmed.to_string()
+        }
+    };
+
+    let goal = text_field("goal", &input.goal)?;
+    let state = text_field("state", &input.state)?;
+    let next_steps = item_list("next_steps", &input.next_steps)?;
+    let files = item_list("files", &input.files)?;
+    let decisions = item_list("decisions", &input.decisions)?;
+    let open_questions = item_list("open_questions", &input.open_questions)?;
+
+    let total = goal.len()
+        + state.len()
+        + next_steps.iter().map(String::len).sum::<usize>()
+        + files.iter().map(String::len).sum::<usize>()
+        + decisions.iter().map(String::len).sum::<usize>()
+        + open_questions.iter().map(String::len).sum::<usize>();
+    if total > HANDOFF_TOTAL_MAX_BYTES {
+        return Err(StorageError::InvalidInput(format!(
+            "handoff body is {total} bytes, over the {HANDOFF_TOTAL_MAX_BYTES}-byte limit; \
+             a handoff is a summary — use a transcript for full detail"
+        )));
+    }
+
+    Ok(NormalizedHandoff {
+        task_id,
+        goal,
+        state,
+        next_steps,
+        files,
+        decisions,
+        open_questions,
+        client,
+        session_id,
+    })
+}
+
+/// 必填正文：去空白后非空，且不超过单字段上限。
+fn text_field(name: &str, raw: &str) -> Result<String, StorageError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(StorageError::InvalidInput(format!("{name} must be non-empty")));
+    }
+    if trimmed.len() > HANDOFF_TEXT_MAX_BYTES {
+        return Err(StorageError::InvalidInput(format!(
+            "{name} is {} bytes, over the {HANDOFF_TEXT_MAX_BYTES}-byte limit",
+            trimmed.len()
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// 可选标识：只去空白，允许为空；但不允许无界。
+fn ident(name: &str, raw: &str) -> Result<String, StorageError> {
+    let trimmed = raw.trim();
+    if trimmed.len() > HANDOFF_IDENT_MAX_BYTES {
+        return Err(StorageError::InvalidInput(format!(
+            "{name} is {} bytes, over the {HANDOFF_IDENT_MAX_BYTES}-byte limit",
+            trimmed.len()
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// 列表字段：条数与单元素长度受限，**保序**，空元素视为笔误报错。
+///
+/// @intent 不静默丢弃空元素：交接是给下一个人看的，「这条下一步是空的」只会让接手方
+///         以为漏了东西；宁可让写入方现在就知道自己传了个空串。
+fn item_list(name: &str, raw: &[String]) -> Result<Vec<String>, StorageError> {
+    if raw.len() > HANDOFF_ITEMS_MAX {
+        return Err(StorageError::InvalidInput(format!(
+            "{name} has {} items, over the {HANDOFF_ITEMS_MAX}-item limit",
+            raw.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for item in raw {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            return Err(StorageError::InvalidInput(format!(
+                "{name} contains an empty item"
+            )));
+        }
+        if trimmed.len() > HANDOFF_ITEM_MAX_BYTES {
+            return Err(StorageError::InvalidInput(format!(
+                "{name} item is {} bytes, over the {HANDOFF_ITEM_MAX_BYTES}-byte limit",
+                trimmed.len()
+            )));
+        }
+        out.push(trimmed.to_string());
+    }
+    Ok(out)
+}
+
+/// 列表摘要用的状态片段：取首行、去空白、截断到 [`HANDOFF_EXCERPT_CHARS`] 字符。
+///
+/// @intent 截断必须**可见**（末尾加 `…`）而不是静默砍掉：接手方看到被截断的句子会去
+///         打开正文，看到一句「完整」的话却缺少关键信息时则无从得知还有下文。
+pub fn state_excerpt(state: &str) -> String {
+    let first_line = state.trim().lines().next().unwrap_or("").trim();
+    let mut chars = first_line.chars();
+    let head: String = chars.by_ref().take(HANDOFF_EXCERPT_CHARS).collect();
+    if chars.next().is_some() {
+        // 超限才截断：回退 1 字符给省略号腾位，保证可见总长仍 ≤ HANDOFF_EXCERPT_CHARS。
+        // 恰好达上限的句子是完整的，不得加省略号（见 normalize 用例「恰好达上限」）。
+        let mut head = head;
+        head.pop();
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+// --- 交接：两后端共用的派生规则 -------------------------------------------
+//
+// @intent 下面几个函数是「后端必须行为一致」的部分，抽出来共用而不是各写一遍：
+//         行为等价是「换后端不改业务代码」的前提，而契约测试只能事后发现漂移。
+
+/// 由完整修订生成列表摘要（摘要口径只在这里定义一次）。
+pub fn handoff_summary(h: &crate::domain::Handoff) -> crate::domain::HandoffSummary {
+    crate::domain::HandoffSummary {
+        task_id: h.task_id.clone(),
+        revision: h.revision,
+        goal: h.goal.clone(),
+        state_excerpt: state_excerpt(&h.state),
+        client: h.client.clone(),
+        session_id: h.session_id.clone(),
+        created_at: h.created_at,
+        acked: h.acked_at.is_some(),
+        acked_by: h.acked_by.clone(),
+        next_step_count: h.next_steps.len(),
+    }
+}
+
+/// **先排序、后截断**——顺序不可颠倒（docs §4.3 H11）。
+///
+/// @intent 把两步合成一个函数，是为了让「先 LIMIT 再 ORDER BY」这个高发缺陷
+///         在后端代码里**没有地方可以写出来**：调用方拿到的是「已排好序的前 N 条」。
+///         `limit == 0` 返回空集（不是「不限」——那是静默的语义陷阱）。
+pub fn order_handoff_summaries(
+    mut items: Vec<crate::domain::HandoffSummary>,
+    limit: usize,
+) -> Vec<crate::domain::HandoffSummary> {
+    items.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    if limit == 0 {
+        return Vec::new();
+    }
+    items.truncate(limit);
+    items
+}
+
+/// 数组列序列化：空数组落为 `[]`，**不落 NULL**（docs §3.3）。
+pub fn handoff_array_to_json(items: &[String]) -> String {
+    // `Vec<String>` 的序列化不可能失败（无自定义 Serialize、无 map 键），
+    // 故此处不用 `unwrap_or_else` 兜底——静默降级成 `[]` 会悄悄丢数据。
+    serde_json::to_string(items).expect("serializing Vec<String> to JSON cannot fail")
+}
+
+/// 数组列反序列化：列内容损坏属于**后端故障**（不是调用方输入问题），故归 `Backend`。
+pub fn handoff_array_from_json(raw: &str) -> Result<Vec<String>, StorageError> {
+    serde_json::from_str(raw)
+        .map_err(|e| StorageError::Backend(format!("handoff array column is not valid JSON: {e}")))
+}
 
 /// 宽松规范化实体名列表：去空白、丢弃空项、按首次出现去重。
 ///
@@ -202,5 +445,142 @@ mod tests {
             vec![canonical],
             "同一输入经写路径与读路径必须得到同一个名字"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 交接（handoff）校验
+    // -----------------------------------------------------------------------
+
+    /// 基准输入：一条合法的最小交接。
+    fn base() -> HandoffInput {
+        HandoffInput::new("  把 handoff 并入 memora  ", "  设计完成，待实现  ")
+    }
+
+    /// 零 ID 主路径：不给 task_id 时由 client 推导分片槽位，并统一去空白。
+    #[test]
+    fn handoff_defaults_to_sharded_slot_and_trims() {
+        let n = handoff(&base().with_client("  zed  ")).unwrap();
+        assert_eq!(n.task_id, "current@zed");
+        assert_eq!(n.client, "zed");
+        assert_eq!(n.goal, "把 handoff 并入 memora");
+        assert_eq!(n.state, "设计完成，待实现");
+        assert_eq!(n.session_id, "", "未声明会话应落空串");
+        assert!(n.next_steps.is_empty(), "未给数组应落空数组");
+    }
+
+    /// 未声明 client 时退回项目级槽位（而不是报错——client 是可选字段）。
+    #[test]
+    fn handoff_without_client_uses_project_wide_slot() {
+        assert_eq!(handoff(&base()).unwrap().task_id, "current");
+    }
+
+    /// 显式 task_id 允许 `.` 与 `@`（与 project_id 的字符集**刻意不同**，docs §3.2）。
+    #[test]
+    fn handoff_accepts_explicit_task_id_with_dot_and_at() {
+        assert_eq!(
+            handoff(&base().with_task("v1.2-api@refactor")).unwrap().task_id,
+            "v1.2-api@refactor"
+        );
+    }
+
+    /// 非法 task_id 一律拒绝：空串是笔误（不是「请用默认槽位」），路径分隔符尤其危险。
+    #[test]
+    fn handoff_rejects_illegal_task_id() {
+        for bad in ["", "   ", "a/b", "a b", "a#b", "../etc", "a\\b"] {
+            assert!(
+                handoff(&base().with_task(bad)).is_err(),
+                "task_id {bad:?} 应被拒绝"
+            );
+        }
+        let too_long = "a".repeat(HANDOFF_TASK_ID_MAX_CHARS + 1);
+        assert!(handoff(&base().with_task(too_long)).is_err());
+        // 边界：恰好 128 字符应通过
+        let at_limit = "a".repeat(HANDOFF_TASK_ID_MAX_CHARS);
+        assert!(handoff(&base().with_task(at_limit)).is_ok());
+    }
+
+    /// goal / state 必填：空交接没有意义，必须当场拒绝而不是存一条空记录。
+    #[test]
+    fn handoff_requires_goal_and_state() {
+        assert!(handoff(&HandoffInput::new("", "有进展")).is_err());
+        assert!(handoff(&HandoffInput::new("有目标", "   ")).is_err());
+    }
+
+    /// 各层容量上限：单字段、单元素、条数、整条。边界值本身必须通过。
+    #[test]
+    fn handoff_enforces_layer_limits_with_inclusive_boundaries() {
+        // 单字段：恰好 16 KiB 通过，多 1 字节拒绝
+        let ok_text = "a".repeat(HANDOFF_TEXT_MAX_BYTES);
+        assert!(handoff(&HandoffInput::new(ok_text.clone(), "s")).is_ok());
+        let over_text = "a".repeat(HANDOFF_TEXT_MAX_BYTES + 1);
+        assert!(handoff(&HandoffInput::new(over_text, "s")).is_err());
+
+        // 数组条数：恰好 64 通过，65 拒绝
+        let max_items = vec!["step".to_string(); HANDOFF_ITEMS_MAX];
+        assert!(handoff(&base().with_next_steps(max_items)).is_ok());
+        let too_many = vec!["step".to_string(); HANDOFF_ITEMS_MAX + 1];
+        assert!(handoff(&base().with_next_steps(too_many)).is_err());
+
+        // 单元素：恰好 4 KiB 通过，多 1 字节拒绝
+        let ok_item = vec!["b".repeat(HANDOFF_ITEM_MAX_BYTES)];
+        assert!(handoff(&base().with_files(ok_item)).is_ok());
+        let over_item = vec!["b".repeat(HANDOFF_ITEM_MAX_BYTES + 1)];
+        assert!(handoff(&base().with_files(over_item)).is_err());
+    }
+
+    /// 整条上限：每个字段都合法，加起来超限也要拒绝（否则「用错工具」无人制止）。
+    #[test]
+    fn handoff_enforces_total_size_across_fields() {
+        let bulk = || -> Vec<String> { vec!["c".repeat(256); HANDOFF_ITEMS_MAX] };
+        let input = HandoffInput::new("g".repeat(8 * 1024), "s".repeat(8 * 1024))
+            .with_next_steps(bulk())
+            .with_files(bulk())
+            .with_decisions(bulk())
+            .with_open_questions(bulk());
+        let err = handoff(&input).unwrap_err();
+        assert!(
+            matches!(&err, StorageError::InvalidInput(m) if m.contains("over the")),
+            "应因整条超限而拒绝，实际：{err:?}"
+        );
+    }
+
+    /// 空元素是笔误，报错而不是静默丢弃。
+    #[test]
+    fn handoff_rejects_blank_items() {
+        assert!(handoff(&base().with_next_steps(vec!["ok".into(), "  ".into()])).is_err());
+    }
+
+    /// 数组保序且逐项去空白——接手方看到的顺序必须与写入方一致。
+    #[test]
+    fn handoff_preserves_item_order_and_trims_each() {
+        let n = handoff(&base().with_next_steps(vec![
+            " 第二步 ".to_string(),
+            "第一步".to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(n.next_steps, vec!["第二步".to_string(), "第一步".to_string()]);
+    }
+
+    /// 标识字段有界（它们不是正文，但不该无界）。
+    #[test]
+    fn handoff_bounds_ident_fields() {
+        let long = "c".repeat(HANDOFF_IDENT_MAX_BYTES + 1);
+        assert!(handoff(&base().with_client(long)).is_err());
+        let long = "s".repeat(HANDOFF_IDENT_MAX_BYTES + 1);
+        assert!(handoff(&base().with_session(long)).is_err());
+    }
+
+    /// 摘要取首行并**可见地**标记截断。
+    #[test]
+    fn state_excerpt_takes_first_line_and_marks_truncation() {
+        assert_eq!(state_excerpt("第一行\n第二行"), "第一行");
+        assert_eq!(state_excerpt("  空白包围  "), "空白包围");
+
+        let exact = "x".repeat(HANDOFF_EXCERPT_CHARS);
+        assert_eq!(state_excerpt(&exact), exact, "恰好达上限不应出现省略号");
+
+        let over = state_excerpt(&"x".repeat(HANDOFF_EXCERPT_CHARS + 1));
+        assert!(over.ends_with('…'), "超长必须标记截断：{over}");
+        assert_eq!(over.chars().count(), HANDOFF_EXCERPT_CHARS);
     }
 }

@@ -27,6 +27,8 @@ mod daemon;
 mod domain;
 mod entity;
 mod error;
+mod handoff_cli;
+mod http;
 mod instance;
 mod mcp;
 mod meta;
@@ -119,6 +121,28 @@ fn main() -> ExitCode {
                 Command::Run => {
                     source.log();
                     serve(config).map(|()| 0)
+                }
+                Command::Handoff { action } => {
+                    // CLI 与 daemon 平级：只加载配置（端口 / token），不触碰存储
+                    let endpoint =
+                        match http::Endpoint::parse(parsed.handoff.server.as_deref().unwrap_or(""), config.port)
+                        {
+                            Ok(ep) => ep,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                return ExitCode::from(2);
+                            }
+                        };
+                    handoff_cli::run(
+                        action,
+                        &parsed.handoff,
+                        &handoff_cli::HandoffConfig {
+                            endpoint,
+                            token: config.admin_token.clone(),
+                        },
+                        std::env::var("MEMORA_PROJECT").ok().as_deref(),
+                    )
+                    .map_err(anyhow::Error::msg)
                 }
                 Command::Start => {
                     source.log();

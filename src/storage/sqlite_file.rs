@@ -11,11 +11,14 @@
 //! 该差异完全锁在本文件内，不向调用方泄漏。
 #![allow(clippy::doc_lazy_continuation)]
 
-use crate::domain::{Entity, EntityInput, Graph, Observation, ObservationInput, Relation, RelationInput};
-use crate::entity::memory::{entities, observations, relations};
+use crate::domain::{
+    AckOutcome, Entity, EntityInput, Graph, Handoff, HandoffInput, HandoffResolution,
+    HandoffSummary, Observation, ObservationInput, Relation, RelationInput,
+};
+use crate::entity::memory::{entities, handoffs, observations, relations};
 use crate::error::StorageError;
 use crate::storage::normalize;
-use crate::storage::repo::MemoryRepository;
+use crate::storage::repo::{HandoffRepository, MemoryRepository};
 use crate::storage::{BackendKind, ProjectRepos, StorageBackend};
 use async_trait::async_trait;
 use sea_orm::ActiveValue::Set;
@@ -61,6 +64,27 @@ const MEMORY_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_name)",
     "CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_name)",
     "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(name, content, obs_id UNINDEXED)",
+    // --- P4.3 交接：与记忆同库但独立成表（两种写语义，见 docs §3.4）---
+    // 主键 `(task_id, revision)`：一次 save = 一条不可变修订，旧修订永不改写。
+    // 四组数组列存 JSON 文本，空数组落 `[]`、不落 NULL。
+    "CREATE TABLE IF NOT EXISTS handoffs (\
+        task_id TEXT NOT NULL, \
+        revision INTEGER NOT NULL, \
+        goal TEXT NOT NULL, \
+        state TEXT NOT NULL, \
+        next_steps TEXT NOT NULL, \
+        files TEXT NOT NULL, \
+        decisions TEXT NOT NULL, \
+        open_questions TEXT NOT NULL, \
+        client TEXT NOT NULL DEFAULT '', \
+        session_id TEXT NOT NULL DEFAULT '', \
+        created_at INTEGER NOT NULL, \
+        acked_at INTEGER, \
+        acked_by TEXT NOT NULL DEFAULT '', \
+        PRIMARY KEY (task_id, revision)\
+    )",
+    // 「每任务只取最新修订」是 list / resolve 的共同形态，故索引按 (task_id, revision DESC)
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id, revision DESC)",
 ];
 
 /// 检索索引中「实体占位行」的 `obs_id` 取值（真实观测 id 自增，从 1 开始）。
@@ -603,6 +627,270 @@ impl MemoryRepository for SqliteMemoryRepo {
     }
 }
 
+/// 单项目库的交接仓库（与 [`SqliteMemoryRepo`] 共享同一个连接池）。
+///
+/// @intent 同库同连接，但**不共用仓库对象**：交接是追加修订语义、记忆是幂等合并语义，
+///         合并成一个对象会让「哪张表归谁」变得含糊。连接内部是 `Arc`，克隆代价可忽略。
+pub struct SqliteHandoffRepo {
+    /// 项目库连接（与记忆仓库同一份）
+    db: DatabaseConnection,
+}
+
+impl SqliteHandoffRepo {
+    /// 行模型 → 领域模型（JSON 列在此还原成数组）。
+    fn to_handoff(m: handoffs::Model) -> Result<Handoff, StorageError> {
+        Ok(Handoff {
+            task_id: m.task_id,
+            revision: m.revision,
+            goal: m.goal,
+            state: m.state,
+            next_steps: normalize::handoff_array_from_json(&m.next_steps)?,
+            files: normalize::handoff_array_from_json(&m.files)?,
+            decisions: normalize::handoff_array_from_json(&m.decisions)?,
+            open_questions: normalize::handoff_array_from_json(&m.open_questions)?,
+            client: m.client,
+            session_id: m.session_id,
+            created_at: m.created_at,
+            acked_at: m.acked_at,
+            acked_by: m.acked_by,
+        })
+    }
+
+    /// 取某任务的最新修订（连接与事务上都可用，故对 `ConnectionTrait` 泛型）。
+    async fn load_latest_on<C: ConnectionTrait>(
+        db: &C,
+        task_id: &str,
+    ) -> Result<Option<Handoff>, StorageError> {
+        let model = handoffs::Entity::find()
+            .filter(handoffs::Column::TaskId.eq(task_id))
+            .order_by_desc(handoffs::Column::Revision)
+            .one(db)
+            .await?;
+        model.map(Self::to_handoff).transpose()
+    }
+
+    /// 取某任务的最新修订（本仓库连接）。
+    async fn load_latest(&self, task_id: &str) -> Result<Option<Handoff>, StorageError> {
+        Self::load_latest_on(&self.db, task_id).await
+    }
+
+    /// 在事务中追加一条修订并读回。
+    ///
+    /// @intent 修订号用**单条 `INSERT ... SELECT COALESCE(MAX(revision),0)+1`** 分配，
+    ///         而不是「先查 max 再插入」：后者在并发 save 下会各自算出同一个修订号，
+    ///         撞主键而失败。SQLite 的写事务天然串行，故单语句即原子。
+    async fn append_revision(
+        txn: &DatabaseTransaction,
+        n: &normalize::NormalizedHandoff,
+    ) -> Result<Handoff, StorageError> {
+        let sql = "INSERT INTO handoffs (\
+                task_id, revision, goal, state, next_steps, files, decisions, \
+                open_questions, client, session_id, created_at, acked_at, acked_by\
+            ) SELECT ?, COALESCE(MAX(revision), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '' \
+            FROM handoffs WHERE task_id = ?";
+        txn.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [
+                n.task_id.clone().into(),
+                n.goal.clone().into(),
+                n.state.clone().into(),
+                normalize::handoff_array_to_json(&n.next_steps).into(),
+                normalize::handoff_array_to_json(&n.files).into(),
+                normalize::handoff_array_to_json(&n.decisions).into(),
+                normalize::handoff_array_to_json(&n.open_questions).into(),
+                n.client.clone().into(),
+                n.session_id.clone().into(),
+                now().into(),
+                n.task_id.clone().into(),
+            ],
+        ))
+        .await?;
+
+        Self::load_latest_on(txn, &n.task_id).await?.ok_or_else(|| {
+            StorageError::Backend(
+                "handoff insert succeeded but read-back found no revision".to_string(),
+            )
+        })
+    }
+
+    /// 每任务最新修订的摘要列表。
+    ///
+    /// @intent SQL 里已 `ORDER BY ... LIMIT`（避免为取 10 条而全量读出），但排序口径
+    ///         仍以共用的 [`normalize::order_handoff_summaries`] 为唯一真相——两个后端
+    ///         都必须经过它，H11（先排序后截断）才不会只在一边成立。
+    ///         `limit == usize::MAX` 表示不限（用于 `resolve(None)` 取全部候选）。
+    async fn list_latest(
+        &self,
+        prefix: Option<&str>,
+        unacked_only: bool,
+        limit: usize,
+    ) -> Result<Vec<HandoffSummary>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut sql = String::from(
+            "SELECT h.* FROM handoffs h \
+             JOIN (SELECT task_id, MAX(revision) AS revision FROM handoffs GROUP BY task_id) m \
+               ON h.task_id = m.task_id AND h.revision = m.revision \
+             WHERE 1 = 1",
+        );
+        let mut values: Vec<sea_orm::Value> = Vec::new();
+        if unacked_only {
+            sql.push_str(" AND h.acked_at IS NULL");
+        }
+        if let Some(p) = prefix {
+            // 用 substr 而不是 LIKE：task_id 允许 `_`，而它在 LIKE 里是单字符通配符，
+            // 会让前缀 `a_` 意外匹配到 `ab`。
+            sql.push_str(" AND substr(h.task_id, 1, length(?)) = ?");
+            values.push(p.to_string().into());
+            values.push(p.to_string().into());
+        }
+        sql.push_str(" ORDER BY h.created_at DESC, h.task_id ASC");
+        if limit != usize::MAX {
+            sql.push_str(" LIMIT ?");
+            values.push((limit as i64).into());
+        }
+
+        let models: Vec<handoffs::Model> = handoffs::Entity::find()
+            .from_raw_sql(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql.as_str(),
+                values,
+            ))
+            .all(&self.db)
+            .await?;
+
+        let full: Vec<Handoff> = models
+            .into_iter()
+            .map(Self::to_handoff)
+            .collect::<Result<Vec<_>, _>>()?;
+        let summaries = full.iter().map(normalize::handoff_summary).collect();
+        Ok(normalize::order_handoff_summaries(summaries, limit))
+    }
+}
+
+#[async_trait]
+impl HandoffRepository for SqliteHandoffRepo {
+    async fn save_handoff(&self, input: HandoffInput) -> Result<Handoff, StorageError> {
+        // 先整批校验、再落库：非法输入不产生半条修订（docs §3.5）
+        let normalized = normalize::handoff(&input)?;
+
+        let txn = self.db.begin().await?;
+        match Self::append_revision(&txn, &normalized).await {
+            Ok(saved) => {
+                txn.commit().await?;
+                Ok(saved)
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn resolve_handoff(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<HandoffResolution, StorageError> {
+        match task_id {
+            Some(id) => Ok(match self.load_latest(id.trim()).await? {
+                Some(h) => HandoffResolution::Found(Box::new(h)),
+                None => HandoffResolution::None,
+            }),
+            None => {
+                // 复用 list 的候选口径：resolve(None) 与「列表里看到的东西」必须同源，
+                // 否则会出现「列表说有一条、load 说没有」这种自相矛盾的界面。
+                let candidates = self.list_latest(None, true, usize::MAX).await?;
+                match candidates.len() {
+                    0 => Ok(HandoffResolution::None),
+                    1 => {
+                        let id = candidates[0].task_id.clone();
+                        Ok(match self.load_latest(&id).await? {
+                            Some(h) => HandoffResolution::Found(Box::new(h)),
+                            // 并发删除的窄窗口：如实返回「没有了」，不 panic
+                            None => HandoffResolution::None,
+                        })
+                    }
+                    _ => Ok(HandoffResolution::Ambiguous(candidates)),
+                }
+            }
+        }
+    }
+
+    async fn list_handoffs(
+        &self,
+        prefix: Option<&str>,
+        unacked_only: bool,
+        limit: usize,
+    ) -> Result<Vec<HandoffSummary>, StorageError> {
+        self.list_latest(prefix, unacked_only, limit).await
+    }
+
+    async fn ack_handoff(
+        &self,
+        task_id: Option<&str>,
+        client: &str,
+    ) -> Result<AckOutcome, StorageError> {
+        let Some(id) = task_id else {
+            // 无 ID：由共用规则决定「0 条什么都不做 / 1 条接它 / ≥2 条绝不替人猜」
+            return crate::storage::ack_resolving_none(self, client).await;
+        };
+
+        let Some(current) = self.load_latest(id.trim()).await? else {
+            return Ok(AckOutcome {
+                resolution: HandoffResolution::None,
+                won: false,
+            });
+        };
+        if current.acked_at.is_some() {
+            // 幂等：已接手时保持首次的 acked_at / acked_by 不变
+            return Ok(AckOutcome {
+                resolution: HandoffResolution::Found(Box::new(current)),
+                won: false,
+            });
+        }
+
+        // CAS：只有「仍未被接手」的那条修订会被写中，受影响行数即「是否抢到」
+        let affected = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE handoffs SET acked_at = ?, acked_by = ? \
+                 WHERE task_id = ? AND revision = ? AND acked_at IS NULL",
+                [
+                    now().into(),
+                    client.trim().to_string().into(),
+                    current.task_id.clone().into(),
+                    current.revision.into(),
+                ],
+            ))
+            .await?
+            .rows_affected();
+        let won = affected == 1;
+
+        // 抢输的一方也要看到「谁抢到了」：故一律读回当前最新修订
+        let latest = self.load_latest(&current.task_id).await?.unwrap_or(current);
+        Ok(AckOutcome {
+            resolution: HandoffResolution::Found(Box::new(latest)),
+            won,
+        })
+    }
+
+    async fn delete_handoff(&self, task_id: &str) -> Result<(), StorageError> {
+        // 幂等：不存在视为成功；空 ID 也是「无事可删」，不额外制造一个失败分支
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM handoffs WHERE task_id = ?",
+                [task_id.trim().to_string().into()],
+            ))
+            .await?;
+        Ok(())
+    }
+}
+
 /// SQLite 文件后端：按 project_id 换算出项目库路径。
 ///
 /// @intent `projects.db_path`（元库登记值）仅作记录，项目库位置以本后端推导结果为准，
@@ -678,7 +966,8 @@ impl SqliteFileBackend {
         ProjectRepos {
             project_id: project_id.to_string(),
             backend: BackendKind::SqliteFile,
-            memory: Arc::new(SqliteMemoryRepo { db }),
+            memory: Arc::new(SqliteMemoryRepo { db: db.clone() }),
+            handoff: Arc::new(SqliteHandoffRepo { db }),
         }
     }
 
@@ -744,7 +1033,7 @@ impl StorageBackend for SqliteFileBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::EntityInput;
+    use crate::domain::{EntityInput, HandoffInput};
     use crate::storage::contract;
     use crate::storage::StorageBackend;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -783,6 +1072,88 @@ mod tests {
     async fn sqlite_file_satisfies_backend_contract() {
         let backend = SqliteFileBackend::new(temp_data_dir());
         contract::run_backend_contract(&backend).await;
+    }
+
+    /// 交接仓库必须与内存后端行为完全等价（H1–H18 各跑一遍）。
+    #[tokio::test]
+    async fn sqlite_file_satisfies_handoff_contract() {
+        let backend = SqliteFileBackend::new(temp_data_dir());
+        let repos = backend.repositories_for("handoff-contract").await.unwrap();
+        contract::run_handoff_contract(&*repos.handoff).await;
+    }
+
+    /// 修订必须**物理留存且不可改写**；排序规则用可控的 `created_at` 钉死。
+    ///
+    /// @intent 契约层没有「读历史修订」的接口（产品上也不需要），因此「旧修订仍在」
+    ///         与「created_at 降序」这两条只能在后端层直接查表验证。真实时钟在一秒
+    ///         内无法制造出顺序差异，故这里手工写入 `created_at`——这是唯一能把
+    ///         「排序键真的是 created_at」与「只是恰好按 task_id 排」区分开的办法。
+    #[tokio::test]
+    async fn handoff_revisions_persist_immutably_and_order_by_created_at() {
+        let backend = SqliteFileBackend::new(temp_data_dir());
+        let project = "handoff-history";
+        let repos = backend.repositories_for(project).await.unwrap();
+
+        for v in 1..=3 {
+            repos
+                .handoff
+                .save_handoff(
+                    HandoffInput::new(format!("v{v}"), format!("状态 {v}")).with_task("t"),
+                )
+                .await
+                .unwrap();
+        }
+
+        // 另一个连接直接查表：确认三次 save 是三条并存的行，且旧内容未被改写
+        let db = Database::connect(format!(
+            "sqlite://{}?mode=rwc",
+            backend.db_path(project).display()
+        ))
+        .await
+        .unwrap();
+        let rows = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT revision, goal FROM handoffs WHERE task_id = 't' ORDER BY revision",
+            ))
+            .await
+            .unwrap();
+        let revisions: Vec<i64> = rows
+            .iter()
+            .map(|r| r.try_get::<i64>("", "revision").unwrap())
+            .collect();
+        let goals: Vec<String> = rows
+            .iter()
+            .map(|r| r.try_get::<String>("", "goal").unwrap())
+            .collect();
+        assert_eq!(revisions, vec![1, 2, 3], "三个修订必须同时留存（只追加）");
+        assert_eq!(goals, vec!["v1", "v2", "v3"], "旧修订内容不得被后续 save 改写");
+
+        // 手工 created_at：o-2 与 o-3 同秒（比 task_id 升序），o-1 最旧（排最后）
+        for (id, created_at) in [("o-2", 200_i64), ("o-1", 100), ("o-3", 200)] {
+            db.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO handoffs (\
+                    task_id, revision, goal, state, next_steps, files, decisions, \
+                    open_questions, client, session_id, created_at, acked_at, acked_by\
+                 ) VALUES (?, 1, ?, '', '[]', '[]', '[]', '[]', '', '', ?, NULL, '')",
+                [id.into(), format!("{id} 的活").into(), created_at.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        let listed = repos
+            .handoff
+            .list_handoffs(Some("o-"), true, usize::MAX)
+            .await
+            .unwrap();
+        let order: Vec<String> = listed.iter().map(|s| s.task_id.clone()).collect();
+        assert_eq!(
+            order,
+            vec!["o-2".to_string(), "o-3".to_string(), "o-1".to_string()],
+            "应为 created_at 降序；同秒时 task_id 升序"
+        );
     }
 
     /// 并发写入必须全部成功，且一条都不能丢。

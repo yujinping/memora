@@ -207,6 +207,78 @@ impl MemoraServer {
         let repos = repos_from(&ctx)?;
         Ok(Json(tools::open_nodes(&*repos.memory, req).await?))
     }
+
+    /// 保存一条工作交接（检查点），供另一个客户端 / 机器接手。
+    #[tool(
+        description = "Save a work handoff at a checkpoint, so another client or machine can \
+                       continue this work. Pass client set to your own name (e.g. \"zed\", \
+                       \"workbuddy\"): it keeps your pending handoff separate from other \
+                       clients'. Omit task_id to continue the workstream you most recently \
+                       saved; pass back the task_id returned by handoff_load / handoff_save \
+                       when you are continuing that same workstream. If the work item you are \
+                       handing off is NOT the one you loaded, give it a short task_id of your \
+                       own — never ask the user to invent one. Returns the stored revision and \
+                       its final task_id."
+    )]
+    async fn handoff_save(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(req): Parameters<dto::HandoffSaveRequest>,
+    ) -> Result<Json<dto::HandoffSaveResponse>, ErrorData> {
+        let repos = repos_from(&ctx)?;
+        Ok(Json(tools::handoff_save(&*repos.handoff, req).await?))
+    }
+
+    /// 读取一条交接：不给 task_id 就是「接手当前待接手的那条」。
+    #[tool(
+        description = "Load a handoff to resume work. Omit task_id to load the pending one: if \
+                       exactly one is pending you get it, if several are pending you get their \
+                       summaries (status=\"ambiguous\") and must pick one by task_id. \
+                       status=\"none\" means nothing is waiting — that is a normal state, not \
+                       an error. Reading never marks anything as taken."
+    )]
+    async fn handoff_load(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(req): Parameters<dto::HandoffLoadRequest>,
+    ) -> Result<Json<dto::HandoffLoadResponse>, ErrorData> {
+        let repos = repos_from(&ctx)?;
+        Ok(Json(tools::handoff_load(&*repos.handoff, req).await?))
+    }
+
+    /// 列出待接手的交接（接手选择界面的数据来源）。
+    #[tool(
+        description = "List handoffs waiting to be taken over, newest first, with a recognizable \
+                       summary (goal, state excerpt, client, session label, time). Defaults to \
+                       pending ones only; pass unacked_only=false to look at history. This call \
+                       has no side effects — listing never marks work as taken."
+    )]
+    async fn handoff_list(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(req): Parameters<dto::HandoffListRequest>,
+    ) -> Result<Json<dto::HandoffListResponse>, ErrorData> {
+        let repos = repos_from(&ctx)?;
+        Ok(Json(tools::handoff_list(&*repos.handoff, req).await?))
+    }
+
+    /// 标记接手（CAS）：会从**其他所有客户端**的待接手列表里移除这一条。
+    #[tool(
+        description = "Mark a handoff as taken over. This removes the entry from every other \
+                       client's pending list, so only call it once the user has agreed to take \
+                       that work. Omit task_id to take the single pending handoff; if several \
+                       are pending the call returns the candidates and takes nothing \
+                       (won=false). won=false with a handoff means someone else took it first — \
+                       report that instead of proceeding."
+    )]
+    async fn handoff_ack(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(req): Parameters<dto::HandoffAckRequest>,
+    ) -> Result<Json<dto::HandoffAckResponse>, ErrorData> {
+        let repos = repos_from(&ctx)?;
+        Ok(Json(tools::handoff_ack(&*repos.handoff, req).await?))
+    }
 }
 
 #[tool_handler]
@@ -224,7 +296,23 @@ impl ServerHandler for MemoraServer {
                  project convention, a key decision or a todo, persist it with \
                  create_entities / add_observations. \
                  PROACTIVE READ: at the start of a session, call read_graph or search_nodes \
-                 to restore relevant memory before answering.",
+                 to restore relevant memory before answering. \
+                 HANDOFF RESUME: at the start of a session, call handoff_list (unacked only) \
+                 to see what is waiting. Nothing pending: say nothing about it. One pending: \
+                 mention it in one line and take it over once the user agrees. Several \
+                 pending: show the summaries and let the user choose — or pick silently when \
+                 the user's request already makes it obvious. If the user only wants to know \
+                 what is pending, list and stop. Only handoff_ack marks work as taken, and \
+                 that removes the entry from every other client's pending list: never ack \
+                 before the user has agreed to take that work. Never ask the user for an id. \
+                 HANDOFF SAVE: when a task reaches a meaningful checkpoint, or the user says \
+                 they will continue from another client or machine, call handoff_save with \
+                 goal/state/next_steps and pass client set to your own name (e.g. \"zed\", \
+                 \"workbuddy\") — it keeps your pending handoff separate from other clients'. \
+                 Omit task_id to continue the workstream you most recently saved — pass back \
+                 the task_id returned by handoff_load / handoff_save when you are continuing \
+                 that same workstream. If the work item you are handing off is NOT the one you \
+                 loaded, give it a short task_id of your own; never ask the user to invent one.",
             )
     }
 }
@@ -234,9 +322,9 @@ mod tests {
     use super::*;
 
     /// 路由表暴露的工具必须与 `mcp::tools::TOOL_NAMES` 完全一致，
-    /// 否则「文档写了 9 个工具、实际只注册 8 个」这类问题会静默存在。
+    /// 否则「文档写了 13 个工具、实际只注册 12 个」这类问题会静默存在。
     #[test]
-    fn router_exposes_exactly_the_nine_declared_tools() {
+    fn router_exposes_exactly_the_declared_tools() {
         let server = MemoraServer::new();
         let mut names = server.tool_names();
         names.sort();
@@ -245,6 +333,7 @@ mod tests {
         expected.sort();
 
         assert_eq!(names, expected);
+        assert_eq!(names.len(), 13, "9 个记忆工具 + 4 个交接工具");
     }
 
     /// 每个工具都必须带描述与可解析的入参 schema——描述是代理决定是否调用它的全部依据。
@@ -276,6 +365,82 @@ mod tests {
                 .as_deref()
                 .is_some_and(|i| i.contains("create_entities")),
             "接入指令需给出主动写入/读取的提示，否则记忆库会长期为空"
+        );
+    }
+
+    /// 回归 #7「零安装自足性」：`instructions` 必须自带判方向所需的全部措辞。
+    ///
+    /// @intent 这条防的是一种隐蔽退化：把关键规则挪进可选的 skill 文件（它需要落盘才能
+    ///         被发现、且在支持 skills 的客户端里也是按需加载），于是**所有测试照样绿、
+    ///         零安装路径却已失效**。四条措辞分别对应四类必需行为：会话开始先看待接手、
+    ///         检查点/换机器要保存、只想看看则只读、绝不向人要 ID。
+    #[test]
+    fn instructions_are_self_sufficient_for_the_install_free_path() {
+        let info = MemoraServer::new().get_info();
+        let text = info.instructions.unwrap_or_default();
+        for (needle, why) in [
+            ("handoff_list", "会话开始先看有无待接手"),
+            ("handoff_save", "检查点 / 换机器时要保存"),
+            ("list and stop", "只想看看时只读、不改状态"),
+            ("Never ask the user for an id", "绝不向用户索要 ID"),
+        ] {
+            assert!(
+                text.contains(needle),
+                "instructions 缺少「{why}」所需的措辞：{needle}"
+            );
+        }
+    }
+
+    /// 技能文件（可选质量层）的机械属性：存在、frontmatter 可解析、
+    /// `name` / `description` 非空且 `description` 以 `Use when` 起头
+    /// （对起头有约定才能在对的时机被客户端按需加载，docs §5.6.2、§11）。
+    ///
+    /// @intent 技能行为本身无法被服务端单测覆盖——它是给模型看的文本；
+    ///         能钉的只有「文件存在且格式正确」这一层。
+    ///
+    /// **双模（§11 回归 #7 的可执行形态）**：`skills/` 整个缺席时本测试不失败，
+    /// 转而断言零安装路径（instructions 自足）仍成立——skill 是可选增强，
+    /// 删掉它交接功能必须完全可用，这条回归必须能真的跑。常规 checkout 下
+    /// 文件随仓库存在，走严格 frontmatter 校验，缺字段照样红。
+    #[test]
+    fn skill_file_exists_with_valid_frontmatter() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("skills/memora-handoff/SKILL.md");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            // 零安装分支：skill 缺席是允许的形态，此时唯一要求是
+            // instructions（随连接即得的通道）自足。
+            let instructions = MemoraServer::new()
+                .get_info()
+                .instructions
+                .unwrap_or_default();
+            assert!(
+                instructions.contains("Never ask the user for an id"),
+                "skill 缺席时 instructions 必须仍自足（零安装路径）"
+            );
+            return;
+        };
+
+        let body = text
+            .strip_prefix("---\n")
+            .and_then(|t| t.split_once("\n---"))
+            .unwrap_or_else(|| panic!("SKILL.md 应以 `---\\n...\\n---` frontmatter 开头"))
+            .0;
+        let mut name = None;
+        let mut description = None;
+        for line in body.lines() {
+            if let Some(v) = line.strip_prefix("name:") {
+                name = Some(v.trim().to_string());
+            }
+            if let Some(v) = line.strip_prefix("description:") {
+                description = Some(v.trim().to_string());
+            }
+        }
+        assert!(name.is_some_and(|n| !n.is_empty()), "frontmatter 缺少非空 name");
+        let description =
+            description.expect("frontmatter 缺少 description");
+        assert!(
+            description.starts_with("Use when"),
+            "description 必须以 `Use when` 起头才能在对的时机被加载，实际：{description}"
         );
     }
 }

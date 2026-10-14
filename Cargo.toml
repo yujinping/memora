@@ -32,6 +32,13 @@ rmcp = { version = "3.3.0", features = ["transport-streamable-http-server"] }
 # 与 rmcp 的 schemars 依赖同源（1.x），用于工具入参 / 出参的 JSON Schema 推导
 schemars = "1.2.2"
 argon2 = "0.6.0"
+# P4.3 交接 CLI：直连公网 HTTPS 的阻塞式客户端（docs/handoff-integration-design.md §5.4）。
+# 选 ureq 而非 reqwest：CLI 是同步的，reqwest 会拉入整套 async 栈而此处用不到。
+# default-features 关掉（不引 json/charset 等无关特性），只留 rustls 提供 TLS 与 WebPKI 根证书。
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# P4.3 交接 CLI 的列表时间列（Unix 秒 → yyyy-MM-dd HH:MM）。
+# sea-orm 已带入 time 生态，这里只是把它提升为直接依赖；不开 parsing / macros。
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "local-offset"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

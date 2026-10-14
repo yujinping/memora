@@ -16,7 +16,7 @@ use crate::reply::internal_error;
 use crate::state::AppState;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use sea_orm::DatabaseConnection;
 
@@ -87,6 +87,25 @@ pub fn create_app(state: AppState) -> Router {
         .route("/projects/{id}", delete(admin::delete_project))
         .route("/projects/{id}/stats", get(admin::project_stats))
         .route("/projects/{id}/graph", get(admin::project_graph))
+        // 交接（P4.3）：静态段 `pending` 必须先于 `{task_id}` 注册（matchit 对静态段
+        // 优先，但先注册是防退化的自文档写法），并有专门用例钉住路由遮蔽。
+        .route(
+            "/projects/{id}/handoffs",
+            post(admin::handoff_save).get(admin::handoff_list),
+        )
+        .route("/projects/{id}/handoffs/pending", get(admin::handoff_pending))
+        .route(
+            "/projects/{id}/handoffs/pending/ack",
+            post(admin::handoff_ack_pending),
+        )
+        .route(
+            "/projects/{id}/handoffs/{task_id}",
+            get(admin::handoff_get).delete(admin::handoff_delete),
+        )
+        .route(
+            "/projects/{id}/handoffs/{task_id}/ack",
+            post(admin::handoff_ack),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_auth))
         .with_state(state.clone());
 
@@ -384,9 +403,9 @@ mod tests {
         );
     }
 
-    /// `tools/list` 暴露的工具必须与文档承诺的 9 个一致。
+    /// `tools/list` 暴露的工具必须与文档承诺的一致（9 记忆 + 4 交接 = 13）。
     #[tokio::test]
-    async fn mcp_tools_list_exposes_the_nine_tools() {
+    async fn mcp_tools_list_exposes_the_declared_tools() {
         let (app, _dir) = setup().await;
         let (status, body) = rpc(
             app,
@@ -402,13 +421,16 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names.len(), 9, "响应体：{body}");
-        names.sort();
-
         let mut expected: Vec<String> = mcp::tools::TOOL_NAMES
             .iter()
             .map(|s| s.to_string())
             .collect();
+        assert_eq!(
+            names.len(),
+            expected.len(),
+            "工具数应与 TOOL_NAMES 声明一致（条数只在此处对表，不重复硬编码），响应体：{body}"
+        );
+        names.sort();
         expected.sort();
         assert_eq!(names, expected);
     }
@@ -1102,6 +1124,474 @@ mod tests {
         // 确认没有误删：unauthorized 请求不得产生副作用
         let (status, _) = get_with_token(app, "/api/v1/projects/demo/stats", Some("admin")).await;
         assert_eq!(status, StatusCode::OK, "被拒的请求不得影响既有项目");
+    }
+
+    // ------------------------------------------------------ 管理面交接（P4.3）
+
+    /// POST `/handoffs`：无 ID 落 `current@<client>` 分片槽位；GET `/handoffs/{task_id}`
+    /// 精确取最新修订。REST 与 MCP 的出参形状一致（复用同一组 dto 视图）。
+    #[tokio::test]
+    async fn admin_handoff_save_lands_in_sharded_slot_and_get_by_id() {
+        let (app, _dir) = setup().await;
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs",
+            Some("admin"),
+            serde_json::json!({
+                "goal": "验收 REST 保存",
+                "state": "第一条修订",
+                "next_steps": ["接 CLI"],
+                "client": "zed",
+                "session_id": "A1"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "响应体：{body}");
+        assert_eq!(body["task_id"], "current@zed", "无 ID 应落分片槽位：{body}");
+        assert_eq!(body["revision"], 1);
+        assert_eq!(body["goal"], "验收 REST 保存");
+        assert_eq!(body["acked_at"], serde_json::Value::Null, "新修订必为待接手");
+        assert_eq!(body["next_steps"], serde_json::json!(["接 CLI"]));
+
+        let (status, body) = get_with_token(
+            app,
+            "/api/v1/projects/demo/handoffs/current@zed",
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{body}");
+        assert_eq!(body["task_id"], "current@zed");
+        assert_eq!(body["state"], "第一条修订");
+        assert_eq!(body["session_id"], "A1");
+    }
+
+    /// GET 不存在的 `task_id` 是 404（与 pending 的 204 严格区分）。
+    #[tokio::test]
+    async fn admin_handoff_get_missing_task_is_404() {
+        let (app, _dir) = setup().await;
+        let (status, body) = get_with_token(
+            app,
+            "/api/v1/projects/demo/handoffs/no-such-task",
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "响应体：{body}");
+    }
+
+    /// 列表端点：缺省只列待接手、倒序、上限 10；`?unacked=0` 看历史；
+    /// `?limit` 截断发生在排序之后；`?prefix` 只过滤不过滤排序。
+    #[tokio::test]
+    async fn admin_handoff_list_defaults_and_filters() {
+        let (app, _dir) = setup().await;
+        for (task, client) in [("t-1", "zed"), ("t-2", "cursor"), ("t-3", "zed")] {
+            let (status, body) = send_json(
+                app.clone(),
+                "POST",
+                "/api/v1/projects/demo/handoffs",
+                Some("admin"),
+                serde_json::json!({"goal": format!("{task} 的活"), "state": "待接", "client": client, "task_id": task}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "响应体：{body}");
+        }
+        // 接手 t-2，让它退出缺省列表但保留在历史里
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs/t-2/ack",
+            Some("admin"),
+            serde_json::json!({"client": "zed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{body}");
+
+        let (status, body) =
+            get_with_token(app.clone(), "/api/v1/projects/demo/handoffs", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK, "响应体：{body}");
+        let all: Vec<serde_json::Value> = body["handoffs"].as_array().unwrap().clone();
+        let ids_of = |items: &[serde_json::Value]| -> Vec<String> {
+            items
+                .iter()
+                .map(|s| s["task_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // 同秒 save 的顺序依赖 tie-break（task_id 升序），不硬编码断言；
+        // 与契约 H11 同思路：断言「待接手集合 == {t-1, t-3} 且排序稳定」。
+        let mut sorted_ids = ids_of(&all);
+        sorted_ids.sort();
+        assert_eq!(
+            sorted_ids,
+            vec!["t-1".to_string(), "t-3".to_string()],
+            "缺省只列待接手：{body}"
+        );
+        for pair in all.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            assert!(
+                a["created_at"].as_i64().unwrap() > b["created_at"].as_i64().unwrap()
+                    || (a["created_at"] == b["created_at"]
+                        && a["task_id"].as_str().unwrap() < b["task_id"].as_str().unwrap()),
+                "排序应为 created_at 降序、同秒 task_id 升序：{body}"
+            );
+        }
+        assert_eq!(all[0]["acked"], false);
+        assert_eq!(all[0]["state_excerpt"], "待接");
+        assert_eq!(all[0]["client"], "zed");
+
+        let (status, body) = get_with_token(
+            app.clone(),
+            "/api/v1/projects/demo/handoffs?unacked=0",
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let got: Vec<&str> = body["handoffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["task_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(got.len(), 3, "unacked=0 应包含已接手的：{body}");
+        let t2 = body["handoffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["task_id"] == "t-2")
+            .unwrap();
+        assert_eq!(t2["acked"], true, "已接手条目应带 acked 标记：{body}");
+        assert_eq!(t2["acked_by"], "zed");
+
+        let (status, body) = get_with_token(
+            app.clone(),
+            "/api/v1/projects/demo/handoffs?limit=1",
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // 截断必须发生在排序之后：limit=1 的结果应等于全量列表的第一项（与 H11 同构）。
+        let first = get_with_token(
+            app.clone(),
+            "/api/v1/projects/demo/handoffs",
+            Some("admin"),
+        )
+        .await
+        .1;
+        assert_eq!(
+            body["handoffs"].as_array().unwrap().len(),
+            1,
+            "响应体：{body}"
+        );
+        assert_eq!(
+            body["handoffs"][0]["task_id"],
+            first["handoffs"][0]["task_id"],
+            "limit 截断必须发生在排序之后"
+        );
+
+        let (status, body) = get_with_token(
+            app.clone(),
+            "/api/v1/projects/demo/handoffs?prefix=t-",
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["handoffs"].as_array().unwrap().len(),
+            2,
+            "prefix 只过滤 task_id，缺省仍只列待接手（t-2 已接手）：{body}"
+        );
+
+        let (status, body) = get_with_token(
+            app,
+            "/api/v1/projects/demo/handoffs?prefix=t-&unacked=0",
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["handoffs"].as_array().unwrap().len(),
+            3,
+            "prefix 与 unacked=0 可组合：{body}"
+        );
+    }
+
+    /// 零 ID 入口 `GET /handoffs/pending`：无 → 204；唯一 → 200 完整记录；
+    /// 多条 → 300 + 候选摘要（绝不替调用方挑）。
+    #[tokio::test]
+    async fn admin_handoff_pending_resolves_zero_id_entry() {
+        let (app, _dir) = setup().await;
+
+        let (status, body) =
+            get_with_token(app.clone(), "/api/v1/projects/demo/handoffs/pending", Some("admin"))
+                .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "空仓库应 204：{body}");
+
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs",
+            Some("admin"),
+            serde_json::json!({"goal": "唯一的活", "state": "待接", "client": "zed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (status, body) =
+            get_with_token(app.clone(), "/api/v1/projects/demo/handoffs/pending", Some("admin"))
+                .await;
+        assert_eq!(status, StatusCode::OK, "唯一待接手应 200：{body}");
+        assert_eq!(body["task_id"], "current@zed");
+        assert_eq!(body["goal"], "唯一的活");
+
+        let (status, _) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs",
+            Some("admin"),
+            serde_json::json!({"goal": "另一条", "state": "待接", "client": "cursor"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) =
+            get_with_token(app, "/api/v1/projects/demo/handoffs/pending", Some("admin")).await;
+        assert_eq!(status, StatusCode::MULTIPLE_CHOICES, "多条应 300：{body}");
+        let got: Vec<&str> = body["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["task_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(got.len(), 2, "候选应含两条：{body}");
+        assert!(got.contains(&"current@zed") && got.contains(&"current@cursor"));
+    }
+
+    /// **路由遮蔽钉死**：存在名为 `pending` 的任务时，`GET /handoffs/pending` 与
+    /// `POST /handoffs/pending/ack` 仍必须命中零 ID 入口，而不是被 `{task_id}` 吃掉。
+    #[tokio::test]
+    async fn admin_handoff_pending_route_is_not_shadowed_by_task_id() {
+        let (app, _dir) = setup().await;
+        for task in ["pending", "other"] {
+            let (status, body) = send_json(
+                app.clone(),
+                "POST",
+                "/api/v1/projects/demo/handoffs",
+                Some("admin"),
+                serde_json::json!({"goal": format!("{task} 的活"), "state": "待接", "task_id": task}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        // 若被 {task_id} 吃掉，这里会 200 返回单条 "pending" 任务，而非 300 候选
+        let (status, body) =
+            get_with_token(app.clone(), "/api/v1/projects/demo/handoffs/pending", Some("admin"))
+                .await;
+        assert_eq!(
+            status,
+            StatusCode::MULTIPLE_CHOICES,
+            "同名任务存在时零 ID 入口必须仍然生效：{body}"
+        );
+
+        let (status, body) = send_json(
+            app,
+            "POST",
+            "/api/v1/projects/demo/handoffs/pending/ack",
+            Some("admin"),
+            serde_json::json!({"client": "zed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::MULTIPLE_CHOICES, "{body}");
+        assert_eq!(body["won"], false, "歧义时 ack 不得抢到接手权：{body}");
+    }
+
+    /// ack 两个入口：`{task_id}/ack` 精确接手（重复 ack 幂等、won=false）；
+    /// `pending/ack` 零 ID 接手（无待接手 → 204）。
+    #[tokio::test]
+    async fn admin_handoff_ack_endpoints() {
+        let (app, _dir) = setup().await;
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs",
+            Some("admin"),
+            serde_json::json!({"goal": "目标", "state": "待接", "task_id": "ack-me"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs/ack-me/ack",
+            Some("admin"),
+            serde_json::json!({"client": "zed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["won"], true);
+        assert_eq!(body["handoff"]["acked_by"], "zed");
+        assert!(body["handoff"]["acked_at"].is_number());
+
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs/ack-me/ack",
+            Some("admin"),
+            serde_json::json!({"client": "cursor"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "重复 ack 仍是正常返回：{body}");
+        assert_eq!(body["won"], false, "已接手不得再次抢到");
+        assert_eq!(
+            body["handoff"]["acked_by"], "zed",
+            "接手方不得被后到者覆盖"
+        );
+
+        // 全部接手完毕后，零 ID 接手入口无活可干 → 204
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs/pending/ack",
+            Some("admin"),
+            serde_json::json!({"client": "zed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "无待接手应 204：{body}");
+
+        // 接手不存在的任务 → 404
+        let (status, body) = send_json(
+            app,
+            "POST",
+            "/api/v1/projects/demo/handoffs/ghost/ack",
+            Some("admin"),
+            serde_json::json!({"client": "zed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    /// DELETE 幂等；删除后 GET 404；重复 DELETE 仍 200。
+    #[tokio::test]
+    async fn admin_handoff_delete_is_idempotent() {
+        let (app, _dir) = setup().await;
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs",
+            Some("admin"),
+            serde_json::json!({"goal": "待删", "state": "x", "task_id": "doomed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (status, _) =
+            delete_with_token(app.clone(), "/api/v1/projects/demo/handoffs/doomed", Some("admin"))
+                .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = get_with_token(
+            app.clone(),
+            "/api/v1/projects/demo/handoffs/doomed",
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) =
+            delete_with_token(app, "/api/v1/projects/demo/handoffs/doomed", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK, "重复删除必须幂等");
+    }
+
+    /// 非法入参 400（与记忆写侧同源：整批先校验再落库）；项目不存在 404；无凭据 401。
+    #[tokio::test]
+    async fn admin_handoff_input_errors_are_actionable() {
+        let (app, _dir) = setup().await;
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs",
+            Some("admin"),
+            serde_json::json!({"goal": "", "state": "x"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/demo/handoffs",
+            Some("admin"),
+            serde_json::json!({"goal": "g", "state": "x", "task_id": "bad/id"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/ghost/handoffs",
+            Some("admin"),
+            serde_json::json!({"goal": "g", "state": "x"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+        let (status, _) = send_json(
+            app,
+            "POST",
+            "/api/v1/projects/demo/handoffs",
+            None,
+            serde_json::json!({"goal": "g", "state": "x"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// 列表端点的查询参数非法时必须 400，不得静默回退默认值。
+    #[tokio::test]
+    async fn admin_handoff_list_rejects_invalid_query_params() {
+        let (app, _dir) = setup().await;
+        for uri in [
+            "/api/v1/projects/demo/handoffs?unacked=yes",
+            "/api/v1/projects/demo/handoffs?limit=abc",
+            "/api/v1/projects/demo/handoffs?limit=-1",
+        ] {
+            let (status, body) = get_with_token(app.clone(), uri, Some("admin")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} 响应体：{body}");
+        }
+    }
+
+    /// `stats.handoffs` = 有交接的任务数（不区分是否已接手）。
+    #[tokio::test]
+    async fn admin_stats_includes_handoff_task_count() {
+        let (app, _dir) = setup().await;
+        for (task, ack_it) in [("s-1", false), ("s-2", true)] {
+            let (status, body) = send_json(
+                app.clone(),
+                "POST",
+                "/api/v1/projects/demo/handoffs",
+                Some("admin"),
+                serde_json::json!({"goal": format!("{task} 的活"), "state": "x", "task_id": task}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            if ack_it {
+                let (status, body) = send_json(
+                    app.clone(),
+                    "POST",
+                    "/api/v1/projects/demo/handoffs/s-2/ack",
+                    Some("admin"),
+                    serde_json::json!({"client": "zed"}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+        }
+
+        let (status, body) =
+            get_with_token(app, "/api/v1/projects/demo/stats", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["handoffs"], 2, "应统计全部有交接的任务：{body}");
     }
 
     // ------------------------------------------------------ 网页控制台（P4.4）

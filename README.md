@@ -63,8 +63,9 @@
 | **按项目硬隔离** | 每个项目独立 `data/{project_id}/mem.db`——物理隔离；再叠加路径/token 绑定做逻辑隔离，双保险互不越权 |
 | **原生鉴权** | 项目 token（`Authorization: Bearer`）+ 独立的管理员 token（`ADMIN_TOKEN`），两套体系分离 |
 | **网页控制台** | `/admin` 用户名 + 口令登录即可建项目、复制 token、浏览记忆；口令只以 Argon2id 哈希落盘，会话 Cookie 与项目 token 严格隔离 |
-| **标准 MCP** | Streamable HTTP 传输，9 个对齐官方语义的记忆工具，兼容主流 MCP 客户端 |
+| **标准 MCP** | Streamable HTTP 传输，9 个对齐官方语义的记忆工具 + 4 个交接（handoff）工具，兼容主流 MCP 客户端 |
 | **自带进程管理** | caddy 式 CLI：`run` / `start` / `stop` / `restart` / `status` / `init`——没有 systemd、没有 root 也能运维 |
+| **任务交接** | `memora handoff save/load/list/ack/rm` + 4 个 MCP 工具：跨客户端 / 跨机器接力零 ID 完成；设计见 `docs/handoff-integration-design.md` |
 | **可换成能的后端** | Repository + 共享契约测试：新增一种持久化后端 = 1 个 impl 文件 + 1 行注册，业务层**零改动** |
 | **TDD 交付** | 228 项测试全通过，`clippy --all-targets` 零告警；后端行为由一份契约同时约束 |
 
@@ -244,7 +245,7 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 
 ## MCP 工具
 
-9 个工具，语义对齐官方 MCP Memory。**项目不在 URL 里**——由 `Authorization: Bearer <项目 token>` 解析出 `project_id`，从根上避免「路径与 token 指向不同项目」这类不一致。
+13 个工具 = 9 个记忆工具（语义对齐官方 MCP Memory）+ 4 个交接工具（`handoff_*` 家族前缀，既有 9 个一个不改名）。**项目不在 URL 里**——由 `Authorization: Bearer <项目 token>` 解析出 `project_id`，从根上避免「路径与 token 指向不同项目」这类不一致。
 
 | 工具 | 关键参数 | 行为 | 返回 |
 |---|---|---|---|
@@ -257,6 +258,17 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 | `read_graph` | — | 返回全图 | `{entities[], relations[]}` |
 | `search_nodes` | `query` | FTS5 全词检索（bm25 排序）；无结果时退化为子串扫描 | 命中实体（带完整观测集，按相关度排序） |
 | `open_nodes` | `names[]` | 按名取节点明细 | 命中实体（按 name 升序） |
+
+**交接（handoff）家族**——跨客户端 / 跨机器的「接力」与记忆严格分表（高频过程性写入不进 FTS5，否则 `search_nodes` 会被交接噪音淹没）：
+
+| 工具 | 关键参数 | 行为 | 返回 |
+|---|---|---|---|
+| `handoff_save` | `goal, state, next_steps[], files[], decisions[], open_questions[], task_id?, client?, session_id?` | 追加一条不可变修订；缺 `task_id` 落 `current@<client>` 分片槽位；新修订重置接手态 | `{handoff, task_id, revision}` |
+| `handoff_load` | `task_id?` | 缺省取当前待接手的那条（唯一时直接命中，多条返回候选）；读取无副作用 | `{status: found/none/ambiguous, handoff?, candidates[]}` |
+| `handoff_list` | `unacked_only?=true, limit?=10, prefix?` | 列「有哪些活等着我」，摘要含 `goal / state_excerpt / client / session_id / 时间` | `{handoffs[]}` |
+| `handoff_ack` | `task_id?, client?` | 标记接手（CAS）；缺省接当前待接手那条；重复 ack 幂等不覆盖 | `{status, won, handoff?, candidates[]}` |
+
+**零 ID 主路径**：写入方不必给任务起名，接手方一个参数都不用传——`task_id` 只在工具结果里流转，**从不要求人输入**。多条待接手时服务端返回候选、绝不替调用方挑。交接规则随 `initialize` 的 `instructions` 连接即得（`HANDOFF RESUME` / `HANDOFF SAVE` 两段，措辞刻意零 ID）；可选的质量层见 `skills/memora-handoff/SKILL.md`（删掉它功能完全可用）。
 
 **四个值得说明的接口约定：**
 
@@ -278,7 +290,14 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 | `POST` | `/projects` | 创建项目（生成 token 并返回明文，`201`） |
 | `GET` | `/projects` | 项目列表（含各自后端） |
 | `DELETE` | `/projects/{id}` | 注销项目（删登记行 + 删项目数据） |
-| `GET` | `/projects/{id}/stats` | 实体 / 关系 / 观测统计 |
+| `GET` | `/projects/{id}/stats` | 实体 / 关系 / 观测 / 交接任务数统计 |
+| `POST` | `/projects/{id}/handoffs` | 保存交接修订（`201`；体同 `handoff_save`，`task_id` 可省） |
+| `GET` | `/projects/{id}/handoffs` | 列摘要：`?unacked=1`（缺省）、`?limit=10`、`?prefix=` |
+| `GET` | `/projects/{id}/handoffs/pending` | **零 ID 入口**：命中 `200`；无待接手 `204`；多条 `300` + 候选摘要 |
+| `GET` | `/projects/{id}/handoffs/{task_id}` | 精确取最新修订；不存在 `404` |
+| `POST` | `/projects/{id}/handoffs/pending/ack` | 零 ID 接手，体 `{"client":"..."}`；歧义 `300` |
+| `POST` | `/projects/{id}/handoffs/{task_id}/ack` | 精确接手（CAS，重复 ack 幂等） |
+| `DELETE` | `/projects/{id}/handoffs/{task_id}` | 幂等删除全部修订 |
 | `GET` | `/projects/{id}/graph` | 该项目的全图快照（控制台「记忆浏览」用，只读） |
 | `POST` | `/session` | 控制台登录（公开；body `{username, password}`）→ 签发会话 Cookie |
 | `GET` | `/session` | 会话自检（公开）→ `{console_login_enabled, authenticated, user}` |
@@ -293,7 +312,9 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 
 | 码 | 含义 | 典型场景 |
 |---|---|---|
-| `400` | 入参可修正 | `project_id` 非法（目录穿越 / 分隔符 / 空白）；请求的后端未编译进本构建（响应附带 `available_backends` 列表） |
+| `400` | 入参可修正 | `project_id` 非法（目录穿越 / 分隔符 / 空白）；请求的后端未编译进本构建（响应附带 `available_backends` 列表）；交接入参非法（空 `goal`、非法 `task_id`、超限） |
+| `204` | 无待接手 | 交接零 ID 入口在「没有可接手的交接」时返回（正常状态；`404` 留给指定 `task_id` 不存在） |
+| `300` | 多条待接手 | 交接歧义：响应体给候选摘要，服务端不替调用方挑 |
 | `401` | 凭据问题 | 缺失或错误的 `ADMIN_TOKEN`；控制台用户名或口令错误；会话已过期 / 已登出；未配置登录口令 |
 | `403` | 来源不被接受 | 用会话 Cookie 鉴权的写请求来自跨源站（CSRF 二次防线） |
 | `404` | 资源不存在 | 项目未登记 |
@@ -303,6 +324,10 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 统计口径与客户端**同源**：`stats` 与 `graph` 都走 `read_graph` 派生，而不是另写一套 SQL 查询，
 避免出现两套不一致的读取逻辑。控制台**不提供**写入记忆的入口——写入仍只经 MCP 工具，
 以免在管理面引入第二套写入语义（判重规则、来源字段等）。
+
+> **`ADMIN_TOKEN` 因此从「管理面凭据」升格为「管理面 + 交接读写凭据」**（交接 CLI 只能拿
+> 到它——明文项目 token 不可反查），信任等级不变（管理面本就能删项目）；项目 token 仍
+> **不能**用于本前缀。
 
 ---
 
@@ -320,7 +345,7 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
                            │
                   ┌────────┴────────┐
             MCP 工具层          REST 管理层
-        9 个标准记忆工具   项目增 / 删 / 统计 / 全图 + 会话
+      9 记忆 + 4 交接工具  项目增删 / 统计 / 全图 / 交接
 ```
 
 **分层依赖单向，不得回指**：
@@ -344,7 +369,7 @@ mcp::dto 只被 tools 与 server 使用
 | `password.rs` | 口令哈希 / 校验 / 随机生成 | 只含哈希与口令，**不含任何 HTTP 概念**；随机量仍走系统熵，不引 rand 生态 |
 | `session.rs` | 内存会话表、Cookie 签发与解析、跨源判定 | 用内存表而非签名 Cookie：不必引入长期密钥；会话有效期**绝对**，不滑动 |
 | `admin.rs` | 项目生命周期 handler | 只经 `StorageRegistry` 取 trait 对象，不引用任何具体后端 |
-| `mcp/dto.rs` | 9 个工具的入参 / 出参契约（serde + JsonSchema） | 只描述协议，不含逻辑 |
+| `mcp/dto.rs` | 13 个工具的入参 / 出参契约（serde + JsonSchema） | 只描述协议，不含逻辑 |
 | `mcp/tools.rs` | 工具语义实现 | **只依赖 `Arc<dyn MemoryRepository>`**，可脱离 MCP 传输层用内存后端快速单测 |
 | `mcp/server.rs` | rmcp 宏装配 + 从请求上下文取仓库 | **唯一允许 `use rmcp` 的地方** |
 | `storage/` | Repository 契约 + 后端实现 | 方言差异锁死在各自 impl 内 |
@@ -471,7 +496,8 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 | P4.2 | 运行形态：自守护 CLI + 配置显式化 + systemd / Caddy + 优雅退出 | ✅ |
 | P4.3 | 配置单实例化：TOML + XDG 绝对路径 + 实例记录（`status` / `stop` 无需带参数） | ✅ |
 | P4.4 | 网页控制台：`/admin` 登录（Argon2id）+ 建项目 / 取 token / 浏览记忆 | ✅ |
-| P5 | 会话表与跨机器会话恢复（`log_turn` / `get_session` / `list_sessions`） | 🔜 |
+| P4.5 | 任务交接并入 memora：4 个 MCP 工具 + 7 个 REST 路由 + `handoff` CLI（设计见 `docs/handoff-integration-design.md`） | ✅ |
+| P5.1 | 会话表与跨机器会话恢复（`log_turn` / `get_session` / `list_sessions`） | 🔜 |
 | 后续 | 远程 embedding 语义检索、记忆版本与回滚、导入导出、控制台里改记忆 | 💡 |
 
 **非目标（首版范围外）**：内置大模型推理、复杂图谱推理 / 反思、多节点集群。

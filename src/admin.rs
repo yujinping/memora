@@ -19,7 +19,7 @@ use crate::meta::{self, NewProject};
 use crate::reply;
 use crate::state::AppState;
 use crate::storage::{validate_project_id, BackendKind, ProjectRepos};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -85,6 +85,8 @@ pub struct ProjectStats {
     pub relations: usize,
     /// 观测总数（跨实体累加）
     pub observations: usize,
+    /// 有交接的任务数（不区分是否已接手）
+    pub handoffs: usize,
 }
 
 /// 一张观测的对外形态。
@@ -296,6 +298,14 @@ pub async fn project_stats(
         Ok(graph) => graph,
         Err(err) => return reply::internal_error(&err),
     };
+    let handoffs = match repos
+        .handoff
+        .list_handoffs(None, false, usize::MAX)
+        .await
+    {
+        Ok(items) => items.len(),
+        Err(err) => return reply::internal_error(&err),
+    };
 
     Json(ProjectStats {
         project_id,
@@ -303,6 +313,7 @@ pub async fn project_stats(
         entities: graph.entity_count(),
         relations: graph.relation_count(),
         observations: graph.observation_count(),
+        handoffs,
     })
     .into_response()
 }
@@ -369,8 +380,298 @@ pub async fn project_graph(
     .into_response()
 }
 
-/// 解析项目标识 → 登记行 → 存储后端 → 仓库集合，失败时给出可回传的响应。
+// ---------------------------------------------------------------- 交接（P4.3）
+
+// REST 交接出参**复用 MCP 的 dto 视图**（`mcp::dto`）。
+//
+// @intent CLI、curl 与 AI 客户端看到的是**同一份 JSON 形状**——「CLI 看到的和 AI
+//         看到的不一样」这类漂移在结构上不可能发生（docs §5.2、§5.3）。
+//         与 graph 端点自建视图不同：那里视图是领域模型与 HTTP 的解耦层，
+//         而 dto 本来就是对外协议契约，无需再包一层。
+
+// 交接保存请求体：与 MCP `handoff_save` 入参同构（含 camelCase 别名与
+// `deny_unknown_fields`，字段拼错在解析期就被 400 拒绝）。
+use crate::mcp::dto::HandoffSaveRequest;
+
+/// 接手请求体；两个字段都可省略，`client` 只进 `acked_by` 诊断信息。
+#[derive(Debug, Default, Deserialize)]
+pub struct AckHandoffBody {
+    /// 接手方标识；省略落空串 = 未声明
+    #[serde(default)]
+    pub client: Option<String>,
+}
+
+/// `GET .../handoffs` 的查询参数（全部可省）。
+#[derive(Debug, Deserialize)]
+pub struct HandoffListQuery {
+    /// `1`（缺省）只列待接手；`0` 看历史（含已接手）
+    #[serde(default)]
+    pub unacked: Option<String>,
+    /// 最多返回多少条；缺省 10（与 MCP `handoff_list` 同源）
+    #[serde(default)]
+    pub limit: Option<String>,
+    /// 只列 `task_id` 以该前缀开头的条目
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+/// POST `/projects/{id}/handoffs`：保存修订，返回 201 + 完整记录。
 ///
+/// @intent 校验失败 400（调用方改参数即可），与 MCP 的 `-32602` 同源分流；
+///         「落哪个后端、哪张表」由 `repositories_of` 决定，本 handler 对后端盲视。
+pub async fn handoff_save(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<HandoffSaveRequest>,
+) -> Response {
+    let repos = match repositories_of(&state, &project_id).await {
+        Ok(repos) => repos,
+        Err(response) => return *response,
+    };
+    let input = crate::domain::HandoffInput {
+        task_id: req.task_id,
+        goal: req.goal,
+        state: req.state,
+        next_steps: req.next_steps,
+        files: req.files,
+        decisions: req.decisions,
+        open_questions: req.open_questions,
+        client: req.client,
+        session_id: req.session_id,
+    };
+    match repos.handoff.save_handoff(input).await {
+        Ok(h) => (StatusCode::CREATED, Json(crate::mcp::tools::handoff_view(h))).into_response(),
+        Err(StorageError::InvalidInput(detail)) => reply::bad_request("invalid_input", &detail),
+        Err(err) => reply::internal_error(&err),
+    }
+}
+
+/// GET `/projects/{id}/handoffs`：列摘要（接手选择界面）。
+///
+/// @intent 查询参数非法必须 400 而不是静默回退默认值——与配置解析「非法值硬失败」
+///         同一口径；`unacked` 只接受 `1`/`0`，`limit` 只接受非负整数。
+pub async fn handoff_list(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Query(q): Query<HandoffListQuery>,
+) -> Response {
+    let repos = match repositories_of(&state, &project_id).await {
+        Ok(repos) => repos,
+        Err(response) => return *response,
+    };
+    let unacked = match q.unacked.as_deref() {
+        None | Some("1") => true,
+        Some("0") => false,
+        Some(other) => {
+            return reply::bad_request(
+                "invalid_request",
+                &format!("`unacked` 只接受 1 或 0，实际 `{other}`"),
+            )
+        }
+    };
+    let limit = match q.limit.as_deref() {
+        None => crate::mcp::dto::DEFAULT_HANDOFF_LIST_LIMIT,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                return reply::bad_request(
+                    "invalid_request",
+                    &format!("`limit` 必须是非负整数，实际 `{raw}`"),
+                )
+            }
+        },
+    };
+    match repos
+        .handoff
+        .list_handoffs(q.prefix.as_deref(), unacked, limit)
+        .await
+    {
+        Ok(items) => {
+            let handoffs: Vec<_> = items
+                .into_iter()
+                .map(crate::mcp::tools::handoff_summary_view)
+                .collect();
+            Json(json!({ "handoffs": handoffs })).into_response()
+        }
+        Err(err) => reply::internal_error(&err),
+    }
+}
+
+/// GET `/projects/{id}/handoffs/pending`：**零 ID 入口**。
+///
+/// @intent 状态码三分流是本端点的全部语义：200 = 命中唯一一条（返回完整记录）；
+///         204 = 没有待接手（正常状态，不是 404——404 留给「指定 task_id 不存在」）；
+///         300 = 多条待接手，响应体给候选摘要，服务端绝不替调用方挑（docs §5.2）。
+pub async fn handoff_pending(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let repos = match repositories_of(&state, &project_id).await {
+        Ok(repos) => repos,
+        Err(response) => return *response,
+    };
+    match repos.handoff.resolve_handoff(None).await {
+        Ok(crate::domain::HandoffResolution::Found(h)) => {
+            Json(crate::mcp::tools::handoff_view(*h)).into_response()
+        }
+        Ok(crate::domain::HandoffResolution::None) => StatusCode::NO_CONTENT.into_response(),
+        Ok(crate::domain::HandoffResolution::Ambiguous(list)) => {
+            let candidates: Vec<_> = list
+                .into_iter()
+                .map(crate::mcp::tools::handoff_summary_view)
+                .collect();
+            (
+                StatusCode::MULTIPLE_CHOICES,
+                Json(json!({ "status": "ambiguous", "candidates": candidates })),
+            )
+                .into_response()
+        }
+        Err(StorageError::InvalidInput(detail)) => reply::bad_request("invalid_input", &detail),
+        Err(err) => reply::internal_error(&err),
+    }
+}
+
+/// GET `/projects/{id}/handoffs/{task_id}`：精确取最新修订；不存在 404。
+pub async fn handoff_get(
+    State(state): State<AppState>,
+    Path((project_id, task_id)): Path<(String, String)>,
+) -> Response {
+    let repos = match repositories_of(&state, &project_id).await {
+        Ok(repos) => repos,
+        Err(response) => return *response,
+    };
+    match repos.handoff.resolve_handoff(Some(&task_id)).await {
+        Ok(crate::domain::HandoffResolution::Found(h)) => {
+            Json(crate::mcp::tools::handoff_view(*h)).into_response()
+        }
+        Ok(crate::domain::HandoffResolution::None) => reply::not_found(
+            "not_found",
+            &format!("handoff `{task_id}` not found"),
+        ),
+        // 显式 ID 不会产生歧义（歧义只发生在无 ID 解析）
+        Ok(crate::domain::HandoffResolution::Ambiguous(_)) => {
+            reply::internal_error(&"unreachable: explicit id resolved to ambiguous")
+        }
+        Err(StorageError::InvalidInput(detail)) => reply::bad_request("invalid_input", &detail),
+        Err(err) => reply::internal_error(&err),
+    }
+}
+
+/// ack 的共用执行体：`task_id = None`（零 ID）与显式 ID 走同一条仓库方法（CAS）。
+///
+/// @intent 与 `resolve_handoff` 同源：寻址规则只有一份实现。返回值按 resolution
+///         分流——Found 200（回传 won 事实）、None 由调用方决定（204 或 404）、
+///         Ambiguous 300 且 `won=false`（不产生任何副作用）。
+async fn ack_response(
+    repos: &ProjectRepos,
+    task_id: Option<&str>,
+    client: &str,
+) -> Response {
+    match repos.handoff.ack_handoff(task_id, client).await {
+        Ok(outcome) => {
+            let (status, handoff, candidates) =
+                crate::mcp::tools::resolution_parts(outcome.resolution);
+            match status {
+                crate::mcp::dto::HandoffStatus::Found => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "found",
+                        "won": outcome.won,
+                        "handoff": handoff,
+                    })),
+                )
+                    .into_response(),
+                crate::mcp::dto::HandoffStatus::Ambiguous => (
+                    StatusCode::MULTIPLE_CHOICES,
+                    Json(json!({
+                        "status": "ambiguous",
+                        "won": outcome.won,
+                        "candidates": candidates,
+                    })),
+                )
+                    .into_response(),
+                crate::mcp::dto::HandoffStatus::None => {
+                    // 显式 ID 找不到任务是 404；零 ID 没有「当前待接手」是 204。
+                    match task_id {
+                        Some(id) => reply::not_found("not_found", &format!("handoff `{id}` not found")),
+                        None => StatusCode::NO_CONTENT.into_response(),
+                    }
+                }
+            }
+        }
+        Err(StorageError::InvalidInput(detail)) => reply::bad_request("invalid_input", &detail),
+        Err(err) => reply::internal_error(&err),
+    }
+}
+
+/// 解析 ack 请求体：空 body 或缺 `client` 都按「未声明」处理。
+///
+/// @intent 用 `Bytes` + 空体判断区分「没有 body」（正常，取默认值）与「body 不是
+///         合法 JSON」（400）——两者合并成默认值会让拼错的请求被静默当成功，违反
+///         「非法值不得静默通过」的项目口径。
+async fn ack_body(bytes: axum::body::Bytes) -> Result<String, Box<Response>> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(String::new());
+    }
+    match serde_json::from_slice::<AckHandoffBody>(&bytes) {
+        Ok(body) => Ok(body.client.unwrap_or_default()),
+        Err(err) => Err(Box::new(reply::bad_request(
+            "invalid_request",
+            &format!("请求体不是合法 JSON：{err}"),
+        ))),
+    }
+}
+
+/// POST `/projects/{id}/handoffs/pending/ack`：**零 ID 接手**。
+pub async fn handoff_ack_pending(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let repos = match repositories_of(&state, &project_id).await {
+        Ok(repos) => repos,
+        Err(response) => return *response,
+    };
+    let client = match ack_body(body).await {
+        Ok(client) => client,
+        Err(response) => return *response,
+    };
+    ack_response(&repos, None, &client).await
+}
+
+/// POST `/projects/{id}/handoffs/{task_id}/ack`：精确接手（CAS；重复 ack 幂等）。
+pub async fn handoff_ack(
+    State(state): State<AppState>,
+    Path((project_id, task_id)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> Response {
+    let repos = match repositories_of(&state, &project_id).await {
+        Ok(repos) => repos,
+        Err(response) => return *response,
+    };
+    let client = match ack_body(body).await {
+        Ok(client) => client,
+        Err(response) => return *response,
+    };
+    ack_response(&repos, Some(&task_id), &client).await
+}
+
+/// DELETE `/projects/{id}/handoffs/{task_id}`：幂等删除（不存在视为成功）。
+pub async fn handoff_delete(
+    State(state): State<AppState>,
+    Path((project_id, task_id)): Path<(String, String)>,
+) -> Response {
+    let repos = match repositories_of(&state, &project_id).await {
+        Ok(repos) => repos,
+        Err(response) => return *response,
+    };
+    match repos.handoff.delete_handoff(&task_id).await {
+        Ok(()) => Json(json!({ "task_id": task_id })).into_response(),
+        Err(err) => reply::internal_error(&err),
+    }
+}
+
+/// 解析项目标识 → 登记行 → 存储后端 → 仓库集合，失败时给出可回传的响应。
 /// @intent 抽成一处是因为「登记行不存在」与「后端不可用」在三处接口里必须映射成**同样**
 ///         的状态码；各写一遍迟早出现一处返回 404、另一处返回 500 的不一致，
 ///         而调用方会据此写出不同的重试策略。
