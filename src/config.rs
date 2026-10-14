@@ -34,6 +34,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::cli::Overrides;
+use crate::password;
 
 /// 未显式配置时的默认监听端口。
 pub const DEFAULT_PORT: u16 = 6789;
@@ -51,6 +52,11 @@ pub const DEFAULT_STORAGE_BACKEND: &str = "sqlite_file";
 pub const DEFAULT_MCP_ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 /// 未显式配置时的日志级别（`RUST_LOG` 语义）。
 pub const DEFAULT_LOG: &str = "info,sqlx=warn,sea_orm=warn";
+/// 网页控制台（`/admin`）的默认登录用户名。
+///
+/// @intent 用户名不是凭据的一部分，只是界面上的一个字段；默认值的存在免去单人自托管
+///         场景里「还要不要想个用户名」这一步。口令才是唯一的秘密，且没有默认值。
+pub const DEFAULT_ADMIN_USER: &str = "admin";
 
 /// 显式指定的配置文件不存在时的处置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +80,12 @@ pub struct EnvVars {
     pub data_dir: Option<String>,
     /// `ADMIN_TOKEN`
     pub admin_token: Option<String>,
+    /// `ADMIN_USER`：网页控制台的登录用户名
+    pub admin_user: Option<String>,
+    /// `ADMIN_PASSWORD`：**明文**口令，加载时即哈希，不落盘
+    pub admin_password: Option<String>,
+    /// `ADMIN_PASSWORD_HASH`：Argon2id 的 PHC 串
+    pub admin_password_hash: Option<String>,
     /// `STORAGE_BACKEND`
     pub storage_backend: Option<String>,
     /// `MCP_ALLOWED_HOSTS`（逗号分隔）
@@ -96,6 +108,9 @@ impl EnvVars {
             port: get("PORT"),
             data_dir: get("DATA_DIR"),
             admin_token: get("ADMIN_TOKEN"),
+            admin_user: get("ADMIN_USER"),
+            admin_password: get("ADMIN_PASSWORD"),
+            admin_password_hash: get("ADMIN_PASSWORD_HASH"),
             storage_backend: get("STORAGE_BACKEND"),
             mcp_allowed_hosts: get("MCP_ALLOWED_HOSTS"),
             rust_log: get("RUST_LOG"),
@@ -153,6 +168,15 @@ pub struct Config {
     pub data_dir: String,
     /// 管理 API（`/api/v1`）凭据
     pub admin_token: String,
+    /// 网页控制台（`/admin`）的登录用户名
+    pub admin_user: String,
+    /// 网页控制台口令的 Argon2id PHC 哈希串；**空串表示未配置**，此时控制台登录不可用
+    ///
+    /// @intent 只存哈希、不存明文：配置文件的权限虽已收到 `600`，但备份、截图、
+    ///         误提交都会让明文扩散；哈希被拿到也无法反推出口令。
+    ///         空串是一个**显式可用状态**而非错误——只用 MCP 与脚本的用户无需配口令，
+    ///         此时 `/admin` 会明确提示「未配置登录口令」，而不是给一个必然失败的登录框。
+    pub admin_password_hash: String,
     /// 新项目默认存储后端
     pub storage_backend: String,
     /// MCP Host 白名单（空表示未配置，由 `effective_mcp_allowed_hosts` 回退）
@@ -175,6 +199,8 @@ struct FileConfig {
     port: Option<u16>,
     data_dir: Option<String>,
     admin_token: Option<String>,
+    admin_user: Option<String>,
+    admin_password_hash: Option<String>,
     storage_backend: Option<String>,
     mcp_allowed_hosts: Option<Vec<String>>,
     log: Option<String>,
@@ -238,6 +264,19 @@ impl Config {
             file.admin_token.as_deref(),
             "",
         );
+        let admin_user = resolve_text(
+            overrides.admin_user.as_deref(),
+            env.admin_user.as_deref(),
+            file.admin_user.as_deref(),
+            DEFAULT_ADMIN_USER,
+        );
+        let admin_password_hash = resolve_password_hash(
+            overrides.admin_password_hash.as_deref(),
+            overrides.admin_password.as_deref(),
+            env.admin_password_hash.as_deref(),
+            env.admin_password.as_deref(),
+            file.admin_password_hash.as_deref(),
+        )?;
         let storage_backend = resolve_text(
             overrides.storage_backend.as_deref(),
             env.storage_backend.as_deref(),
@@ -255,6 +294,8 @@ impl Config {
             port,
             data_dir,
             admin_token,
+            admin_user,
+            admin_password_hash,
             storage_backend,
             mcp_allowed_hosts,
             log,
@@ -289,18 +330,32 @@ impl Config {
     }
 
     /// 构造测试用配置（不读环境变量，不读文件）。
+    ///
+    /// @intent 新增的 `admin_user` / `admin_password_hash` 取默认值（后者为空串，
+    ///         即**控制台登录不可用**）：绝大多数既有用例只关心 MCP 与管理 API，
+    ///         不该被一个与它们无关的凭据配置牵动。需要控制台的用例自行赋值即可。
     #[cfg(test)]
     pub fn for_test(port: u16, data_dir: &str, admin_token: &str, storage_backend: &str) -> Config {
         Config {
             port,
             data_dir: data_dir.to_string(),
             admin_token: admin_token.to_string(),
+            admin_user: DEFAULT_ADMIN_USER.to_string(),
+            admin_password_hash: String::new(),
             storage_backend: storage_backend.to_string(),
             mcp_allowed_hosts: Vec::new(),
             log: DEFAULT_LOG.to_string(),
             config_path: PathBuf::from(FALLBACK_CONFIG_FILE),
             config_loaded: false,
         }
+    }
+
+    /// 网页控制台是否可用（即是否配置了口令）。
+    ///
+    /// @intent 把判定收在一处：路由层据此决定 `/admin` 显示登录表单还是「未配置」提示，
+    ///         启动日志据此决定是否告警。两处各写一遍 `!hash.is_empty()` 迟早漂移。
+    pub fn console_login_enabled(&self) -> bool {
+        password::is_configured(&self.admin_password_hash)
     }
 }
 
@@ -428,6 +483,75 @@ pub fn resolve_text(
         .unwrap_or_else(|| default.to_string())
 }
 
+/// 解析网页控制台的口令哈希。
+///
+/// @intent 这是唯一一个**五层**取值的配置项，因为它同时支持「给脚本的哈希串」与
+///         「给人的明文口令」两种输入。优先级按层展开，层内「哈希串」比「明文」更具体
+///         因而优先：
+///         1. `--admin-password-hash` > `--admin-password`（明文，就地哈希）
+///         2. `ADMIN_PASSWORD_HASH`     > `ADMIN_PASSWORD`（明文，就地哈希）
+///         3. 配置文件 `admin_password_hash`
+///         4. 空串 —— 控制台登录不可用
+///
+/// @intent 明文只在内存中存在：本函数返回的是哈希，明文既不进 `Config` 也不落盘。
+///         支持明文入口是为了让容器 / systemd 环境能从密钥管理注入 `ADMIN_PASSWORD`，
+///         而不必自己先算哈希（那需要额外装一个 argon2 工具）。
+///
+/// @intent 空白串一律视为「本层未表态」而非「要求空口令」：与 [`resolve_text`] 同一语义。
+///         否则 `--admin-password ""` 会变成一个「空口令可登录」的静默危险配置。
+pub fn resolve_password_hash(
+    flag_hash: Option<&str>,
+    flag_plain: Option<&str>,
+    env_hash: Option<&str>,
+    env_plain: Option<&str>,
+    file_hash: Option<&str>,
+) -> Result<String> {
+    // 先判定「谁表态了」，再决定「是否需要哈希」——两步分开，避免层内优先级与
+    // 「是否明文」两件事缠在一条链式调用里。
+    if let Some(phc) = stated(flag_hash) {
+        return Ok(phc.trim().to_string());
+    }
+    if let Some(plain) = stated(flag_plain) {
+        return hash_checked_plain(plain, "--admin-password");
+    }
+    if let Some(phc) = stated(env_hash) {
+        return Ok(phc.trim().to_string());
+    }
+    if let Some(plain) = stated(env_plain) {
+        return hash_checked_plain(plain, "ADMIN_PASSWORD");
+    }
+    if let Some(phc) = stated(file_hash) {
+        return Ok(phc.trim().to_string());
+    }
+    Ok(String::new())
+}
+
+/// 该层是否「表态」：空白串视为未表态。
+///
+/// @intent 与 [`resolve_text`] 的 `filter(|v| !v.trim().is_empty())` 同语义，抽成函数
+///         以免五层判定各写一遍而漂移。写成具名函数而非闭包，是因为闭包的类型推断
+///         无法把返回值的生命周期绑到入参上。
+fn stated(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+/// 把某层给出的明文口令就地哈希；强度不合格则**硬失败**。
+///
+/// @intent 在这里硬失败而不是记一条告警，依据是本项目对配置类故障的一贯处理——
+///         「非法值不得静默通过」（对照 `PORT` 非数字时的硬失败）。口令强度的缺陷
+///         不会在启动时暴露，只会在某天被爆破，因此必须在唯一能拿到**明文**的
+///         时刻拦住；服务跑起来之后只持有哈希，那时已无从判断强度，
+///         这是最后一道闸门。
+///
+/// @intent 报错里带上来源名（`--admin-password` / `ADMIN_PASSWORD`），是因为同一层
+///         有「哈希」与「明文」两个入口，只说「口令太短」会让用户去改错的那个。
+fn hash_checked_plain(plain: &str, source: &str) -> Result<String> {
+    if let Some(reason) = password::weak_password_reason(plain) {
+        bail!("{source} is not usable: {reason}");
+    }
+    password::hash_password(plain).with_context(|| format!("cannot hash the password given by {source}"))
+}
+
 /// 解析日志级别：`RUST_LOG` > 文件 `log` > 默认值。
 ///
 /// @intent 保留 `RUST_LOG` 优先，是因为它是排查期的临时开关，运维预期它能就地压过
@@ -491,6 +615,231 @@ mod tests {
             home: Some(home.to_string()),
             ..EnvVars::default()
         }
+    }
+
+    // ------------------------------------------------- 网页控制台凭据（P4.4）
+
+    /// 文件层必须真的被接线（防止「解析了却没接进 Config」）。
+    #[test]
+    fn file_admin_user_and_password_hash_are_loaded() {
+        let dir = temp_dir();
+        let phc = password::hash_password("file-password").unwrap();
+        let path = write_config(
+            &dir,
+            &format!("admin_user = \"root\"\nadmin_password_hash = \"{phc}\"\n"),
+        );
+        let (config, _) = Config::load_with(
+            &Overrides::default(),
+            Some(&path),
+            MissingPolicy::Reject,
+            &EnvVars::default(),
+        )
+        .unwrap();
+
+        assert_eq!(config.admin_user, "root");
+        assert_eq!(config.admin_password_hash, phc);
+        assert!(config.console_login_enabled());
+        assert!(password::verify_password("file-password", &config.admin_password_hash));
+    }
+
+    /// 未配置口令是一个**正常状态**，不是错误：只用 MCP / 脚本的用户无需口令，
+    /// 此时控制台登录应被判为「不可用」，而不是留下一个必然失败的登录框。
+    #[test]
+    fn console_login_is_disabled_when_no_password_is_configured() {
+        let dir = temp_dir();
+        let path = write_config(&dir, "port = 6800\n");
+        let (config, _) = Config::load_with(
+            &Overrides::default(),
+            Some(&path),
+            MissingPolicy::Reject,
+            &EnvVars::default(),
+        )
+        .unwrap();
+
+        assert_eq!(config.admin_user, DEFAULT_ADMIN_USER, "用户名应有默认值");
+        assert_eq!(config.admin_password_hash, "");
+        assert!(!config.console_login_enabled());
+    }
+
+    /// 五层优先级：层内哈希串优先于明文，高层优先于低层。
+    ///
+    /// @intent 这条用一张用例表把 5 个入口的组合全部钉住。凭据解析是安全相关的，
+    ///         「谁压过谁」必须能被一句话回答，而不是靠读代码推断。
+    #[test]
+    fn password_hash_precedence_is_flag_then_env_then_file() {
+        let file_phc = password::hash_password("from-file").unwrap();
+        let env_phc = password::hash_password("from-env").unwrap();
+        let flag_phc = password::hash_password("from-flag").unwrap();
+
+        // 1) flag 哈希串 > flag 明文 > env 哈希串 > env 明文 > 文件
+        let all = resolve_password_hash(
+            Some(&flag_phc),
+            Some("flag-plain"),
+            Some(&env_phc),
+            Some("env-plain"),
+            Some(&file_phc),
+        )
+        .unwrap();
+        assert!(password::verify_password("from-flag", &all));
+
+        // 2) flag 明文 > env 哈希串（flag 层整体高于 env 层）
+        let flag_plain_wins =
+            resolve_password_hash(None, Some("flag-plain"), Some(&env_phc), None, Some(&file_phc))
+                .unwrap();
+        assert!(
+            password::verify_password("flag-plain", &flag_plain_wins),
+            "flag 层的明文口令应压过 env 层的哈希串"
+        );
+
+        // 3) env 哈希串 > env 明文
+        let env_hash_wins =
+            resolve_password_hash(None, None, Some(&env_phc), Some("env-plain"), Some(&file_phc))
+                .unwrap();
+        assert!(password::verify_password("from-env", &env_hash_wins));
+
+        // 4) env 明文 > 文件
+        let env_plain_wins =
+            resolve_password_hash(None, None, None, Some("env-plain"), Some(&file_phc)).unwrap();
+        assert!(password::verify_password("env-plain", &env_plain_wins));
+
+        // 5) 只有文件时用文件
+        let file_only = resolve_password_hash(None, None, None, None, Some(&file_phc)).unwrap();
+        assert_eq!(file_only, file_phc);
+
+        // 6) 全空 → 空串（登录不可用）
+        assert_eq!(
+            resolve_password_hash(None, None, None, None, None).unwrap(),
+            ""
+        );
+    }
+
+    /// 空白串在每一层都表示「本层未表态」，而不是「要求一个空口令」。
+    ///
+    /// @intent 若把 `--admin-password ""` 当作有效输入，就会得到一个「空口令可登录」
+    ///         的配置——而它不会让任何检查失败，只是把管理面变成敞开的。
+    #[test]
+    fn blank_password_inputs_are_treated_as_unstated() {
+        let file_phc = password::hash_password("from-file").unwrap();
+
+        let resolved = resolve_password_hash(
+            Some("   "),
+            Some(""),
+            Some("  "),
+            Some("   "),
+            Some(&file_phc),
+        )
+        .unwrap();
+        assert_eq!(resolved, file_phc, "各层均为空白时应落到文件层");
+
+        assert_eq!(
+            resolve_password_hash(None, Some(""), None, Some("  "), None).unwrap(),
+            "",
+            "全为空白时不得产出一个空口令的哈希"
+        );
+    }
+
+    /// 明文口令过短必须在解析期硬失败，且报错要点出是**哪一层**给的。
+    ///
+    /// @intent 这是「非法值不得静默通过」在本项目的第二处兑现（第一处是非法 PORT）。
+    ///         口令强度不会在启动时暴露，只会在某天被爆破；而运行期只持有哈希，
+    ///         那时已无从判断强度——解析期是唯一能拿到明文的时刻，也就是最后一道闸门。
+    #[test]
+    fn weak_plaintext_passwords_are_rejected_at_parse_time() {
+        // 太短：flag 层与 env 层都必须拒绝，并各自点名来源
+        let flag = resolve_password_hash(None, Some("123"), None, None, None)
+            .expect_err("过短的 --admin-password 必须被拒绝");
+        assert!(
+            flag.to_string().contains("--admin-password"),
+            "报错应点名 flag 来源：{flag}"
+        );
+
+        let env = resolve_password_hash(None, None, None, Some("short"), None)
+            .expect_err("过短的 ADMIN_PASSWORD 必须被拒绝");
+        assert!(
+            env.to_string().contains("ADMIN_PASSWORD"),
+            "报错应点名环境变量来源：{env}"
+        );
+
+        // 边界：恰好达到下限（8 个字符）必须放行，否则下限就成了 9
+        let ok = resolve_password_hash(None, Some("12345678"), None, None, None).unwrap();
+        assert!(
+            password::verify_password("12345678", &ok),
+            "达到下限的口令应可正常哈希与校验"
+        );
+
+        // 哈希入口不受下限约束：它本来就是哈希串，强度已无从判断
+        let phc = password::hash_password("whatever-it-is").unwrap();
+        assert_eq!(
+            resolve_password_hash(Some(&phc), Some("123"), None, None, None).unwrap(),
+            phc,
+            "同层内哈希串优先于明文，故过短的明文不该让请求失败"
+        );
+    }
+
+    /// `init` 与 `admin_user` 的交互：文件里的用户名必须能覆盖默认值。
+    #[test]
+    fn admin_user_follows_the_four_layer_precedence() {
+        let dir = temp_dir();
+        let path = write_config(&dir, "admin_user = \"from-file\"\n");
+        let env = EnvVars {
+            admin_user: Some("from-env".to_string()),
+            ..EnvVars::default()
+        };
+
+        let load = |overrides: &Overrides, env: &EnvVars| {
+            Config::load_with(
+                overrides,
+                Some(&path),
+                MissingPolicy::Reject,
+                env,
+            )
+            .unwrap()
+            .0
+            .admin_user
+        };
+
+        assert_eq!(load(&Overrides::default(), &EnvVars::default()), "from-file");
+        assert_eq!(load(&Overrides::default(), &env), "from-env");
+
+        let with_flag = Overrides {
+            admin_user: Some("from-flag".to_string()),
+            ..Overrides::default()
+        };
+        assert_eq!(load(&with_flag, &env), "from-flag");
+    }
+
+    /// 写错键名必须硬失败并点名键名——尤其 `admin_password_hash` 这种打错就静默
+    /// 关掉控制台登录的键。
+    #[test]
+    fn misspelled_password_key_is_rejected_by_name() {
+        let dir = temp_dir();
+        let path = write_config(&dir, "admin_passwd_hash = \"x\"\n");
+
+        match Config::load_with(
+            &Overrides::default(),
+            Some(&path),
+            MissingPolicy::Reject,
+            &EnvVars::default(),
+        ) {
+            Err(err) => {
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("admin_passwd_hash"),
+                    "错误信息应点名键名：{msg}"
+                );
+            }
+            Ok(_) => panic!("未知键必须被拒绝，否则「改了配置却没生效」会静默发生"),
+        }
+    }
+
+    /// 空口令必须被拒绝：它能被哈希出来，但等于把管理面敞开。
+    #[test]
+    fn cannot_configure_an_empty_password_via_the_plaintext_entry() {
+        // 空白被当作未表态（见上一条用例），故这里验证的是「真的传了一个空串」时
+        // 不会产出一个可登录的空口令哈希。
+        let resolved = resolve_password_hash(None, Some(""), None, None, None).unwrap();
+        assert_eq!(resolved, "");
+        assert!(!password::is_configured(&resolved));
     }
 
     #[test]

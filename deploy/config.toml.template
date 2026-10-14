@@ -15,10 +15,22 @@ port = __PORT__
 # 数据目录：元库、各项目库、后台日志与实例记录都在这里
 data_dir = __DATA_DIR__
 
-# 管理员令牌：REST 管理层（/api/v1）鉴权。
-# 生产环境务必改成足够随机的值（本文件权限已收紧为 600）：
-#   openssl rand -hex 32
+# 管理员令牌：REST 管理层（/api/v1）鉴权，供脚本与 CI 使用。
+# 由 `memora init` 生成（openssl 级随机），无需手改。本文件权限已收紧为 600。
+# 若手工设置，用：openssl rand -hex 32
+# 请求方式：Authorization: Bearer <admin_token>
 admin_token = __ADMIN_TOKEN__
+
+# 网页控制台（/admin）的登录用户名。不是秘密，只是个字段。
+admin_user = __ADMIN_USER__
+
+# 网页控制台登录口令的 Argon2id 哈希串（PHC 格式，含算法参数）。
+# **这里存的是哈希，不是口令本身**：配置被备份、截图或误提交时，哈希无法反推口令。
+# 由 `memora init` 生成并打印一次明文口令；重置口令请重跑 `memora init --force`，
+# 或手工算一份：memora --help 中 --admin-password 一项可就地哈希明文。
+# 留空（""）表示**关闭控制台登录**——只用 MCP 与脚本的部署无需它，
+# 此时 /admin 会明确提示「未配置登录口令」，而不是给一个必然失败的登录框。
+admin_password_hash = __ADMIN_PASSWORD_HASH__
 
 # 新项目的默认存储后端（既有项目以其在 _meta.db 中的登记值为准）
 # 可选：sqlite_file（默认）| in_mem（仅测试，进程退出即丢失）

@@ -6,7 +6,7 @@
 //!         同样可运维；同时保留「无子命令即前台运行」的向后兼容，
 //!         既有 systemd / 容器部署零改动。
 //!
-//! @intent 解析刻意手写而非引入 clap：本服务的选项面仅 6 个，而 clap 会带来可观的
+//! @intent 解析刻意手写而非引入 clap：服务的选项面不大，而 clap 会带来可观的
 //!         编译时间与二进制约 300KB 的体积增长，与「2GB 服务器上的单二进制」定位不符。
 //!         代价是 `--help` 文本需自行维护（见 [`usage`]），但选项稳定后这属一次性成本。
 
@@ -50,6 +50,12 @@ pub struct Overrides {
     pub data_dir: Option<String>,
     /// 管理员令牌
     pub admin_token: Option<String>,
+    /// 网页控制台登录用户名
+    pub admin_user: Option<String>,
+    /// 网页控制台登录口令（**明文**，加载时即哈希，不落盘）
+    pub admin_password: Option<String>,
+    /// 网页控制台登录口令的 Argon2id PHC 串（与 `admin_password` 二选一，本项优先）
+    pub admin_password_hash: Option<String>,
     /// 新项目默认存储后端标识
     pub storage_backend: Option<String>,
     /// MCP Host 白名单原始串（逗号分隔）；解析交由 `Config::parse_allowed_hosts`
@@ -140,6 +146,9 @@ pub fn usage() -> String {
          \x20 -p, --port <PORT>            监听端口\n\
          \x20     --data-dir <PATH>        数据目录\n\
          \x20     --admin-token <TOKEN>    管理员令牌（/api/v1 鉴权）\n\
+         \x20     --admin-user <NAME>      网页控制台（/admin）登录用户名，默认 admin\n\
+         \x20     --admin-password <PWD>   网页控制台登录口令（明文；加载时即哈希，不落盘）\n\
+         \x20     --admin-password-hash <PHC>  口令的 Argon2id 哈希串（优先于上一项）\n\
          \x20     --storage-backend <NAME> 新项目默认存储后端\n\
          \x20     --mcp-allowed-hosts <CSV> MCP 允许的 Host 白名单（逗号分隔）\n\
          \x20     --config <PATH>          指定配置文件（默认 $XDG_CONFIG_HOME/memora/config.toml）\n\
@@ -148,7 +157,8 @@ pub fn usage() -> String {
          \n\
          配置优先级：命令行选项 > 进程环境变量 > 配置文件 > 内置默认值\n\
          默认路径是绝对路径，与当前目录无关：任何目录下的 `memora status` 都指向同一实例，\n\
-         故日常操作无需带参数。为某个实例单独指定配置时才需要 `--config`。\n",
+         故日常操作无需带参数。为某个实例单独指定配置时才需要 `--config`。\n\
+         网页控制台：服务启动后访问 http://localhost:<PORT>/admin\n",
         version = env!("CARGO_PKG_VERSION")
     )
 }
@@ -213,6 +223,18 @@ where
                 "admin-token" => {
                     let value = value_of(inline, &mut it, "--admin-token")?;
                     overrides.admin_token = Some(value);
+                }
+                "admin-user" => {
+                    let value = value_of(inline, &mut it, "--admin-user")?;
+                    overrides.admin_user = Some(value);
+                }
+                "admin-password" => {
+                    let value = value_of(inline, &mut it, "--admin-password")?;
+                    overrides.admin_password = Some(value);
+                }
+                "admin-password-hash" => {
+                    let value = value_of(inline, &mut it, "--admin-password-hash")?;
+                    overrides.admin_password_hash = Some(value);
                 }
                 "storage-backend" => {
                     let value = value_of(inline, &mut it, "--storage-backend")?;
@@ -511,6 +533,12 @@ mod tests {
             "/data",
             "--admin-token",
             "s3cret",
+            "--admin-user",
+            "root",
+            "--admin-password",
+            "p4ssw0rd",
+            "--admin-password-hash",
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA",
             "--storage-backend",
             "in_mem",
             "--mcp-allowed-hosts",
@@ -523,9 +551,49 @@ mod tests {
                 port: Some(6800),
                 data_dir: Some("/data".to_string()),
                 admin_token: Some("s3cret".to_string()),
+                admin_user: Some("root".to_string()),
+                admin_password: Some("p4ssw0rd".to_string()),
+                admin_password_hash: Some(
+                    "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_string()
+                ),
                 storage_backend: Some("in_mem".to_string()),
                 mcp_allowed_hosts: Some("mem.example.com,localhost".to_string()),
             }
         );
+    }
+
+    /// 三个凭据选项彼此独立，不得互相污染：
+    /// `--admin-token`（脚本用）、`--admin-password`（明文）、`--admin-password-hash`（哈希）。
+    #[test]
+    fn credential_flags_do_not_leak_into_each_other() {
+        let only_token = parse_args(&["--admin-token", "tok"]).unwrap();
+        assert_eq!(only_token.overrides.admin_token.as_deref(), Some("tok"));
+        assert_eq!(only_token.overrides.admin_password, None);
+        assert_eq!(only_token.overrides.admin_password_hash, None);
+
+        let only_password = parse_args(&["--admin-password", "pw"]).unwrap();
+        assert_eq!(only_password.overrides.admin_token, None);
+        assert_eq!(only_password.overrides.admin_password.as_deref(), Some("pw"));
+        assert_eq!(only_password.overrides.admin_password_hash, None);
+
+        // `--admin-password-hash` 的取值必须原样保留：它本身含有 `$` 与 `,`，
+        // 若被当作分隔符或需要转义，PHC 串就会在解析阶段被悄悄改坏。
+        let phc = "$argon2id$v=19$m=19456,t=2,p=1$YWJjZGVmZ2hpamtsbW5vcA$aGFzaA";
+        let only_hash = parse_args(&["--admin-password-hash", phc]).unwrap();
+        assert_eq!(only_hash.overrides.admin_password_hash.as_deref(), Some(phc));
+    }
+
+    /// 帮助文本必须列出控制台相关选项与入口地址，否则用户无从知道它的存在。
+    #[test]
+    fn help_text_documents_the_console_and_its_credentials() {
+        let text = usage();
+        for expected in [
+            "--admin-user",
+            "--admin-password",
+            "--admin-password-hash",
+            "/admin",
+        ] {
+            assert!(text.contains(expected), "帮助文本缺少 {expected}");
+        }
     }
 }

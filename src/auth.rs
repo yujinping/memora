@@ -3,12 +3,19 @@
 //! @author yujinping
 //! @intent P2：中间件职责扩展为「token → 项目登记项 → 仓库集合」，并把结果作为
 //!          `ProjectContext` 注入请求扩展；此后所有 handler 只依赖 trait 对象。
+//! @intent P4.4：管理面（`/api/v1`）新增**第二条**凭据通路——网页控制台的会话 Cookie。
+//!         两条通路的取舍不同：Bearer 面向脚本（无状态、可写进配置文件与 CI 密钥），
+//!         Cookie 面向浏览器（登录一次、自动携带）。二者共用同一个鉴权入口
+//!         [`authenticate_admin`]，以免两处各自判定而出现「一条通路做了 CSRF 检查、
+//!         另一条忘了做」这类不对称缺陷。
+//!         `/mcp` 一侧**只有** Bearer 一条通路，会话 Cookie 不参与——见 `routes` 的装配。
 
 use crate::error::{AuthError, ProjectResolveError};
 use crate::reply::{internal_error, unauthorized};
+use crate::session;
 use crate::state::AppState;
 use axum::extract::{Request, State};
-use axum::http::{header::AUTHORIZATION, HeaderValue};
+use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue, Method};
 use axum::middleware::Next;
 use axum::response::Response;
 use sha2::{Digest, Sha256};
@@ -78,6 +85,98 @@ fn auth_failure(err: AuthError) -> Response {
     unauthorized()
 }
 
+/// 管理面的鉴权结果。
+///
+/// @intent 保留「凭据来自哪条通路」这一信息，是为了让中间件能对**会话通路**施加
+///         CSRF 检查：携带会话 Cookie 的是浏览器，而浏览器会自动附带该 Cookie，
+///         于是跨站请求也能通过鉴权；Bearer 通路不存在这个问题，故不受该检查约束。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminIdentity {
+    /// 来自 `Authorization: Bearer <ADMIN_TOKEN>`（脚本 / 无状态调用方）
+    BearerToken,
+    /// 来自有效会话 Cookie（网页控制台）
+    Session {
+        /// 登录用户名
+        user: String,
+    },
+}
+
+/// 定长数据的常量时间比较。
+///
+/// @intent 逐字节异或后统一判定，不做提前返回：`==` 会在首个不同的字节处停下，
+///         于是比较耗时随「匹配了多少个前缀字符」变化，理论上可被用于逐字节爆破凭据。
+///         长度不等时立即返回 `false`——凭据长度是公开且固定的，泄漏它没有意义。
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 解析管理面身份：Bearer 优先，其次会话 Cookie。
+///
+/// @intent 「Bearer 存在但无效」时**直接失败**，不继续尝试 Cookie。理由：调用方显式
+///         提供了凭据却被拒绝，若此时回退到环境里自动携带的会话 Cookie 并放行，
+///         会让「配置里的 token 早已失效」这一事实被静默掩盖——而这正是最难排查的
+///         一类问题（脚本在配了错的 token 时反而表现正常）。
+pub fn authenticate_admin(state: &AppState, headers: &HeaderMap) -> Option<AdminIdentity> {
+    if let Some(token) = extract_bearer(headers.get(AUTHORIZATION)) {
+        let expected = state.config.admin_token.as_bytes();
+        // 空 ADMIN_TOKEN 表示「未配置管理凭据」，此时任何 Bearer 都不该被接受。
+        if !expected.is_empty() && constant_time_eq(token.as_bytes(), expected) {
+            return Some(AdminIdentity::BearerToken);
+        }
+        return None;
+    }
+
+    let id = session::cookie_value(headers, session::COOKIE_NAME)?;
+    let found = state.sessions.get(&id)?;
+    Some(AdminIdentity::Session { user: found.user })
+}
+
+/// 管理面鉴权中间件：`/api/v1` 的写操作与统计。
+///
+/// @intent 会话通路上追加跨站检查（见 [`AdminIdentity`]）。这里返回 403 而非 401：
+///         凭据本身是有效的，被拒的是「这次请求来自别的站点」，换个凭据也不会变好——
+///         属于与 `/mcp` 的 Host 白名单同类的「请求来源不被接受」。
+pub async fn admin_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    let identity = match authenticate_admin(&state, req.headers()) {
+        Some(identity) => identity,
+        None => return auth_failure(AuthError::InvalidToken),
+    };
+
+    if matches!(identity, AdminIdentity::Session { .. })
+        && is_state_changing(req.method())
+        && session::is_cross_origin(req.headers())
+    {
+        tracing::warn!(
+            method = %req.method(),
+            path = %req.uri().path(),
+            "rejected a cross-origin state-changing request authenticated by session cookie"
+        );
+        return crate::reply::forbidden(
+            "cross_origin_rejected",
+            "state-changing requests authenticated by a session cookie must originate from \
+             the same host; use the admin token for scripts",
+        );
+    }
+
+    req.extensions_mut().insert(identity);
+    next.run(req).await
+}
+
+/// 该方法是否会改变服务端状态（从而需要 CSRF 防护）。
+///
+/// @intent 按「不是安全方法」判定，而不是枚举 POST/DELETE：将来新增 PUT/PATCH 时
+///         自动被覆盖，不必记得回来改这里——漏改的后果是**静默失去防护**。
+fn is_state_changing(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
 /// Bearer 鉴权中间件：解析 token → 定位项目 → 把仓库集合注入请求扩展。
 ///
 /// @intent 注入的是 `ProjectRepos` 本身（自带 project_id 与 backend），
@@ -103,15 +202,6 @@ pub async fn bearer_auth(State(state): State<AppState>, mut req: Request, next: 
         }
         Err(ProjectResolveError::Auth(err)) => auth_failure(err),
         Err(ProjectResolveError::Storage(err)) => internal_error(&err),
-    }
-}
-
-/// 管理员鉴权中间件：比对 ADMIN_TOKEN。
-pub async fn admin_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    match extract_bearer(req.headers().get(AUTHORIZATION)) {
-        Some(t) if t == state.config.admin_token => next.run(req).await,
-        Some(_) => auth_failure(AuthError::InvalidToken),
-        None => auth_failure(AuthError::MissingToken),
     }
 }
 
@@ -169,6 +259,45 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..64 {
             assert!(seen.insert(generate_token().unwrap()), "token 出现重复");
+        }
+    }
+
+    /// 常量时间比较必须是真值函数：等值放行，任何差异都必须被发现。
+    #[test]
+    fn constant_time_eq_is_an_exact_equality_check() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"admin-token", b"admin-token"));
+
+        assert!(!constant_time_eq(b"admin-token", b"admin-tokeN"), "末位差异");
+        assert!(!constant_time_eq(b"admin-token", b"Admin-token"), "首位差异");
+        assert!(!constant_time_eq(b"admin-token", b"admin-token "), "长度差异");
+        assert!(!constant_time_eq(b"short", b"longer-value"));
+
+        // 全字节取值下的差异（含 0x00 与 0xff 的边界）
+        assert!(constant_time_eq(&[0x00, 0xff], &[0x00, 0xff]));
+        assert!(!constant_time_eq(&[0x00, 0xff], &[0x00, 0xfe]));
+    }
+
+    /// 会改变服务端状态的方法判定：安全方法放行，其余一律要求 CSRF 检查。
+    ///
+    /// @intent 这条档的是「将来新增 PUT/PATCH 却忘了纳入检查」——那会表现为
+    ///         **静默失去防护**，而功能测试全部通过。
+    #[test]
+    fn state_changing_methods_are_classified_by_default_deny() {
+        for safe in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(!is_state_changing(&safe), "{safe} 不应被要求 CSRF 检查");
+        }
+        for unsafe_method in [
+            Method::POST,
+            Method::DELETE,
+            Method::PUT,
+            Method::PATCH,
+            Method::CONNECT,
+        ] {
+            assert!(
+                is_state_changing(&unsafe_method),
+                "{unsafe_method} 必须要求 CSRF 检查"
+            );
         }
     }
 }

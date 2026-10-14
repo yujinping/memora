@@ -42,18 +42,24 @@
 结论：现成方案要么内存超标，要么鉴权/隔离非原生。自建单二进制方案可同时把内存、隔离、鉴权、可控性拉到理想区间，且复用已有技术栈，维护成本可控。
 
 ### 1.2 验收条件（目标）
-- [ ] 免费、开源（自有仓库，MIT / Apache-2.0）
-- [ ] 单二进制部署，无外部服务依赖（除可选远程 embedding API）
-- [ ] 常驻内存 < 100MB（2GB 服务器余量充足）
-- [ ] 可公网 HTTPS 访问
-- [ ] Bearer Token 访问保护
-- [ ] 按项目硬隔离（数据独立、互不越权）
-- [ ] 标准 MCP 协议，兼容主流 MCP 客户端
+- [x] 免费、开源（自有仓库，MIT / Apache-2.0）
+- [x] 单二进制部署，无外部服务依赖（除可选远程 embedding API）
+- [x] 常驻内存 < 100MB（2GB 服务器余量充足）
+- [x] 可公网 HTTPS 访问
+- [x] Bearer Token 访问保护
+- [x] 按项目硬隔离（数据独立、互不越权）
+- [x] 标准 MCP 协议，兼容主流 MCP 客户端
+- [x] **人的入口**：`/admin` 网页控制台（用户名 + 口令），不依赖 `curl` 即可建项目、取 token、浏览记忆
+
+> 最后一条是 P4.4 补上的**验收条件缺席**：前七条全都从「服务能不能被接上」的角度写，
+> 没有一条从「人第一次怎么把它用起来」的角度写。于是接口设计得很完整、第一个项目却必须 `curl`。
+> 验收条件本身的偏向，比任何单个实现缺陷都更难发现。
 
 ### 1.3 非目标（首版范围外）
 - 不做内置大模型推理（事实抽取 / 语义嵌入走外部 API，可选）
 - 不做复杂图谱推理 / 反思（首版对标官方 MCP Memory 的图谱模型）
 - 不做多节点集群（单实例即可）
+- 控制台只读记忆、不写记忆：写入仍只经 MCP 工具，避免在管理面引入第二套写入语义（判重规则、来源字段等）
 
 ---
 
@@ -185,7 +191,7 @@ CREATE INDEX idx_conv_session ON conversations(session_id, created_at);
 
 | 工具 | 关键参数 | 行为 | 返回 |
 |---|---|---|---|
-| `create_entities` | `entities[{name, entity_type}]` | 批量建实体，重复名忽略（不覆盖原类型） | 请求名在调用后的状态（含观测） |
+| `create_entities` | `entities[{name, entity_type, observations?}]` | 批量建实体，重复名忽略（不覆盖原类型）；**可携带 `observations`** 与实体一并落库（来源继承实体的 `source`） | 请求名在调用后的状态（含观测） |
 | `create_relations` | `relations[{from_name, to_name, relation_type}]` | 批量建关系，三元组重复跳过 | 实际落库的关系（**含 id**） |
 | `add_observations` | `observations[{entity_name, contents[]}]` | 追加观测；实体不存在报 `-32602` | 受影响实体（**含新观测 id**） |
 | `delete_entities` | `names[]` | 级联删除关系 / 观测 / FTS | 确实存在并被删除的名字 |
@@ -200,34 +206,64 @@ CREATE INDEX idx_conv_session ON conversations(session_id, created_at);
 - 实体视图为 `{name, entity_type, created_at, source, observations[]}`；观测视图为 `{id, content, created_at, source}`；关系视图为 `{id, from_name, to_name, relation_type, created_at, source}`。`source` 为写入来源标识，空串 = 未声明。
 - **必须回读 id**：`create_relations` / `add_observations` 回读 id 是刻意的——`delete_relations` / `delete_observations` 只接受 id，不回读则调用方拿不到句柄，记忆的「可修订」闭环无法成立。
 - **入参别名**：接受官方 schema 的 camelCase 写法（`entityType` / `relationType` / `entityName` / `from` / `to`），容忍模型照抄旧 schema；别名不进入 JSON Schema，对外只宣传规范字段名。
+- **未知字段硬失败**：全部工具入参启用 `deny_unknown_fields`，字段名拼错、或把两个工具的入参混在同一层（顶层同时给 `entities` 与 `observations`）一律被拒并点名出错字段。
+  - 理由：serde 默认「忽略未知字段」会把错误变成**静默的数据丢失**——服务端返回 200 而数据一条不落，调用方毫无线索。这是最坏的失败形态，而报错还能让模型自行修正参数。
+  - 实测形状差异（写用例时必须分开断言）：参数**反序列化**失败是 `result.isError = true` + 文本消息；工具**语义层**错误（实体不存在等）才是 JSON-RPC `error.code = -32602`。
 
 MCP 服务端采用 **rmcp（Rust MCP SDK，3.x）** 实现 Streamable HTTP 传输。与官方 MCP Memory 的差异仅在**检索能力**（本服务额外支持中文片段与词内片段）与**返回结构的丰富度**（带 id 与时间戳），不改变三元组语义。
 
-### 5.2 REST 管理层（`/api/v1`，需 `ADMIN_TOKEN`）
+### 5.2 REST 管理层（`/api/v1`）
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/projects` | 创建项目（生成 token 并返回明文，201） |
 | GET | `/projects` | 项目列表 |
 | DELETE | `/projects/{id}` | 注销项目（删登记行 + 删项目库文件） |
 | GET | `/projects/{id}/stats` | 实体 / 关系 / 观测统计 |
+| GET | `/projects/{id}/graph` | 该项目全图快照（控制台「记忆浏览」用，只读） |
+| POST | `/session` | 控制台登录（**公开**）→ 签发会话 Cookie |
+| GET | `/session` | 会话自检（**公开**）→ 是否已配置口令 / 是否已登录 |
+| DELETE | `/session` | 登出（幂等）→ 204 + 立即失效的 Cookie |
 | GET | `/health` | 健康检查（无鉴权） |
+
+**两条凭据通道**：`ADMIN_TOKEN`（Bearer，给脚本 / CI）或控制台**会话 Cookie**（给浏览器）。
+项目 token **不是**管理凭据，不可用于本前缀。
 
 **请求 / 响应契约**
 - `POST /projects`：体为 `{"project_id"?: string, "backend"?: string}`，两字段均可省略——省略 `project_id` 时自动生成 `p_<12 位十六进制>`，省略 `backend` 时取 `STORAGE_BACKEND`。
 - 创建响应 `{"project_id", "token", "backend"}`：**明文 `token` 仅此一次出现**，库内只存 SHA-256，丢失只能重建项目。
 - 注销响应 `{"project_id", "data_removed": bool}`：`data_removed=false` 表示「登记已撤销，但物理数据未能删除」（该项目的后端未编译进本构建）——如实报告，不假装成功。
 - 统计响应 `{"project_id", "backend", "entities", "relations", "observations"}`，数据一律从 `read_graph` 派生，与 MCP 客户端所见同源。
+- 登录体 `{"username", "password"}` → `{"user", "expires_in_secs"}` + `Set-Cookie`。**用户名错与口令错的响应逐字相同**（差异只进服务端日志），否则会形成用户名枚举信道——而用户名恰是本服务唯一的公开标识（默认 `admin`）。
 
 **状态码语义**（与 MCP 侧 `-32602` / `-32603` 的分流原则一致：客户端可否自行修正）
 | 码 | 含义 | 触发场景 |
 |---|---|---|
 | 400 | 入参可修正 | project_id 非法（目录穿越 / 分隔符 / 空白）；请求的后端未编译进本构建（响应附带 `available_backends` 列表供自我修正） |
-| 401 | 凭据问题 | 缺 / 错 `ADMIN_TOKEN`（项目 token 不能当管理凭据用） |
+| 401 | 凭据问题 | 缺 / 错 `ADMIN_TOKEN`；控制台用户名或口令错误；会话过期 / 已登出；未配置登录口令 |
+| 403 | 来源不被接受 | 用会话 Cookie 鉴权的写请求来自跨源站（CSRF 第二道防线） |
 | 404 | 资源不存在 | 项目未登记 |
 | 409 | 资源冲突 | project_id 已被占用 |
 | 500 | 服务端故障 | 元库不可用、后端未注册（登记的 backend 值本身合法但本构建未编译）、熵源不可用 |
 
 **注销的顺序约定**：先删物理数据（`StorageBackend::drop_project`），再删元库登记行。反序时若删文件失败，会留下「登记行已消失、数据仍在盘上」的不可见残留——既违背删除承诺又无法重试自愈；本顺序最坏情况是「文件已删、登记行尚在」，重试一次 DELETE 即可收敛。
+
+#### 5.2.1 网页控制台（`/admin`，P4.4 新增）
+
+补上第 5 节里原本**缺失的一环**：接口设计只回答了「脚本怎么建项目」，没回答「人怎么第一次用起来」。
+
+| 决策 | 取舍 |
+|---|---|
+| **凭据形态：用户名 + 口令** | `admin_token` 是 64 位十六进制串，给脚本用没问题，给人用是「从终端抄进浏览器」的负担。口令以 **Argon2id** 哈希存进 `config.toml`（PHC 格式，参数内联），任何位置都不存明文 |
+| **会话用内存表，不用签名 Cookie** | 签名 Cookie 需要一把长期密钥，于是「怎么生成、存哪、怎么轮换」立刻变成三个新的运维问题，而落盘密钥本身又是必须保护的秘密。内存表不需要密钥：会话 id 是 256 bit 随机量、服务端持有对应关系，客户端无法自证身份，因而**不存在「伪造一个签名 Cookie」这条攻击路径**。代价是重启即全员登出（对管理面反而是正向属性：等于强制重新认证）与多实例不共享会话——而 memora 是单实例模型，这个代价当前为零 |
+| **会话有效期绝对（不滑动）** | 滑动过期会让一个被窃取的 id 只要持续被使用就永不失效。取 12 小时（一个工作日量级） |
+| **CSRF 双防线** | 主防线是 `SameSite=Strict`；第二道是「用 Cookie 鉴权的写请求必须同源」。第二道刻意做成 **fail-closed**：`Origin` 存在而 `Host` 缺失即判为跨站——实测中发现过这个漏洞（测试用的 `oneshot` 不产生 `Host`，跨站 DELETE 因此被放行）。读请求（GET/HEAD/OPTIONS）豁免 |
+| **`Secure` 只在确认 HTTPS 时添加** | 判断依据取反代约定的 `X-Forwarded-Proto`（Caddy 默认发送）。自托管常见形态是 `http://localhost:6789`，此时加上 `Secure` 会被浏览器**丢弃**该 Cookie，表现为「登录成功但立刻又变回未登录」——一个不影响安全边界（`SameSite` 与 `HttpOnly` 仍生效）却极难自查的故障 |
+| **页面不携带任何数据** | `/admin` 公开可访问，因为它只是一张登录表单；页面自己在浏览器里请求 `/api/v1/session` 登录。因此它无需鉴权，也没有「未登录也能读到东西」的面 |
+| **页面用 `textContent` 渲染，绝不用 `innerHTML`** | 展示的实体名与观测内容来自 AI 客户端写入的记忆库，属不可信数据；用 `innerHTML` 等于在自己的管理界面里开一个存储型 XSS。已固化成用例 |
+| **`/api/v1/session` 单独成组注册** | 登录接口不可能先鉴权。若并进同一个 `route_layer`，`POST /session` 会在进入 handler 前就被 401 拒掉——一个只在「第一次用浏览器」时才暴露的装配错误 |
+| **口令强度只在解析期校验** | 服务跑起来后只持有哈希，那时已无从判断强度。明文短于 8 字符**硬失败**（与非法 `PORT` 同源：非法值不得静默通过）。判据只看长度——要求「含大小写数字符号」会诱导用户产出 `Passw0rd!` 这类可预测口令，而长度才是抵抗离线爆破的主要变量 |
+| **`init` 生成真实随机凭据** | 原先写一个占位 token 并让人手改，等于把「公网部署漏改 ⇒ 管理面无鉴权」做成默认路径。现在 `init` 生成 20 位随机口令（字符集剔除 `0/O/o/1/l/I` 等易混字形）、当场哈希、**只打印一次**明文。随机量仍走系统熵（`getrandom`），不引入 rand 生态 |
+| **反代白名单必须与路由表同步** | 新增 `/admin` 时漏改 `deploy/Caddyfile`，症状是「localhost 直连正常、经 Caddy 反代 404」——两边各自看都没错，单元测试也发现不了（路由表与反代模板互不相干）。已加用例断言模板覆盖全部公开前缀 |
 
 ### 5.3 MCP 客户端接入配置（Zed / WorkBuddy）
 
@@ -252,6 +288,37 @@ MCP_ALLOWED_HOSTS=mem.example.com,localhost,127.0.0.1
   }
 }
 ```
+
+#### 5.3.1 「项目上下文」从哪里来：一条传输选型的固有代价（2026-09-20 补充）
+
+先说结论：**服务端无法知道「这次写入来自哪个工作区」，且这不是实现疏漏，而是 HTTP 传输选型的必然结果。**
+
+| 查证点 | 事实 |
+|---|---|
+| MCP 的 `initialize` 入参 | 只有 `protocol_version` / `capabilities` / `client_info` / `_meta`（rmcp 3.3.0 `model.rs` `InitializeRequestParams`）——**没有任何 cwd 或工作区字段** |
+| 客户端是否可能告知工作区 | 协议里唯一表达「文件系统根」的机制是 `roots`，但它在 rmcp 3.3.0 已标记**废弃**（SEP-2577）；且无状态 JSON 响应模式（`json_response = true`）下服务端无法反向发 `roots/list` 请求，此路不通 |
+| memora 侧是否采集过上下文 | `src/` 内 `workspace` / `cwd` / `current_dir` **零命中**；服务端不读任何请求头或 `clientInfo`；`projects` 表只有 `project_id` / `token_hash` / `db_path` / `created_at` / `backend` 五列 |
+| WorkBuddy 侧配置作用域 | `~/.workbuddy/mcp.json` 是**用户级唯一一份**，`{工作区}/.workbuddy/mcp.json` 不存在 → 所有工作区共用同一条目、同一个 token |
+
+因此 `token → project` 这条绑定所表达的语义是**「这个客户端条目能访问哪个项目」**（访问权限），
+**不是「你现在在哪里干活」**（工作区归属）。二者在「一个客户端条目」的配置形态下会被混为一谈，
+表现为：从 A 仓库发起的写入落进 B 项目的库，且**全过程静默**——服务端只认 token，客户端也不上报目录，没有任何一处会提示「你正在往 X 项目写」。
+
+**「项目上下文」只能由调用方显式声明。**四种声明方式及代价（**待决策**，尚未实施）：
+
+| 方案 | 上下文来自 | 隔离承诺 | 每开新项目要做 | 主要风险 / 说明 |
+|---|---|---|---|---|
+| **A｜客户端多条目** | 条目名（`memora-iptv`、`memora-board`…） | 保住 | 改 `mcp.json` + 信任 + **新开会话** | 所有工作区都会看到全部条目。工具名按 server 命名空间隔离（观测到的客户端约定一律为 `mcp__<server>__<tool>`，故 `memora-iptv` 与 `memora-board` 的工具**不会重名**），模型仍需选对命名空间，但那是「选服务器」量级的判断，比「猜项目名」可复核 |
+| **B｜工作区级 token + 显式 `project` 入参** | 每次工具调用参数 | **放弃**（一个 token 可跨项目读写） | 无（这是它唯一的优点） | 把「选对项目」的责任从**一次且可复核的配置**转移到**每次且不可复核的模型调用**；必须不设隐式默认（忘传即报错），否则串味从「总是写进 X」变成「偶尔写进 Y」 |
+| **C｜配置命令化**（`memora connect --client workbuddy --project X`） | 同 A | 保住 | 一条命令（脚本写 `mcp.json`，并提示「去信任 + 新开会话」） | 只降低操作成本，不解决重启 |
+| **D｜仓库内声明文件**（`AGENTS.md` / `CLAUDE.md` 写明「本项目 = memora-iptv，何时读、何时写」） | **仓库根目录里的一份文件** | 保住（配合 A） | 一条命令追加（配合 C） | 这是唯一能同时解决**「自动」**（协议层不提供触发，只能靠仓内指令教模型）与**「归属」**（文件随仓库走，天然按工作区正确）的办法。关键是它把上下文锚在**可 review、可 diff、随仓库走**的文件上，而非模型的临场记忆里 |
+
+**A + C + D 是推荐组合**：隔离承诺不动，自动化由仓内声明获得，操作成本压到一条命令。
+**B 只有在「坚决不肯增加客户端条目」时才考虑**——它动的是本项目最核心的卖点（「token 即项目」硬隔离），须单独评审后再定。
+
+**为什么 D 不可省**：A/B/C 解决的都是「写到哪个库」，而没有解决「模型**想不想**调用工具」。MCP 协议不提供「自动注入记忆」的机制——它只提供工具，调不调用是客户端的决策。
+对比之下，客户端自带的记忆（如 WorkBuddy 的 `~/.workbuddy/MEMORY.md` + `{工作区}/.workbuddy/memory/`）是**自动注入上下文**的，且**天然按工作区分域**（因为它跑在本地，知道 cwd）。
+memora 作为 HTTP 传输的外部服务二者皆无，因此必须用仓内声明把「何时读、何时写、写哪个项目」显式教给模型——否则工具存在但永不被调用，「按项目管理」也就无从谈起。
 
 **Zed**（`~/.config/zed/settings.json`，新版本原生支持 `url` + `headers`）：
 ```json
@@ -364,6 +431,8 @@ MCP_ALLOWED_HOSTS=mem.example.com,localhost,127.0.0.1
 | **P3 MCP** | 接入 rmcp，9 个工具改为调用 `MemoryRepository` trait（不直连 sea-orm） | 客户端可读写记忆 | 工具语义单测 + 协议级端到端（`initialize` / `tools/list` / `tools/call`）;<br>MCP Inspector 人工核验待 P4.2 联调时补 |
 | **P4.1 管理面** | REST 项目增删 + 用量统计；后端新增 `drop_project` 生命周期方法 | 项目生命周期脱离手工改库 | 管理面协议级用例 + 后端级契约（双后端） |
 | **P4.2 运行形态** | caddy 式自守护 CLI（`run`/`start`/`stop`/`restart`/`status`/`init`）+ `.env` 查找路径显式化 + release 构建 + systemd/Caddy + 压测 | 公网可用，且无 systemd 也能跑 | 负载 / 隔离验证、进程生命周期端到端 |
+| **P4.3 配置单实例化** | 配置改为 XDG 绝对默认路径 + TOML + `--config`；`.env` 与 `--env-file` 退役；PID 文件升级为实例记录 | 「实例身份」不再随 CWD 漂移 | 默认路径解析、TOML 未知键拒绝、按记录探活与终止 |
+| **P4.4 网页控制台** | `/admin` 页面 + 用户名/口令登录（Argon2id）+ 内存会话 + 建项目 / 复制 token / 记忆浏览；`init` 生成随机凭据 | 不用 `curl` 也能建项目并查看记忆 | 口令与会话单测 + 控制台协议级用例（含 CSRF 与凭据隔离）+ 页面静态自洽断言 |
 | **P5 会话** | `conversations` 表 + `log_turn`/`get_session`/`list_sessions` + Zed/WorkBuddy 接入指令落地 | 会话跨机器恢复 | 会话写入 / 恢复单测 + 双客户端联调 |
 
 **实施进度（截至 2026-09-15）**
@@ -439,6 +508,14 @@ MCP_ALLOWED_HOSTS=mem.example.com,localhost,127.0.0.1
     10. **部署模板内嵌二进制**：`deploy/` 三份模板经 `include_str!` 编译进二进制，`memora init` 因而**不依赖部署目录**——这与「单文件交付」的定位一致，也避免「模板文件没跟着二进制走」的部署事故。Caddyfile 用 `handle` 块而非顶层 `reverse_proxy` + 兜底 `respond`：Caddy 的 directive 排序会把 `respond` 提到 `reverse_proxy` 之前执行，从而拦掉代理规则。
     11. **PID 文件内容损坏时报错而非视作「未运行」**：后者会直接覆盖一个可能仍在运行的服务。存活探测用 `kill(pid, 0)`，且 **`EPERM` 判为存活**（进程存在但不属于当前用户），其余错误保守判为存活。
     12. **`stop` 幂等成功而 `status` 未运行返回 3**：脚本可无条件调用 `memora stop`，而「是否在运行」的判断交给 `status` 的退出码（遵循 LSB init 脚本惯例）。
+- **P4.4 网页控制台已完成**：补上设计里一处**真实的缺口**——「怎么建一个项目」原先只有脚本能回答。
+  - 起因：设计文档从背景、选型、数据模型到接口都完整，唯独没写过「人怎么第一次用起来」（在其中检索「控制台 / 登录 / 浏览器」为零命中）。于是 `POST /api/v1/projects` 写得很到位，而第一次使用必须 `curl` 并手工拼 `Authorization` 头——这对脚本是优点，对人是门槛。**这不是某个实现的疏漏，而是验收条件本身的偏向**（见 §1.2 的注）。
+  - 新增模块：`console.rs`（`/admin` 页面 + `/api/v1/session` 登录/登出/自检）、`console.html`（内嵌页面，`include_str!`）、`password.rs`（Argon2id 哈希 / 校验 / 随机口令）、`session.rs`（内存会话表 + Cookie 解析签发 + 跨源判定）。改动：`auth.rs` 增加 `AdminIdentity`（Bearer 或会话）与 `admin_auth` 中间件；`config.rs` 增加 `admin_user` / `admin_password_hash` 与**五层**口令解析（flag 哈希 / flag 明文 / env 哈希 / env 明文 / 文件）；`cli.rs` 增加 `--admin-user` / `--admin-password` / `--admin-password-hash`；`reply.rs` 增加 403 与「带原因的 401」；`admin.rs` 增加 `GET /projects/{id}/graph`；`daemon.rs` 的 `init` 改为生成并打印真实随机凭据；`deploy/config.toml.template` 增加两个键；`Cargo.toml` 新增 `argon2`（`alloc + getrandom + password-hash`，无 std 依赖负担）。
+  - **验证结果**：`cargo test` **228 项全部通过**；`cargo build` 与 `cargo clippy --all-targets` **零告警**；实机 16 项 L7 用例全通过（矩阵见 `docs/testing-guide.md` §10），其中值得单列的四条：**错误用户名与错误口令的响应逐字相同**、**会话 Cookie 不能鉴权 `/mcp`**、**项目 token 不能鉴权 `/api/v1`**、**跨源写请求 403 / 登出后旧 Cookie 401**。
+  - 关键实现取舍：见 §5.2.1 的决策表（内存会话而非签名 Cookie、口令只落哈希、CSRF 双防线、`Secure` 依 `X-Forwarded-Proto`、页面不含数据、`textContent` 而非 `innerHTML`、`/session` 单独成组、口令强度只在解析期校验、`init` 生成真实凭据、反代白名单与路由表同步）。
+  - **实测发现并修复的两个缺陷**（都属「各自看都对、合起来错」的一类）：
+    1. **反代漏放行 `/admin`**：`deploy/Caddyfile` 只列了 mcp / api / health 三个前缀，新增控制台后忘了同步 → localhost 直连正常、公网经 Caddy 打开 404，且返回的正是模板里兜底的 `respond 404`。已补 `handle /admin`，并加用例断言反代模板覆盖**全部**公开前缀——路由表与反代模板互不相干，靠人记得同步是不可靠的。
+    2. **跨站写请求曾被放行**：`is_cross_origin` 原先在「有 `Origin` 但无 `Host`」时返回「非跨站」（fail-open）。而测试用的 `oneshot` 恰好不产生 `Host`，跨站 DELETE 因此被放行。HTTP/1.1 与浏览器请求都必带 `Host`，故该分支只可能来自畸形或人为构造的请求；已改为 fail-closed，并补上「有 Origin 无 Host 必须判为跨站」的用例。
 
 每期产出完整可运行代码与测试，评审通过后再推进下一期。
 

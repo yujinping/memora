@@ -23,8 +23,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use crate::auth;
 use crate::config::Config;
 use crate::instance::{self, InstanceFile, InstanceRecord, EXIT_NOT_RUNNING};
+use crate::password;
 
 /// 健康探测的轮询间隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -83,6 +85,19 @@ pub fn child_spec(exe: &Path, config: &Config, log_path: &Path) -> ChildSpec {
     // 只注入非空项：空值会覆盖子进程自身读到的配置，把有效设置抹成默认值。
     if !config.admin_token.trim().is_empty() {
         envs.push(("ADMIN_TOKEN".to_string(), config.admin_token.clone()));
+    }
+    if !config.admin_user.trim().is_empty() {
+        envs.push(("ADMIN_USER".to_string(), config.admin_user.clone()));
+    }
+    // 口令**哈希**而非明文：父进程拿到的是已解析配置，明文在加载时就被哈希掉了，
+    // 这里注入的正是子进程启动控制台登录所需的那一份。漏注入不会报错，
+    // 只会让 `start` 形态下的 `/admin` 提示「未配置登录口令」，而 `run` 形态正常
+    // ——这类「两种运行形态行为不一致」的缺陷最难察觉，故有专门用例守着。
+    if !config.admin_password_hash.trim().is_empty() {
+        envs.push((
+            "ADMIN_PASSWORD_HASH".to_string(),
+            config.admin_password_hash.clone(),
+        ));
     }
     if !config.mcp_allowed_hosts.is_empty() {
         envs.push((
@@ -313,23 +328,94 @@ pub fn init(config: &Config, force: bool) -> Result<i32> {
     }
 
     let exe = std::env::current_exe().context("cannot determine the current executable path")?;
-    write_private(config_path, &render_config_template(config))?;
+
+    // 凭据补齐：未配置的项就地生成。**不再写占位值**——占位值不会让任何检查失败，
+    // 只会让管理面在生产上等于无鉴权，属于「能启动但危险」的最坏形态。
+    let (effective, generated) = credentials_for_init(config)?;
+    write_private(config_path, &render_config_template(&effective))?;
 
     println!("wrote {}", config_path.display());
     println!();
+    print_credentials(&effective, &generated);
+    println!();
     println!("下一步：");
+    println!("  1. 前台试跑：{} run", exe.display());
     println!(
-        "  1. 编辑 {}：至少设置 admin_token（openssl rand -hex 32）",
-        config_path.display()
-    );
-    println!("  2. 前台试跑：{} run", exe.display());
-    println!(
-        "  3. 后台常驻：{} start    （或使用下方 systemd unit）",
+        "  2. 后台常驻：{} start    （或使用下方 systemd unit）",
         exe.display()
     );
+    println!(
+        "  3. 打开控制台：http://localhost:{}/admin",
+        effective.port
+    );
     println!();
-    println!("{}", render_deploy_templates(&exe, config));
+    println!("{}", render_deploy_templates(&exe, &effective));
     Ok(0)
+}
+
+/// `init` 期间补出的明文凭据。
+///
+/// @intent 明文只活在这一个结构里、只在 `init` 的 stdout 上出现一次：它不进入
+///         `Config`（`Config` 只持有哈希与 token），也不落盘。这样即便 `init` 的输出
+///         被重定向到某个日志文件，泄漏面也只有那一次输出，而不是持续可读的配置。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GeneratedCredentials {
+    /// 本次生成的管理 API token（未生成时为 `None`）
+    pub admin_token: Option<String>,
+    /// 本次生成的控制台口令明文（未生成时为 `None`）
+    pub admin_password: Option<String>,
+}
+
+/// 补齐 `init` 所需的凭据，返回「可用于渲染的配置」与「本次新生成的明文」。
+///
+/// @intent 之所以由 `init` 生成而不是让用户自己填：默认路径上的 `init` 是绝大多数人的
+///         第一次接触，此时要求他们先想一个 token、再想一个口令，结果往往是
+///         `change-me` 或直接留空——两者都让管理面敞开。生成随机值把「做得对」
+///         变成默认行为，代价只是需要用户抄一次输出。
+///
+/// @intent 口令与 token 都各自只在**未配置**时生成：`--force` 重跑 `init` 时，
+///         已显式配置的凭据不会被悄悄换掉（那会让所有已接入的客户端突然 401）。
+pub fn credentials_for_init(config: &Config) -> Result<(Config, GeneratedCredentials)> {
+    let mut effective = config.clone();
+    let mut generated = GeneratedCredentials::default();
+
+    if effective.admin_token.trim().is_empty() {
+        let token = auth::generate_token().context("cannot generate an admin token")?;
+        effective.admin_token = token.clone();
+        generated.admin_token = Some(token);
+    }
+
+    if !effective.console_login_enabled() {
+        let plain = password::generate_password(password::GENERATED_LENGTH)?;
+        effective.admin_password_hash = password::hash_password(&plain)?;
+        generated.admin_password = Some(plain);
+    }
+
+    Ok((effective, generated))
+}
+
+/// 打印本次生成或已生效的凭据信息。
+///
+/// @intent 未生成任何凭据时**不打印任何秘密**，只说明「沿用了既有设置」：
+///         否则每次 `--force` 重跑都会把已在配置文件里的凭据再抄到终端一次，
+///         徒增泄漏面而无新信息。
+fn print_credentials(config: &Config, generated: &GeneratedCredentials) {
+    if generated.admin_token.is_none() && generated.admin_password.is_none() {
+        println!("凭据：沿用配置文件中已有的设置，本次未生成新凭据。");
+        return;
+    }
+
+    println!("⚠️  以下凭据仅在此显示一次，请立即保存到密码管理器。");
+    println!();
+    if let Some(token) = &generated.admin_token {
+        println!("  管理 API token （Authorization: Bearer …）");
+        println!("    {token}");
+    }
+    if let Some(plain) = &generated.admin_password {
+        println!("  网页控制台 http://localhost:{}/admin", config.port);
+        println!("    用户名：{}", config.admin_user);
+        println!("    口令：  {plain}");
+    }
 }
 
 /// 以 `0600` 写入文本文件（配置文件含 admin_token，不应被同组用户或他人读到）。
@@ -387,18 +473,20 @@ pub fn render_config_template(config: &Config) -> String {
                 .join(",\n")
         )
     };
-    // 空 token 写成占位值：`admin_token = ""` 会让所有 /api/v1 请求 401，
-    // 而用户看到的是一份“看起来已经配好”的文件。
-    let admin_token = if config.admin_token.trim().is_empty() {
-        "change-me"
-    } else {
-        config.admin_token.as_str()
-    };
 
+    // 这里**不做占位值兜底**：写死一个 `change-me` 会让配置文件看起来已经配好，
+    // 而实际上管理面无鉴权。凭据由 `credentials_for_init` 保证非空，
+    // 若此处仍为空，说明调用方绕过了 `init`——那就如实写出空值，
+    // 由启动告警（`main::warn_about_risky_config`）把它暴露出来。
     CONFIG_TEMPLATE
         .replace("__PORT__", &config.port.to_string())
         .replace("__DATA_DIR__", &toml_string(&config.data_dir))
-        .replace("__ADMIN_TOKEN__", &toml_string(admin_token))
+        .replace("__ADMIN_TOKEN__", &toml_string(&config.admin_token))
+        .replace("__ADMIN_USER__", &toml_string(&config.admin_user))
+        .replace(
+            "__ADMIN_PASSWORD_HASH__",
+            &toml_string(&config.admin_password_hash),
+        )
         .replace("__STORAGE_BACKEND__", &toml_string(&config.storage_backend))
         .replace("__MCP_ALLOWED_HOSTS__", &hosts_block)
         .replace("__LOG__", &toml_string(&config.log))
@@ -952,21 +1040,102 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 未设置 admin_token 时不得写成空串：那会让所有 /api/v1 请求 401，
-    /// 而用户看到的是一份「看起来已经配好」的文件。
+    /// `init` 必须生成真实凭据，而不是写入占位值。
+    ///
+    /// @intent 此前的实现写死 `change-me`：它不会让任何检查失败，却让管理面在生产上
+    ///         等于无鉴权——「能启动但危险」的最坏形态。本用例把「没有占位值」升级为
+    ///         断言：token 必须是 64 位十六进制随机串，口令哈希必须能验证本次生成的明文。
     #[test]
-    fn init_writes_a_placeholder_admin_token() {
-        let mut config = Config::for_test(6789, "/data", "", "sqlite_file");
-        let rendered = render_config_template(&config);
-        assert!(
-            rendered.contains("admin_token = \"change-me\""),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("admin_token = \"\""));
+    fn init_generates_real_credentials_instead_of_placeholders() {
+        let config = Config::for_test(6789, "/data", "", "sqlite_file");
+        let (effective, generated) = credentials_for_init(&config).unwrap();
 
-        // 显式传入的值则原样落盘
-        config.admin_token = "s3cret".to_string();
-        assert!(render_config_template(&config).contains("admin_token = \"s3cret\""));
+        let token = generated.admin_token.expect("应生成管理 token");
+        assert_eq!(token.len(), 64, "token 应为 256 bit 十六进制串：{token}");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(effective.admin_token, token);
+
+        let plain = generated.admin_password.expect("应生成控制台口令");
+        assert!(
+            password::verify_password(&plain, &effective.admin_password_hash),
+            "落盘的哈希必须能验证本次生成的口令"
+        );
+        assert!(effective.console_login_enabled());
+
+        let rendered = render_config_template(&effective);
+        assert!(rendered.contains(&format!("admin_token = \"{token}\"")));
+        assert!(
+            !rendered.contains("change-me") && !rendered.contains("change-me"),
+            "绝不能再出现占位凭据：{rendered}"
+        );
+        assert!(
+            !rendered.contains("admin_token = \"\"")
+                && !rendered.contains("admin_password_hash = \"\""),
+            "不得写出空凭据：{rendered}"
+        );
+
+        // 渲染结果必须是合法 TOML，且解析回来就是那两个值
+        let parsed: toml::Value = toml::from_str(&rendered).expect("渲染结果必须是合法 TOML");
+        assert_eq!(
+            parsed.get("admin_user").and_then(toml::Value::as_str),
+            Some(crate::config::DEFAULT_ADMIN_USER)
+        );
+        assert_eq!(
+            parsed
+                .get("admin_password_hash")
+                .and_then(toml::Value::as_str),
+            Some(effective.admin_password_hash.as_str())
+        );
+    }
+
+    /// 已配置的凭据在 `--force` 重跑时不得被悄悄换掉。
+    ///
+    /// @intent 换掉 token 会让所有已接入的 MCP 客户端突然 401；换掉口令会让已登录的
+    ///         人再也登不进去。二者都是「重跑一次 init」这一无害动作的意外副作用。
+    #[test]
+    fn init_keeps_explicitly_configured_credentials() {
+        let mut config = Config::for_test(6789, "/data", "existing-token", "sqlite_file");
+        config.admin_user = "root".to_string();
+        config.admin_password_hash = password::hash_password("existing-password").unwrap();
+
+        let (effective, generated) = credentials_for_init(&config).unwrap();
+
+        assert_eq!(generated, GeneratedCredentials::default());
+        assert_eq!(effective.admin_token, "existing-token");
+        assert!(password::verify_password(
+            "existing-password",
+            &effective.admin_password_hash
+        ));
+
+        let rendered = render_config_template(&effective);
+        assert!(rendered.contains("admin_user = \"root\""));
+        assert!(rendered.contains("existing-token"));
+    }
+
+    /// 两次 `init` 生成的凭据必须不同（这才是「随机」的实际含义）。
+    #[test]
+    fn generated_credentials_differ_between_runs() {
+        let config = Config::for_test(6789, "/data", "", "sqlite_file");
+        let first = credentials_for_init(&config).unwrap().1;
+        let second = credentials_for_init(&config).unwrap().1;
+
+        assert_ne!(first.admin_token, second.admin_token);
+        assert_ne!(
+            password::hash_password(first.admin_password.as_ref().unwrap()).unwrap(),
+            password::hash_password(second.admin_password.as_ref().unwrap()).unwrap()
+        );
+    }
+
+    /// 未配置凭据时渲染出空串（而非占位值）：这是刻意的「如实写出」，
+    /// 由启动告警把它暴露出来，而不是用占位值假装配好了。
+    #[test]
+    fn render_writes_empty_credentials_as_empty() {
+        let config = Config::for_test(6789, "/data", "", "sqlite_file");
+        let rendered = render_config_template(&config);
+        assert!(rendered.contains("admin_token = \"\""));
+        assert!(rendered.contains("admin_password_hash = \"\""));
+        // 渲染结果仍须是合法 TOML（空串在 TOML 里合法）
+        toml::from_str::<toml::Value>(&rendered).expect("必须是合法 TOML");
     }
 
     /// 数据目录里出现引号这类字符时，手拼字符串会生成语法非法的 TOML。
@@ -985,6 +1154,26 @@ mod tests {
             Some("/data/with \"quote\" and \\slash"),
             "{rendered}"
         );
+    }
+
+    /// 反代模板必须覆盖服务**实际对外提供**的每一个公开前缀。
+    ///
+    /// @intent 这条哨兵来自一次实测缺陷：Caddyfile 原先只代理 mcp / api / health
+    ///         三个前缀，新增 `/admin` 控制台时忘了同步，于是出现「localhost 直连正常、
+    ///         经 Caddy 反代就 404」——而这类错误不会被任何单元测试发现，
+    ///         因为路由表与反代模板互不相干，各自看都正确。
+    ///
+    /// @intent 维护约定：**这份清单必须与 `routes::create_app` 中注册的公开路由一致**。
+    ///         新增或删除公开路由时，同时改此列表与 `deploy/Caddyfile`；
+    ///         模板改了必须重新编译（模板经 `include_str!` 内嵌）。
+    #[test]
+    fn reverse_proxy_template_covers_every_public_prefix() {
+        for prefix in ["/mcp", "/api/v1", "/admin", "/health"] {
+            assert!(
+                CADDYFILE.contains(&format!("handle {prefix}")),
+                "反代模板缺少对 {prefix} 的代理规则——公网部署下该前缀会返回 404：\n{CADDYFILE}"
+            );
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 use crate::admin;
 use crate::auth::{admin_auth, bearer_auth};
+use crate::console;
 use crate::mcp;
 use crate::meta;
 use crate::reply::internal_error;
@@ -34,21 +35,45 @@ async fn list_projects(meta: DatabaseConnection) -> Response {
 
 /// 装配路由：
 /// - `/health` 公开；
-/// - `/mcp` 为 MCP Streamable HTTP 端点，需 Bearer（按 token 隔离到项目）；
-/// - `/api/v1` 需 ADMIN_TOKEN：项目列表 / 创建 / 注销 / 统计。
+/// - `/admin` 公开：网页控制台页面本体，不含任何数据，登录由页面自行发起；
+/// - `/mcp` 为 MCP Streamable HTTP 端点，需 **Bearer 项目 token**；
+/// - `/api/v1/session` 登录 / 登出 / 自检（登录必须公开，故单独成群、不挂鉴权中间件）；
+/// - `/api/v1` 其余端点需管理凭据：`ADMIN_TOKEN` Bearer，或控制台会话 Cookie。
+///
+/// ⚠ 新增**公开前缀**时必须同步 `deploy/Caddyfile`（公网部署的反代白名单），
+///   否则会出现「直连 localhost 正常、经 Caddy 反代 404」——两边各自看都没错。
+///   这条约束由 `daemon::tests::reverse_proxy_template_covers_every_public_prefix` 守着。
 ///
 /// 鉴权中间件通过 `from_fn_with_state` 直接持有 `AppState`，使整棵路由树状态一致（Router<()>），
 /// 避免 Axum 对各子路由 `State<S>` 的推断冲突。MCP 服务作为嵌套服务挂载，
 /// 中间件先于它执行并把 `ProjectRepos` 写入请求扩展，rmcp 再把该扩展透传给工具。
 /// 管理面 handler 以 `State<AppState>` 取依赖（先 `route_layer` 挂鉴权，再 `with_state`
 /// 落到 `Router<()>`），与 MCP 侧 `Router<()>` 的形态保持一致。
+///
+/// @intent 两套凭据的边界刻意划在路由分组上，而不是在 handler 里判断：
+///         `/mcp` 只挂 `bearer_auth`（项目 token），`/api/v1` 只挂 `admin_auth`
+///         （管理凭据）。会话 Cookie **不参与** `/mcp` 鉴权，项目 token 也**不是**
+///         管理凭据——这条边界有专门的用例守着，防止将来「顺手复用中间件」把它抹掉。
+///
+/// @intent `/api/v1/session` 必须与其余管理端点分开注册：登录接口本身不可能先鉴权，
+///         否则永远无法登录。若把它并进同一个 `route_layer`，`POST /session` 会
+///         在进入 handler 前就被 401 拒掉——这是一个只在「第一次用浏览器」时才暴露的
+///         装配错误，故有对应用例钉住。
 pub fn create_app(state: AppState) -> Router {
     // MCP 端点：Bearer 鉴权 → 注入 ProjectRepos → 交给 rmcp 协议层
     let mcp_routes = Router::new()
         .nest_service("/mcp", mcp::build_service(&state.config))
         .route_layer(middleware::from_fn_with_state(state.clone(), bearer_auth));
 
-    // 管理路由：ADMIN_TOKEN 鉴权；项目列表的 db 连接经闭包注入，避免与路由状态耦合
+    // 会话端点：登录必须公开；登出与自检的判定在 handler 内部完成（见 console 模块）
+    let session_routes = Router::new()
+        .route(
+            "/session",
+            get(console::status).post(console::login).delete(console::logout),
+        )
+        .with_state(state.clone());
+
+    // 管理路由：ADMIN_TOKEN 或控制台会话；项目列表的 db 连接经闭包注入，避免与路由状态耦合
     let meta_conn = state.meta.clone();
     let api_routes = Router::new()
         .route(
@@ -61,14 +86,16 @@ pub fn create_app(state: AppState) -> Router {
         )
         .route("/projects/{id}", delete(admin::delete_project))
         .route("/projects/{id}/stats", get(admin::project_stats))
+        .route("/projects/{id}/graph", get(admin::project_graph))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_auth))
         .with_state(state.clone());
 
-    // 健康检查（公开）
+    // 公开端点：健康检查与控制台页面
     Router::new()
         .route("/health", get(health))
+        .route("/admin", get(console::page))
         .merge(mcp_routes)
-        .nest("/api/v1", api_routes)
+        .nest("/api/v1", session_routes.merge(api_routes))
 }
 
 #[cfg(test)]
@@ -83,10 +110,24 @@ mod tests {
     use sea_orm::Database;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
     use tower::ServiceExt;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// 测试用控制台用户名。
+    const CONSOLE_USER: &str = "console-admin";
+    /// 测试用控制台口令（明文只出现在测试里；生产路径下它从不落盘）。
+    const CONSOLE_PASSWORD: &str = "test-console-password";
+
+    /// 控制台口令的哈希。
+    ///
+    /// @intent 只算一次并缓存：argon2 默认参数单次约数十毫秒，若每个用例现算会把
+    ///         整套测试拖慢到难以接受。哈希本身与用例无关，缓存它不损失任何覆盖。
+    fn console_password_hash() -> String {
+        static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        HASH.get_or_init(|| crate::password::hash_password(CONSOLE_PASSWORD).unwrap())
+            .clone()
+    }
 
     /// 隔离的临时数据目录。
     fn temp_data_dir() -> PathBuf {
@@ -100,6 +141,15 @@ mod tests {
     ///
     /// 返回 (路由, 数据目录)，数据目录供测试直接落数据以验证隔离。
     async fn setup() -> (Router, PathBuf) {
+        setup_with_console(false).await
+    }
+
+    /// 同上，但可开启网页控制台登录（配置 `admin_user` / `admin_password_hash`）。
+    ///
+    /// @intent 控制台相关用例需要一份真实的口令哈希，而 argon2 的默认参数单次约需
+    ///         数十毫秒——若每个用例都现算，整套测试会被拖慢到难以接受。故此处算一次、
+    ///         在所有控制台用例间共享（`console_app` 的 OnceLock）。
+    async fn setup_with_console(with_console: bool) -> (Router, PathBuf) {
         let data_dir = temp_data_dir();
         let meta_path = data_dir.join("_meta.db");
         let url = format!("sqlite://{}?mode=rwc", meta_path.display());
@@ -124,12 +174,16 @@ mod tests {
             .unwrap();
         }
 
-        let config = Config::for_test(0, &data_dir.to_string_lossy(), "admin", "sqlite_file");
-        let state = AppState {
-            meta: db,
-            storage: Arc::new(StorageRegistry::from_config(&config).unwrap()),
-            config,
-        };
+        let mut config = Config::for_test(0, &data_dir.to_string_lossy(), "admin", "sqlite_file");
+        // 注册表只依赖 `data_dir` 与默认后端，故趁控制台字段尚未改动时先由它构造，
+        // 免得多造一份配置（两份配置容易在后续改动中悄悄分叉）。
+        let storage = StorageRegistry::from_config(&config).unwrap();
+        if with_console {
+            config.admin_user = CONSOLE_USER.to_string();
+            config.admin_password_hash = console_password_hash();
+        }
+
+        let state = AppState::new(db, config, storage);
         (create_app(state), data_dir)
     }
 
@@ -497,6 +551,86 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "响应体：{body}");
         assert_eq!(body["error"]["code"], -32602, "响应体：{body}");
         assert_eq!(body["id"], 1);
+    }
+
+    /// B：字段名写错必须在**调用当时**被拒并点名出错字段（模型据此可自我修正）。
+    ///
+    /// @intent 实测形状值得写下来：参数**反序列化**失败由 rmcp 报成 `result.isError = true`
+    ///         + 文本消息，**不是** JSON-RPC `error` 对象；而工具语义层错误（如实体不存在）
+    ///         返回的是 `error.code = -32602`。两者形状不同、都会让调用方看到原因，
+    ///         但断言必须按各自的实际形状写——把两者混为一谈，钉住的就是一个不存在的契约。
+    #[tokio::test]
+    async fn mcp_rejects_unknown_arguments_instead_of_dropping_them() {
+        let (app, _dir) = setup().await;
+        let (status, body) = rpc(
+            app,
+            Some("secret"),
+            tool_call(
+                1,
+                "create_entities",
+                serde_json::json!({
+                    "entities": [{ "name": "alpha", "observation": ["字段名写成了单数"] }]
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "响应体：{body}");
+        assert_eq!(
+            body["result"]["isError"], true,
+            "反序列化失败必须被报成工具错误，实际：{body}"
+        );
+        let text = body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("unknown field"),
+            "错误应点明是「未知字段」，实际：{text}"
+        );
+        assert!(
+            text.contains("observation"),
+            "错误应点名出错字段，便于调用方自我修正，实际：{text}"
+        );
+    }
+
+    /// A：协议层走一遍「一次调用建实体并附观测」，并**回读**确认真的落库。
+    #[tokio::test]
+    async fn mcp_create_entities_persists_the_observations_it_carries() {
+        let (app, _dir) = setup().await;
+        let (status, body) = rpc(
+            app.clone(),
+            Some("secret"),
+            tool_call(
+                1,
+                "create_entities",
+                serde_json::json!({
+                    "entities": [{
+                        "name": "alpha",
+                        "entityType": "person",
+                        "observations": ["事实一", "事实二"]
+                    }]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{body}");
+        assert_eq!(
+            structured(&body)["entities"][0]["observations"][0]["content"],
+            "事实一",
+            "响应体：{body}"
+        );
+
+        let (_, graph) = rpc(
+            app,
+            Some("secret"),
+            tool_call(2, "read_graph", serde_json::json!({})),
+        )
+        .await;
+        let obs = structured(&graph)["entities"][0]["observations"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(obs.len(), 2, "回读应看到 2 条观测，实际：{graph}");
     }
 
     /// 注入链路端到端：绕过 HTTP 直写项目库的数据，能被 MCP 工具读到。
@@ -968,5 +1102,460 @@ mod tests {
         // 确认没有误删：unauthorized 请求不得产生副作用
         let (status, _) = get_with_token(app, "/api/v1/projects/demo/stats", Some("admin")).await;
         assert_eq!(status, StatusCode::OK, "被拒的请求不得影响既有项目");
+    }
+
+    // ------------------------------------------------------ 网页控制台（P4.4）
+
+    /// 带 Cookie 发起一次请求。
+    ///
+    /// @intent 默认补上 `Host: localhost`：`oneshot` 不经过 hyper，不会自动合成 `Host`，
+    ///         而跨站判据需要它。若不补，所有请求都会落进「有 Origin 无 Host」的分支，
+    ///         同源用例会因**失败关闭**而被误判为跨站——这正是实测中暴露出来的形态。
+    ///         显式给出 `Host` 也更贴近真实流量。
+    async fn send_with_cookie(
+        app: Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        origin: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value, axum::http::HeaderMap) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        if let Some(origin) = origin {
+            builder = builder.header(header::ORIGIN, origin);
+        }
+        let payload = body.map(|v| v.to_string()).unwrap_or_default();
+        let resp = app
+            .oneshot(builder.body(Body::from(payload)).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        (status, body_json(resp).await, headers)
+    }
+
+    /// 从 `Set-Cookie` 响应头里取出 `name=value` 形式的 Cookie 对。
+    fn session_cookie_pair(headers: &axum::http::HeaderMap) -> Option<String> {
+        let raw = headers.get(header::SET_COOKIE)?.to_str().ok()?;
+        let pair = raw.split(';').next()?.trim().to_string();
+        if pair.starts_with("memora_session=") {
+            Some(pair)
+        } else {
+            None
+        }
+    }
+
+    /// 登录并返回后续请求可直接使用的 Cookie 对。
+    async fn login(app: Router) -> String {
+        let (status, _body, headers) = send_with_cookie(
+            app,
+            "POST",
+            "/api/v1/session",
+            None,
+            None,
+            Some(serde_json::json!({
+                "username": CONSOLE_USER,
+                "password": CONSOLE_PASSWORD,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "登录应当成功");
+        session_cookie_pair(&headers).expect("登录响应必须带会话 Cookie")
+    }
+
+    /// `/admin` 必须公开可访问：它只是一张登录表单，登录前就要能看到。
+    #[tokio::test]
+    async fn console_page_is_public_html() {
+        let (app, _dir) = setup_with_console(true).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert!(
+            resp.headers().contains_key("content-security-policy"),
+            "页面必须带 CSP"
+        );
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Memora"), "应返回控制台页面");
+    }
+
+    /// 未配置口令时，自检接口必须如实报告，且登录被拒。
+    ///
+    /// @intent 这是「功能不可用」与「口令错」的分野：前者页面会给修复指引，
+    ///         后者只是提示重试。若两者都返回裸 401，用户只能看到一个无法登录、
+    ///         且不说明原因的界面。
+    #[tokio::test]
+    async fn session_status_reports_missing_console_password() {
+        let (app, _dir) = setup_with_console(false).await;
+
+        let (status, body, _) = send_with_cookie(app.clone(), "GET", "/api/v1/session", None, None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["console_login_enabled"], false);
+        assert_eq!(body["authenticated"], false);
+
+        let (status, body, _) = send_with_cookie(
+            app,
+            "POST",
+            "/api/v1/session",
+            None,
+            None,
+            Some(serde_json::json!({ "username": "admin", "password": "whatever" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not configured"),
+            "应明确告知是「未配置口令」而非「口令错误」：{body}"
+        );
+    }
+
+    /// 登录成功必须签发 Cookie，且该 Cookie 能通过管理面鉴权。
+    ///
+    /// @intent 同时钉住「登录接口本身不能挂鉴权中间件」——若把它误并进受保护的分组，
+    ///         `POST /session` 会在进入 handler 前就 401，本用例即刻失败。
+    #[tokio::test]
+    async fn login_issues_a_cookie_that_authenticates_the_admin_api() {
+        let (app, _dir) = setup_with_console(true).await;
+        let cookie = login(app.clone()).await;
+
+        let (status, body, _) = send_with_cookie(
+            app,
+            "GET",
+            "/api/v1/projects",
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "会话 Cookie 应能通过管理面鉴权：{body}");
+        assert!(body.as_array().unwrap().len() >= 3);
+    }
+
+    /// 错误口令与错误用户名都必须 401，且响应体不得指出是哪一个错了。
+    #[tokio::test]
+    async fn login_rejects_bad_credentials_without_enumeration() {
+        let (app, _dir) = setup_with_console(true).await;
+
+        for (user, password) in [
+            (CONSOLE_USER, "wrong-password"),
+            ("someone-else", CONSOLE_PASSWORD),
+            ("", ""),
+        ] {
+            let (status, body, headers) = send_with_cookie(
+                app.clone(),
+                "POST",
+                "/api/v1/session",
+                None,
+                None,
+                Some(serde_json::json!({ "username": user, "password": password })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{user:?} 应被拒绝");
+            assert!(
+                session_cookie_pair(&headers).is_none(),
+                "失败的登录绝不能签发 Cookie"
+            );
+            assert_eq!(
+                body["detail"], "invalid username or password",
+                "不得区分用户名与口令哪个错：{body}"
+            );
+        }
+    }
+
+    /// 登出后原 Cookie 必须立即失效，且响应要清掉浏览器里的 Cookie。
+    #[tokio::test]
+    async fn logout_invalidates_the_session_and_clears_the_cookie() {
+        let (app, _dir) = setup_with_console(true).await;
+        let cookie = login(app.clone()).await;
+
+        let (status, _, headers) =
+            send_with_cookie(app.clone(), "DELETE", "/api/v1/session", Some(&cookie), None, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let cleared = headers
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(cleared.contains("Max-Age=0"), "必须让浏览器立即丢弃：{cleared}");
+
+        let (status, _, _) =
+            send_with_cookie(app, "GET", "/api/v1/projects", Some(&cookie), None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "登出后会话必须不可用");
+    }
+
+    /// 伪造的会话 id 不得通过鉴权。
+    #[tokio::test]
+    async fn forged_session_cookie_is_rejected() {
+        let (app, _dir) = setup_with_console(true).await;
+        for forged in [
+            "memora_session=deadbeef",
+            "memora_session=",
+            "memora_session=0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            let (status, _, _) =
+                send_with_cookie(app.clone(), "GET", "/api/v1/projects", Some(forged), None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{forged} 不得通过");
+        }
+    }
+
+    /// 会话 Cookie **不得**用于 `/mcp`：两套凭据必须隔离。
+    ///
+    /// @intent 这条边界一旦模糊，浏览器里的一次登录就等于对所有项目 token 的访问权，
+    ///         而项目硬隔离是本服务的核心承诺。故单独用一条用例钉住。
+    #[tokio::test]
+    async fn session_cookie_does_not_authenticate_mcp() {
+        let (app, _dir) = setup_with_console(true).await;
+        let cookie = login(app.clone()).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::COOKIE, cookie)
+            .body(Body::from(
+                request(1, "tools/list", serde_json::json!({})).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "会话 Cookie 不是项目凭据，/mcp 必须拒绝"
+        );
+    }
+
+    /// 项目 token 也不得用于管理面（反向隔离）。
+    #[tokio::test]
+    async fn project_token_is_not_an_admin_credential() {
+        let (app, _dir) = setup_with_console(true).await;
+        let (status, _, _) = send_with_cookie(
+            app,
+            "GET",
+            "/api/v1/projects",
+            Some("memora_session=secret"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, StatusCode::UNAUTHORIZED,
+            "把项目 token 当会话 id 用必须被拒"
+        );
+    }
+
+    /// CSRF：用会话 Cookie 发起的跨站写请求必须被拒，同源写请求必须放行。
+    ///
+    /// @intent 判据是「Origin 的 host 与 Host 是否一致」，故这里同时覆盖同源、异源
+    ///         两种形态；缺 Origin 的形态见下一条用例。
+    #[tokio::test]
+    async fn cross_origin_writes_are_rejected_but_same_origin_is_allowed() {
+        let (app, _dir) = setup_with_console(true).await;
+        let cookie = login(app.clone()).await;
+
+        // 异源 DELETE 必须被拒，且不得产生副作用
+        let (status, body, _) = send_with_cookie(
+            app.clone(),
+            "DELETE",
+            "/api/v1/projects/demo",
+            Some(&cookie),
+            Some("https://evil.example.com"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "跨站写请求必须被拒：{body}");
+        assert_eq!(body["error"], "cross_origin_rejected");
+
+        let (status, _) = get_with_token(app.clone(), "/api/v1/projects/demo/stats", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK, "被拒的跨站请求不得删掉项目");
+
+        // 同源写请求放行
+        let (status, body, _) = send_with_cookie(
+            app.clone(),
+            "POST",
+            "/api/v1/projects",
+            Some(&cookie),
+            Some("http://localhost"),
+            Some(serde_json::json!({ "project_id": "same-origin-ok" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "同源写请求应放行：{body}");
+    }
+
+    /// 缺少 `Origin` 的写请求放行：真正的跨站表单提交在现代浏览器上必带 Origin，
+    /// 而 `curl` 带 Cookie 手工调试不该被误伤。
+    #[tokio::test]
+    async fn cookie_write_without_origin_is_allowed() {
+        let (app, _dir) = setup_with_console(true).await;
+        let cookie = login(app.clone()).await;
+
+        let (status, body, _) = send_with_cookie(
+            app,
+            "POST",
+            "/api/v1/projects",
+            Some(&cookie),
+            None,
+            Some(serde_json::json!({ "project_id": "no-origin" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    /// 跨站检查只约束**会话**通路：Bearer 面向脚本，脚本没有 Origin，
+    /// 也不存在「浏览器自动附带凭据」的问题，故不受限。
+    #[tokio::test]
+    async fn cross_origin_check_does_not_apply_to_bearer() {
+        let (app, _dir) = setup_with_console(true).await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/projects")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer admin")
+            .header(header::ORIGIN, "https://evil.example.com")
+            .body(Body::from(
+                serde_json::json!({ "project_id": "bearer-with-origin" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "Bearer 通路不应受跨站检查约束"
+        );
+    }
+
+    /// 安全方法（GET）即使异源也放行：它不改状态，且浏览器不会为一次读操作
+    /// 提供任何额外权限。
+    #[tokio::test]
+    async fn cross_origin_reads_with_cookie_are_allowed() {
+        let (app, _dir) = setup_with_console(true).await;
+        let cookie = login(app.clone()).await;
+
+        let (status, _, _) = send_with_cookie(
+            app,
+            "GET",
+            "/api/v1/projects",
+            Some(&cookie),
+            Some("https://evil.example.com"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// 记忆浏览接口：返回实体（含观测）与关系，且项目不存在时报 404。
+    #[tokio::test]
+    async fn project_graph_exposes_entities_observations_and_relations() {
+        let (app, dir) = setup_with_console(true).await;
+
+        let repos = SqliteFileBackend::new(dir)
+            .repositories_for("demo")
+            .await
+            .unwrap();
+        repos
+            .memory
+            .create_entities(vec![
+                EntityInput::new("alpha", "person"),
+                EntityInput::new("beta", "person"),
+            ])
+            .await
+            .unwrap();
+        repos
+            .memory
+            .create_relations(vec![crate::domain::RelationInput::new("alpha", "beta", "knows")])
+            .await
+            .unwrap();
+        repos
+            .memory
+            .add_observations(vec![crate::domain::ObservationInput::single(
+                "alpha",
+                "偏好深色主题",
+            )])
+            .await
+            .unwrap();
+        drop(repos);
+
+        // 伪造的会话 id 不得通过鉴权
+        let (status, _, _) = send_with_cookie(
+            app.clone(),
+            "GET",
+            "/api/v1/projects/demo/graph",
+            Some("memora_session=x"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, body) = get_with_token(app.clone(), "/api/v1/projects/demo/graph", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["project_id"], "demo");
+        assert_eq!(body["entities"].as_array().unwrap().len(), 2);
+        assert_eq!(body["relations"].as_array().unwrap().len(), 1);
+
+        let alpha = body["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "alpha")
+            .unwrap();
+        assert_eq!(alpha["entity_type"], "person");
+        let observations = alpha["observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["content"], "偏好深色主题");
+        assert_eq!(observations[0]["entity_name"], "alpha");
+        assert!(
+            observations[0]["id"].as_i64().unwrap() > 0,
+            "必须回传观测 id，否则控制台无法展示可定位的条目"
+        );
+
+        assert_eq!(body["relations"][0]["from_name"], "alpha");
+        assert_eq!(body["relations"][0]["to_name"], "beta");
+        assert_eq!(body["relations"][0]["relation_type"], "knows");
+
+        // 与统计口径一致：控制台看到的实体数应等于 stats 报出的实体数
+        let (_, stats) = get_with_token(app.clone(), "/api/v1/projects/demo/stats", Some("admin")).await;
+        assert_eq!(stats["entities"], body["entities"].as_array().unwrap().len());
+
+        let (status, _) = get_with_token(app, "/api/v1/projects/ghost/graph", Some("admin")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "不存在的项目应报 404");
+    }
+
+    /// 记忆浏览接口的鉴权：无凭据一律 401。
+    #[tokio::test]
+    async fn project_graph_requires_admin_credentials() {
+        let (app, _dir) = setup().await;
+        let (status, _) = get_with_token(app.clone(), "/api/v1/projects/demo/graph", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = get_with_token(app, "/api/v1/projects/demo/graph", Some("secret")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "项目 token 不是管理凭据");
     }
 }

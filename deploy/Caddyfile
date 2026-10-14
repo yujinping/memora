@@ -9,7 +9,7 @@
 #   rmcp 的 Streamable HTTP 传输默认只信回环 Host（防 DNS 重绑定），而反代会透传
 #   真实域名；白名单未命中时 MCP 请求会被协议层以 403 拒绝，且错误信息并不指向配置项。
 #
-# 只暴露三个前缀，其余一律 404：记忆库里是私有内容，不应存在未预期的暴露面。
+# 只暴露四个前缀，其余一律 404：记忆库里是私有内容，不应存在未预期的暴露面。
 mem.example.com {
 	handle /mcp* {
 		reverse_proxy 127.0.0.1:__PORT__
@@ -19,13 +19,21 @@ mem.example.com {
 		reverse_proxy 127.0.0.1:__PORT__
 	}
 
+	# 网页控制台。页面本身不含任何数据（只是一张登录表单），
+	# 但**必须**在反代里放行，否则公网部署下浏览器打开 /admin 会拿到 404。
+	# 这条是实测发现的：原先只代理 mcp / api / health 三个前缀，
+	# 控制台在 localhost 直连时正常，一上 Caddy 就消失。
+	handle /admin {
+		reverse_proxy 127.0.0.1:__PORT__
+	}
+
 	handle /health {
 		reverse_proxy 127.0.0.1:__PORT__
 	}
 
 	# 兜底：必须放在 handle 块里。
 	# 不能写成顶层的裸 `respond 404`——Caddy 的 directive 排序会把 respond 提到
-	# reverse_proxy 之前执行，从而拦掉上面三条代理规则。
+	# reverse_proxy 之前执行，从而拦掉上面几条代理规则。
 	handle {
 		respond 404
 	}

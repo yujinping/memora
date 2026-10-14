@@ -47,6 +47,32 @@ pub fn conflict(error: &str, detail: &str) -> Response {
         .into_response()
 }
 
+/// 403：凭据有效，但这次请求的来源不被接受（跨站写请求 / 非白名单 Host）。
+///
+/// @intent 与 401 的分野是刻意的：401 表示「换个凭据再来」，403 表示「换凭据也没用」。
+///         把它们混为一谈会让调用方在错误的方向上反复重试。
+pub fn forbidden(error: &str, detail: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": error, "detail": detail })),
+    )
+        .into_response()
+}
+
+/// 401 的可选带原因版本。
+///
+/// @intent 仅用于**登录接口**：那里缺凭据本身就是「用户名或口令不对」，
+///         不存在 `unauthorized()` 所防范的「token 探测」问题（用户名不是秘密，
+///         口令是否正确才是）。其余鉴权路径一律继续用无原因的 [`unauthorized`]，
+///         避免把「凭据是否存在」透给攻击者。
+pub fn unauthorized_with(detail: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "unauthorized", "detail": detail })),
+    )
+        .into_response()
+}
+
 /// 500：内部错误。详情仅记入日志，响应体保持通用，避免泄漏存储细节。
 pub fn internal_error(detail: &dyn std::fmt::Display) -> Response {
     tracing::error!(error = %detail, "internal error");

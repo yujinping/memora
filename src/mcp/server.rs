@@ -74,9 +74,10 @@ fn repos_from(ctx: &RequestContext<RoleServer>) -> Result<ProjectRepos, ErrorDat
 
 #[tool_router]
 impl MemoraServer {
-    /// 批量创建实体。同名实体已存在时忽略（不覆盖其类型），整体幂等。
+    /// 批量创建实体（每个实体可一并携带观测）。同名实体已存在时忽略（不覆盖其类型），整体幂等。
     #[tool(
         description = "Create entities in this project's memory graph. \
+                       Each entity may carry observations, which are persisted together with it. \
                        Re-creating an existing name is ignored (its type is preserved). \
                        Returns the persisted state of the requested names."
     )]

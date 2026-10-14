@@ -31,6 +31,7 @@ anyhow = "1"
 rmcp = { version = "3.3.0", features = ["transport-streamable-http-server"] }
 # 与 rmcp 的 schemars 依赖同源（1.x），用于工具入参 / 出参的 JSON Schema 推导
 schemars = "1.2.2"
+argon2 = "0.6.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

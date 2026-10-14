@@ -6,6 +6,11 @@
 //!         字段统一用 snake_case 与领域模型一致；同时为官方 schema 的 camelCase 写法
 //!         （`entityType` / `relationType` / `entityName` / `from` / `to`）保留 serde 别名，
 //!         容忍模型照抄旧 schema。别名不进入 JSON Schema——对外只宣传规范字段名。
+//!
+//! @intent 全部入参结构体启用 `deny_unknown_fields`：字段名写错、或把两个工具的入参混在
+//!         一层（如顶层同时给 `entities` 与 `observations`）时**必须报错**。默认的「忽略
+//!         未知字段」会让服务端返回 200 而数据静默消失，调用方拿不到任何线索——这是最坏
+//!         的失败形态。同时它对模型是**可自我修正**的：错误信息会点名出错字段。
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -15,13 +20,21 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// `create_entities` 的元素。
+///
+/// @intent 带 `observations`，对齐官方 schema 的「一次调用建实体并附带事实」形态：
+///         不接这个字段时，官方习惯的调用会**静默丢观测**（服务端返回 200，数据为空）。
+///         观测的来源继承实体的 `source`——同一次调用视为同一来源。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EntityParam {
     /// 实体名（项目内唯一，作为主键；重复创建同名实体不会覆盖其类型）
     pub name: String,
     /// 实体类型，如 person / project / concept；省略或留空时落为 `unknown`
     #[serde(default, alias = "entityType")]
     pub entity_type: String,
+    /// 建实体时一并写入的观测（按给定顺序落库）；省略或空数组表示不带观测
+    #[serde(default)]
+    pub observations: Vec<String>,
     /// 写入来源标识（哪个客户端 / 助手），省略或留空落为空串；仅首次登记生效
     #[serde(default)]
     pub source: String,
@@ -29,6 +42,7 @@ pub struct EntityParam {
 
 /// `create_relations` 的元素。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RelationParam {
     /// 起点实体名
     #[serde(alias = "from")]
@@ -46,6 +60,7 @@ pub struct RelationParam {
 
 /// `add_observations` 的元素：一次调用为同一实体追加多条事实。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationParam {
     /// 目标实体名；实体必须已存在，否则返回 `-32602`
     #[serde(alias = "entityName")]
@@ -59,6 +74,7 @@ pub struct ObservationParam {
 
 /// `create_entities` 入参。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateEntitiesRequest {
     /// 待创建的实体列表
     pub entities: Vec<EntityParam>,
@@ -66,6 +82,7 @@ pub struct CreateEntitiesRequest {
 
 /// `create_relations` 入参。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRelationsRequest {
     /// 待创建的关系列表；三元组重复时跳过
     pub relations: Vec<RelationParam>,
@@ -73,6 +90,7 @@ pub struct CreateRelationsRequest {
 
 /// `add_observations` 入参。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AddObservationsRequest {
     /// 待追加的观测列表
     pub observations: Vec<ObservationParam>,
@@ -80,6 +98,7 @@ pub struct AddObservationsRequest {
 
 /// `delete_entities` 入参。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteEntitiesRequest {
     /// 待删除的实体名；连同其观测、关联关系与检索索引一并级联删除
     pub names: Vec<String>,
@@ -87,6 +106,7 @@ pub struct DeleteEntitiesRequest {
 
 /// `delete_observations` 入参。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteObservationsRequest {
     /// 待删除的观测 id（由 `read_graph` / `search_nodes` / `open_nodes` 获得）
     pub ids: Vec<i64>,
@@ -94,6 +114,7 @@ pub struct DeleteObservationsRequest {
 
 /// `delete_relations` 入参。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteRelationsRequest {
     /// 待删除的关系 id（由 `read_graph` 获得）
     pub ids: Vec<i64>,
@@ -101,6 +122,7 @@ pub struct DeleteRelationsRequest {
 
 /// `search_nodes` 入参。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchNodesRequest {
     /// 关键词；命中实体名、实体类型或观测内容，结果按相关度（bm25）排序
     pub query: String,
@@ -108,6 +130,7 @@ pub struct SearchNodesRequest {
 
 /// `open_nodes` 入参。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OpenNodesRequest {
     /// 待展开的实体名；未命中的名字被跳过
     pub names: Vec<String>,
@@ -209,4 +232,110 @@ pub struct DeleteObservationsResponse {
 pub struct DeleteRelationsResponse {
     /// 本次请求的关系 id（去重后按原序回显）
     pub ids: Vec<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 未知字段必须**硬失败**，而不是被 serde 静默忽略。
+    ///
+    /// @intent 原先全仓库没有 `deny_unknown_fields`：字段名拼错、或按别家 schema 习惯
+    ///         传参时，服务端一律返回 `200` 而数据静默消失（实测 `create_entities` 带
+    ///         `observations` 时返回体里是 `"observations": []`）。「成功但无数据」是最坏的
+    ///         失败形态——调用方拿不到任何线索，只会在很久以后发现记忆是空的。
+    ///         故此处宁可报错也不静默：字段名写错必须在**调用当时**暴露。
+    #[test]
+    fn unknown_fields_are_rejected_instead_of_silently_ignored() {
+        let err = serde_json::from_value::<EntityParam>(json!({
+            "name": "alpha",
+            "observation": ["字段名写成了单数"]
+        }))
+        .expect_err("未知字段必须报错");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "错误信息应点明是「未知字段」，实际：{msg}"
+        );
+        assert!(
+            msg.contains("observation"),
+            "错误信息应点名出错字段，便于调用方自我修正，实际：{msg}"
+        );
+    }
+
+    /// 最现实的误用：把 `create_entities` 与 `add_observations` 混在同一层，
+    /// 顶层同时给 `entities` 和 `observations`。若放行，后者会整批静默消失。
+    #[test]
+    fn extra_field_beside_a_valid_one_is_rejected_not_dropped() {
+        let err = serde_json::from_value::<CreateEntitiesRequest>(json!({
+            "entities": [{"name": "alpha"}],
+            "observations": [{"entity_name": "alpha", "contents": ["fact"]}]
+        }))
+        .expect_err("顶层多余字段必须报错，否则 observations 会被静默丢弃");
+
+        assert!(
+            err.to_string().contains("unknown field"),
+            "实际：{err}"
+        );
+    }
+
+    /// 加了 `deny_unknown_fields` 后，规范 snake_case 与官方 camelCase 别名必须都仍可用。
+    #[test]
+    fn deny_unknown_fields_coexists_with_the_official_aliases() {
+        let canonical: EntityParam =
+            serde_json::from_value(json!({"name": "a", "entity_type": "person", "source": "wb"}))
+                .expect("规范字段名必须可用");
+        assert_eq!(canonical.entity_type, "person");
+
+        let alias: EntityParam =
+            serde_json::from_value(json!({"name": "a", "entityType": "person"}))
+                .expect("官方 camelCase 别名必须仍可用");
+        assert_eq!(alias.entity_type, "person");
+
+        let rel: RelationParam =
+            serde_json::from_value(json!({"from": "a", "to": "b", "relationType": "knows"}))
+                .expect("关系的官方别名必须仍可用");
+        assert_eq!(
+            (
+                rel.from_name.as_str(),
+                rel.to_name.as_str(),
+                rel.relation_type.as_str()
+            ),
+            ("a", "b", "knows")
+        );
+    }
+
+    /// 对外 schema 必须声明 `additionalProperties: false`，让调用的模型在**生成参数时**
+    /// 就知道不许加额外字段，而不是等打到服务端才被拒。
+    #[test]
+    fn generated_schemas_forbid_additional_properties() {
+        let schemas: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "EntityParam",
+                serde_json::to_value(schemars::schema_for!(EntityParam)).unwrap(),
+            ),
+            (
+                "RelationParam",
+                serde_json::to_value(schemars::schema_for!(RelationParam)).unwrap(),
+            ),
+            (
+                "ObservationParam",
+                serde_json::to_value(schemars::schema_for!(ObservationParam)).unwrap(),
+            ),
+            (
+                "CreateEntitiesRequest",
+                serde_json::to_value(schemars::schema_for!(CreateEntitiesRequest)).unwrap(),
+            ),
+        ];
+
+        for (label, schema) in schemas {
+            assert_eq!(
+                schema["additionalProperties"],
+                json!(false),
+                "{label} 的 JSON Schema 应声明 additionalProperties: false"
+            );
+        }
+    }
 }

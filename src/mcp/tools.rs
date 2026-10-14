@@ -98,6 +98,11 @@ fn sorted_entities(mut entities: Vec<crate::domain::Entity>) -> Vec<EntityView> 
 }
 
 /// `create_entities`：批量建实体（同名忽略），返回请求名在调用后的状态。
+///
+/// @intent 入参可携带 `observations`（对齐官方 schema 的「一次调用建实体并附观测」）：
+///         建完实体后紧跟一次 `add_observations`，来源沿用实体的 `source`。
+///         两个批次的校验都在**任何写入之前**完成——否则非法观测会留下
+///         「实体已建、观测没写」的半成品，而调用方只看到一次报错。
 pub async fn create_entities(
     repo: &dyn MemoryRepository,
     req: CreateEntitiesRequest,
@@ -110,6 +115,17 @@ pub async fn create_entities(
         })
         .collect();
 
+    // 随实体一起给出的观测：同一次调用视为同一来源，故沿用该实体的 `source`。
+    let carried: Vec<ObservationInput> = req
+        .entities
+        .iter()
+        .filter(|e| !e.observations.is_empty())
+        .map(|e| {
+            ObservationInput::new(e.name.clone(), e.observations.clone())
+                .with_source(e.source.clone())
+        })
+        .collect();
+
     // 先用共享规范化器取「规范名」，再据此回读：写路径与读路径必须用同一套去空白规则，
     // 否则「写入带空白名字 → 按原样回读」会漏命中。
     let names: Vec<String> = normalize::entities(&inputs)
@@ -118,7 +134,15 @@ pub async fn create_entities(
         .map(|(name, _, _)| name)
         .collect();
 
+    if !carried.is_empty() {
+        normalize::observations(&carried).map_err(tool_error)?;
+    }
+
     repo.create_entities(inputs).await.map_err(tool_error)?;
+    if !carried.is_empty() {
+        repo.add_observations(carried).await.map_err(tool_error)?;
+    }
+
     let entities = repo
         .open_nodes(&normalize::name_list(&names))
         .await
@@ -320,7 +344,16 @@ mod tests {
         EntityParam {
             name: name.to_string(),
             entity_type: ty.to_string(),
+            observations: Vec::new(),
             source: String::new(),
+        }
+    }
+
+    /// 带观测的实体入参（校验 `create_entities` 的「一次建实体并附观测」路径）。
+    fn entity_with_observations(name: &str, ty: &str, contents: &[&str]) -> EntityParam {
+        EntityParam {
+            observations: contents.iter().map(|c| c.to_string()).collect(),
+            ..entity(name, ty)
         }
     }
 
@@ -392,6 +425,98 @@ mod tests {
 
         assert_eq!(again.entities.len(), 1);
         assert_eq!(again.entities[0].entity_type, "person");
+    }
+
+    /// A：官方 schema 允许「一次调用建实体并附带观测」。
+    ///
+    /// @intent 原先 `EntityParam` 没有 `observations` 字段，而 serde 又默认忽略未知字段，
+    ///         于是官方习惯的调用会返回 200 且观测**一条都不落库**，调用方毫无察觉。
+    ///         本用例钉住「请求里带的观测必须真的写进去」，并回读复核而不只看响应。
+    #[tokio::test]
+    async fn create_entities_persists_the_observations_carried_in_the_request() {
+        let repo = repo().await;
+        let resp = create_entities(
+            &*repo,
+            CreateEntitiesRequest {
+                entities: vec![
+                    entity_with_observations("alpha", "person", &["第一条事实", "第二条事实"]),
+                    entity("beta", ""),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        let contents: Vec<&str> = resp.entities[0]
+            .observations
+            .iter()
+            .map(|o| o.content.as_str())
+            .collect();
+        assert_eq!(contents, vec!["第一条事实", "第二条事实"]);
+        assert!(
+            resp.entities[1].observations.is_empty(),
+            "未带观测的实体不应凭空多出观测"
+        );
+
+        let graph = read_graph(&*repo).await.unwrap();
+        let alpha = graph
+            .entities
+            .iter()
+            .find(|e| e.name == "alpha")
+            .expect("alpha 应已存在");
+        assert_eq!(alpha.observations.len(), 2, "观测应已真正落库");
+    }
+
+    /// 官方 camelCase 写法（`entityType`）与 `observations` 必须能同时使用。
+    #[tokio::test]
+    async fn create_entities_accepts_the_official_camel_case_shape_with_observations() {
+        let repo = repo().await;
+        let req: CreateEntitiesRequest = serde_json::from_value(serde_json::json!({
+            "entities": [
+                {"name": "alpha", "entityType": "person", "observations": ["官方写法的事实"]}
+            ]
+        }))
+        .expect("官方 schema 的写法必须被接受");
+
+        let resp = create_entities(&*repo, req).await.unwrap();
+        assert_eq!(resp.entities[0].entity_type, "person");
+        assert_eq!(resp.entities[0].observations.len(), 1);
+        assert_eq!(resp.entities[0].observations[0].content, "官方写法的事实");
+    }
+
+    /// 观测非法时**整批拒绝**，且不得留下「实体已建、观测没写」的半成品。
+    #[tokio::test]
+    async fn create_entities_rejects_the_whole_batch_when_an_observation_is_blank() {
+        let repo = repo().await;
+        let err = create_entities(
+            &*repo,
+            CreateEntitiesRequest {
+                entities: vec![entity_with_observations("alpha", "person", &["ok", "   "])],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_code(err, INVALID_PARAMS);
+
+        let graph = read_graph(&*repo).await.unwrap();
+        assert!(
+            graph.entities.is_empty(),
+            "校验必须在写入前完成：非法观测不得在库里留下任何实体"
+        );
+    }
+
+    /// 观测继承实体的 `source`：同一次调用视为同一来源，调用方无需写两遍。
+    #[tokio::test]
+    async fn observations_carried_by_create_entities_inherit_the_entity_source() {
+        let repo = repo().await;
+        let mut e = entity_with_observations("alpha", "person", &["fact"]);
+        e.source = "workbuddy".to_string();
+
+        let resp = create_entities(&*repo, CreateEntitiesRequest { entities: vec![e] })
+            .await
+            .unwrap();
+        assert_eq!(resp.entities[0].source, "workbuddy");
+        assert_eq!(resp.entities[0].observations[0].source, "workbuddy");
     }
 
     #[tokio::test]

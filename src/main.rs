@@ -22,6 +22,7 @@ mod admin;
 mod auth;
 mod cli;
 mod config;
+mod console;
 mod daemon;
 mod domain;
 mod entity;
@@ -29,17 +30,18 @@ mod error;
 mod instance;
 mod mcp;
 mod meta;
+mod password;
 #[cfg(windows)]
 mod process;
 mod reply;
 mod routes;
+mod session;
 mod state;
 mod storage;
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use anyhow::Result;
 use sea_orm::Database;
@@ -185,11 +187,7 @@ async fn serve(config: Config) -> Result<()> {
         "storage backends ready"
     );
 
-    let state = AppState {
-        meta: db,
-        config: config.clone(),
-        storage: Arc::new(storage),
-    };
+    let state = AppState::new(db, config.clone(), storage);
 
     warn_about_risky_config(&config);
 
@@ -226,6 +224,22 @@ fn warn_about_risky_config(config: &Config) {
             "admin_token is not set: every /api/v1 request will be rejected with 401 \
              (project creation and statistics are unavailable). Set it in the config file \
              or via the ADMIN_TOKEN environment variable"
+        );
+    }
+
+    // 未配置控制台口令是**允许**的（只用 MCP 与脚本的部署无需它），但必须让运维知道
+    // 「为什么 /admin 打不开」——否则这就是一次无从排查的「功能好像没有」。
+    if !config.console_login_enabled() {
+        tracing::warn!(
+            config_file = %config.config_path.display(),
+            "admin_password_hash is not set: the web console (/admin) is available but its \
+             login is disabled. Run `memora init --force` to generate credentials, or set \
+             admin_password_hash in the config file"
+        );
+    } else {
+        tracing::info!(
+            user = %config.admin_user,
+            "web console enabled at /admin"
         );
     }
 

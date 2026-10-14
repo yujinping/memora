@@ -18,7 +18,7 @@ use crate::error::StorageError;
 use crate::meta::{self, NewProject};
 use crate::reply;
 use crate::state::AppState;
-use crate::storage::{validate_project_id, BackendKind};
+use crate::storage::{validate_project_id, BackendKind, ProjectRepos};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -85,6 +85,68 @@ pub struct ProjectStats {
     pub relations: usize,
     /// 观测总数（跨实体累加）
     pub observations: usize,
+}
+
+/// 一张观测的对外形态。
+#[derive(Debug, Serialize)]
+pub struct ObservationView {
+    /// 观测主键（可据此调用 `delete_observations`）
+    pub id: i64,
+    /// 事实内容
+    pub content: String,
+    /// 创建时间（Unix 秒）
+    pub created_at: i64,
+    /// 写入来源标识，空串表示未声明
+    pub source: String,
+    /// 所属实体名
+    pub entity_name: String,
+}
+
+/// 一个实体的对外形态（含其观测）。
+#[derive(Debug, Serialize)]
+pub struct EntityView {
+    /// 实体名
+    pub name: String,
+    /// 实体类型
+    pub entity_type: String,
+    /// 创建时间（Unix 秒）
+    pub created_at: i64,
+    /// 登记来源标识，空串表示未声明
+    pub source: String,
+    /// 该实体的观测，按 id 升序
+    pub observations: Vec<ObservationView>,
+}
+
+/// 一条关系的对外形态。
+#[derive(Debug, Serialize)]
+pub struct RelationView {
+    /// 关系主键
+    pub id: i64,
+    /// 起点实体名
+    pub from_name: String,
+    /// 终点实体名
+    pub to_name: String,
+    /// 关系类型
+    pub relation_type: String,
+    /// 创建时间（Unix 秒）
+    pub created_at: i64,
+    /// 写入来源标识，空串表示未声明
+    pub source: String,
+}
+
+/// 全图快照的对外形态（网页控制台的「记忆浏览」用它）。
+///
+/// @intent 单独定义视图结构而不给领域模型加 `Serialize`：领域模型是存储层与工具层
+///         共用的内部契约，把它的字段直接暴露成 HTTP 响应，等于让「改一个字段名」
+///         同时成为一次不兼容的 API 变更。视图结构把这两件事解耦，代价是几行映射代码。
+#[derive(Debug, Serialize)]
+pub struct GraphView {
+    /// 项目标识
+    pub project_id: String,
+    /// 实体（含观测），按 name 升序
+    pub entities: Vec<EntityView>,
+    /// 关系，按 id 升序
+    pub relations: Vec<RelationView>,
 }
 
 /// 创建项目：校验 → 发 token → 登记（返回 201）。
@@ -226,28 +288,9 @@ pub async fn project_stats(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> Response {
-    if let Err(err) = validate_project_id(&project_id) {
-        return reply::bad_request("invalid_request", &err.to_string());
-    }
-
-    let record = match meta::find_project(&state.meta, &project_id).await {
-        Ok(Some(record)) => record,
-        Ok(None) => return project_not_found(&project_id),
-        Err(err) => return reply::internal_error(&err),
-    };
-
-    // 登记的 backend 值无法解析属数据损坏，调用方改不了 ⇒ 500
-    let kind = match BackendKind::parse(&record.backend) {
-        Ok(kind) => kind,
-        Err(err) => return reply::internal_error(&err),
-    };
-    let backend = match state.storage.get(kind) {
-        Ok(backend) => backend,
-        Err(err) => return reply::internal_error(&err),
-    };
-    let repos = match backend.repositories_for(&project_id).await {
+    let repos = match repositories_of(&state, &project_id).await {
         Ok(repos) => repos,
-        Err(err) => return reply::internal_error(&err),
+        Err(response) => return *response,
     };
     let graph = match repos.memory.read_graph().await {
         Ok(graph) => graph,
@@ -256,12 +299,120 @@ pub async fn project_stats(
 
     Json(ProjectStats {
         project_id,
-        backend: kind.as_str().to_string(),
+        backend: repos.backend.as_str().to_string(),
         entities: graph.entity_count(),
         relations: graph.relation_count(),
         observations: graph.observation_count(),
     })
     .into_response()
+}
+
+/// 全图快照：网页控制台「记忆浏览」的后端。
+///
+/// @intent 与 MCP 的 `read_graph` **同一个仓库方法**，因此控制台看到的与 AI 客户端
+///         写入的是同一份数据，不存在「两套读取逻辑互相漂移」的问题。
+///         本接口是只读的：控制台不提供改记忆的能力，写入仍只经 MCP 工具，
+///         以免在管理面引入第二套写入语义（判重规则、来源字段等）。
+pub async fn project_graph(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Response {
+    let repos = match repositories_of(&state, &project_id).await {
+        Ok(repos) => repos,
+        Err(response) => return *response,
+    };
+    let graph = match repos.memory.read_graph().await {
+        Ok(graph) => graph,
+        Err(err) => return reply::internal_error(&err),
+    };
+
+    let entities = graph
+        .entities
+        .iter()
+        .map(|entity| EntityView {
+            name: entity.name.clone(),
+            entity_type: entity.entity_type.clone(),
+            created_at: entity.created_at,
+            source: entity.source.clone(),
+            observations: entity
+                .observations
+                .iter()
+                .map(|obs| ObservationView {
+                    id: obs.id,
+                    content: obs.content.clone(),
+                    created_at: obs.created_at,
+                    source: obs.source.clone(),
+                    entity_name: obs.entity_name.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let relations = graph
+        .relations
+        .iter()
+        .map(|relation| RelationView {
+            id: relation.id,
+            from_name: relation.from_name.clone(),
+            to_name: relation.to_name.clone(),
+            relation_type: relation.relation_type.clone(),
+            created_at: relation.created_at,
+            source: relation.source.clone(),
+        })
+        .collect();
+
+    Json(GraphView {
+        project_id,
+        entities,
+        relations,
+    })
+    .into_response()
+}
+
+/// 解析项目标识 → 登记行 → 存储后端 → 仓库集合，失败时给出可回传的响应。
+///
+/// @intent 抽成一处是因为「登记行不存在」与「后端不可用」在三处接口里必须映射成**同样**
+///         的状态码；各写一遍迟早出现一处返回 404、另一处返回 500 的不一致，
+///         而调用方会据此写出不同的重试策略。
+///
+/// @intent 状态码分野与 `reply` 模块一致：项目不存在 → 404（调用方可修正）；
+///         登记的后端无法解析或未编译进本构建 → 500（服务端/构建问题，调用方改不了）。
+///
+/// @intent 错误侧刻意装箱（`Box<Response>`）：`Response` 有 128 字节，直接内联会让
+///         每个 `Result` 都按它的大小搬运，clippy 的 `result_large_err` 正是指这一点。
+///         装箱多一次分配，但只发生在**已经要构造 JSON 响应体**的错误路径上——
+///         不在热路径，代价可忽略。这不是为了讨好 lint：错误路径本来就慢，
+///         而每次成功调用都白扛一个 128 字节返回值的成本是确定的。
+async fn repositories_of(
+    state: &AppState,
+    project_id: &str,
+) -> Result<ProjectRepos, Box<Response>> {
+    if let Err(err) = validate_project_id(project_id) {
+        return Err(Box::new(reply::bad_request(
+            "invalid_request",
+            &err.to_string(),
+        )));
+    }
+
+    let record = match meta::find_project(&state.meta, project_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return Err(Box::new(project_not_found(project_id))),
+        Err(err) => return Err(Box::new(reply::internal_error(&err))),
+    };
+
+    // 登记的 backend 值无法解析属数据损坏，调用方改不了 ⇒ 500
+    let kind = match BackendKind::parse(&record.backend) {
+        Ok(kind) => kind,
+        Err(err) => return Err(Box::new(reply::internal_error(&err))),
+    };
+    let backend = match state.storage.get(kind) {
+        Ok(backend) => backend,
+        Err(err) => return Err(Box::new(reply::internal_error(&err))),
+    };
+    match backend.repositories_for(project_id).await {
+        Ok(repos) => Ok(repos),
+        Err(err) => Err(Box::new(reply::internal_error(&err))),
+    }
 }
 
 /// 404：项目不存在。
