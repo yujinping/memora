@@ -457,6 +457,11 @@ impl StorageBackend for InMemBackend {
         self.projects.lock().unwrap().remove(project_id);
         Ok(())
     }
+
+    fn db_path_label(&self, _project_id: &str) -> String {
+        // 内存后端没有文件，登记一个明确的「无文件」说明值
+        "(memory)".to_string()
+    }
 }
 
 #[cfg(test)]

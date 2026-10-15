@@ -177,9 +177,10 @@ pub async fn create_project(
         Ok(kind) => kind,
         Err(err) => return unavailable_backend(&state, &err),
     };
-    if let Err(err) = state.storage.get(kind) {
-        return unavailable_backend(&state, &err);
-    }
+    let backend = match state.storage.get(kind) {
+        Ok(backend) => backend,
+        Err(err) => return unavailable_backend(&state, &err),
+    };
 
     // 先查后插：管理面是低频人工操作，此处的竞态窗口可接受；
     // 唯一约束仍在库层兜底（并发插入时后到者会得到 500，而非悄然覆盖）。
@@ -202,8 +203,9 @@ pub async fn create_project(
     let new = NewProject {
         project_id: project_id.clone(),
         token: token.clone(),
-        // 记录用相对路径：实际位置由后端推导（见 docs §12.3），此处不构成第二个真相源
-        db_path: format!("{project_id}/mem.db"),
+        // 记录值由后端给出（文件后端 = 项目内相对路径；单库 = 共享文件名；内存 = 无文件），
+        // 实际位置以各后端推导为准（见 docs §12.3 / §12.5），此处不构成第二个真相源
+        db_path: backend.db_path_label(&project_id),
         backend: kind.as_str().to_string(),
     };
     if let Err(err) = meta::create_project(&state.meta, &new).await {

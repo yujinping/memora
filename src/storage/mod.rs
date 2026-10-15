@@ -11,11 +11,13 @@ pub mod mem;
 pub mod normalize;
 pub mod repo;
 pub mod sqlite_file;
+pub mod sqlite_single;
 
 /// 常用类型的扁平重导出，便于上层 `use crate::storage::{...}` 一把取用。
 pub use mem::InMemBackend;
 pub use repo::{HandoffRepository, MemoryRepository};
 pub use sqlite_file::SqliteFileBackend;
+pub use sqlite_single::SqliteSingleBackend;
 
 #[cfg(test)]
 pub mod contract;
@@ -133,6 +135,13 @@ pub trait StorageBackend: Send + Sync {
     ///         内存后端只需丢弃对应条目。留一个必须实现的 trait 方法（而非默认空实现），
     ///         可保证新增后端时无法「忘记」清理逻辑，并强制其接入后端级契约测试。
     async fn drop_project(&self, project_id: &str) -> Result<(), StorageError>;
+
+    /// 项目在元库 `projects.db_path` 中的登记值（仅作记录，不构成第二个真相源）。
+    ///
+    /// @intent 「数据放在哪」是后端知识（docs §12.5）：文件后端登记项目内相对路径，
+    ///         单库后端登记共享文件名，内存后端没有文件。不给默认实现——
+    ///         新增后端必须显式表态，管理面建项目时经由此方法登记。
+    fn db_path_label(&self, project_id: &str) -> String;
 }
 
 /// 后端注册表：运行期可用的后端实现集合。
@@ -158,8 +167,9 @@ impl StorageRegistry {
     pub fn from_config(config: &Config) -> Result<Self, StorageError> {
         let mut registry = Self::new();
 
-        // 本构建可用的实现：SQLite 文件后端 + 内存后端（测试 / 临时验证）
+        // 本构建可用的实现：SQLite 文件后端 + SQLite 单库后端 + 内存后端（测试 / 临时验证）
         registry.register(Arc::new(SqliteFileBackend::new(config.data_dir.clone())));
+        registry.register(Arc::new(SqliteSingleBackend::new(config.data_dir.clone())));
         registry.register(Arc::new(InMemBackend::new()));
 
         // 配置指定的默认后端必须已在注册表中
@@ -283,13 +293,18 @@ mod tests {
             .iter()
             .map(|k| k.as_str())
             .collect();
-        assert_eq!(kinds, vec!["in_mem", "sqlite_file"]);
+        assert_eq!(
+            kinds,
+            vec!["in_mem", "sqlite_file", "sqlite_single"]
+        );
     }
 
     #[test]
     fn registry_rejects_unavailable_default_backend() {
         assert!(StorageRegistry::from_config(&cfg("sqlite_file")).is_ok());
         assert!(StorageRegistry::from_config(&cfg("in_mem")).is_ok());
+        // P6：sqlite_single 已随本构建接线
+        assert!(StorageRegistry::from_config(&cfg("sqlite_single")).is_ok());
         assert_unsupported(
             StorageRegistry::from_config(&cfg("postgres")),
             "postgres",

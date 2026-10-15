@@ -1028,6 +1028,10 @@ impl StorageBackend for SqliteFileBackend {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn db_path_label(&self, project_id: &str) -> String {
+        format!("{project_id}/mem.db")
+    }
 }
 
 #[cfg(test)]

@@ -877,6 +877,112 @@ mod tests {
         assert_eq!(body["backend"], "in_mem");
     }
 
+    /// P6 端到端：sqlite_single 项目从建项目到 MCP 记忆与交接全链路可用。
+    ///
+    /// @intent 后端契约（bc_01–bc_07）钉的是存储层语义；本用例钉的是**协议链路**——
+    ///         单库项目经 REST 创建、经 MCP 读写记忆、走完零 ID 交接三步、
+    ///         stats 反映交接计数，共享库落在 DATA_DIR 下。
+    #[tokio::test]
+    async fn sqlite_single_project_serves_memory_and_handoffs_end_to_end() {
+        let (app, dir) = setup().await;
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects",
+            Some("admin"),
+            serde_json::json!({ "project_id": "single-e2e", "backend": "sqlite_single" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "响应体：{body}");
+        assert_eq!(body["backend"], "sqlite_single");
+        let token = body["token"]
+            .as_str()
+            .expect("201 必须携带一次明文 token")
+            .to_string();
+
+        // 项目列表应反映单库形态的登记值（共享文件名，而非项目内路径）
+        let (status, list) = get_with_token(app.clone(), "/api/v1/projects", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK, "响应体：{list}");
+        let record = list
+            .as_array()
+            .and_then(|a| a.iter().find(|p| p["project_id"] == "single-e2e"))
+            .expect("列表必须包含新项目");
+        assert_eq!(record["db_path"], "mem-single.db");
+
+        // MCP 交接链路：零 ID save → 零参数 load → ack
+        let (status, resp) = rpc(
+            app.clone(),
+            Some(&token),
+            tool_call(
+                1,
+                "handoff_save",
+                serde_json::json!({
+                    "goal": "P6 单库验收", "state": "端到端进行中",
+                    "client": "workbuddy", "sessionId": "P6"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{resp}");
+        assert_eq!(structured(&resp)["task_id"], "current@workbuddy");
+
+        let (status, resp) = rpc(
+            app.clone(),
+            Some(&token),
+            tool_call(2, "handoff_load", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{resp}");
+        assert_eq!(structured(&resp)["status"], "found");
+
+        let (status, resp) = rpc(
+            app.clone(),
+            Some(&token),
+            tool_call(3, "handoff_ack", serde_json::json!({ "client": "zed" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{resp}");
+        assert_eq!(structured(&resp)["won"], true);
+
+        // MCP 记忆：写入 + 检索命中（FTS / 子串回退在单库上同样可用）
+        let (status, resp) = rpc(
+            app.clone(),
+            Some(&token),
+            tool_call(
+                4,
+                "create_entities",
+                serde_json::json!({
+                    "entities": [
+                        { "name": "p6-note", "entityType": "note", "observations": ["单库后端端到端"] }
+                    ]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{resp}");
+
+        let (status, resp) = rpc(
+            app.clone(),
+            Some(&token),
+            tool_call(5, "search_nodes", serde_json::json!({ "query": "端到端" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{resp}");
+        assert_eq!(structured(&resp)["entities"][0]["name"], "p6-note");
+
+        // stats 的交接计数：save 一条、ack 不减计数
+        let (status, body) =
+            get_with_token(app, "/api/v1/projects/single-e2e/stats", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK, "响应体：{body}");
+        assert_eq!(body["handoffs"], 1);
+
+        // 共享库必须落在 DATA_DIR 下
+        assert!(
+            dir.join("mem-single.db").exists(),
+            "共享库必须落在 DATA_DIR 下"
+        );
+    }
+
     /// 重复 project_id 必须拒绝：静默覆盖会让既有 token 与新 token 指向同一项目。
     #[tokio::test]
     async fn admin_create_project_rejects_duplicate_id() {

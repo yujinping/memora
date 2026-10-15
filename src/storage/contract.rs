@@ -46,6 +46,7 @@ pub async fn run_backend_contract(backend: &dyn StorageBackend) {
     bc_04_drop_project_is_idempotent(backend).await;
     bc_05_drop_project_rejects_unsafe_project_id(backend).await;
     bc_06_handoffs_are_isolated_per_project(backend).await;
+    bc_07_db_path_label_is_declared(backend).await;
 }
 
 // ---------------------------------------------------------------- 后端级用例
@@ -170,6 +171,15 @@ async fn bc_06_handoffs_are_isolated_per_project(backend: &dyn StorageBackend) {
         b.handoff.resolve_handoff(Some("current@zed")).await.unwrap(),
         HandoffResolution::None,
         "即使知道 task_id，也不得跨项目读到别人的交接"
+    );
+}
+
+/// 元库登记值 `db_path` 必须由后端显式给出且非空（元库列为 NOT NULL）。
+async fn bc_07_db_path_label_is_declared(backend: &dyn StorageBackend) {
+    let label = backend.db_path_label("bc7");
+    assert!(
+        !label.trim().is_empty(),
+        "db_path 登记值必须非空（元库列为 NOT NULL），实际：{label:?}"
     );
 }
 

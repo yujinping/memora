@@ -385,8 +385,8 @@ mcp::dto 只被 tools 与 server 使用
 | 后端 | 状态 | 存储策略 |
 |---|---|---|
 | `sqlite_file` | ✅ 默认 | 每项目一个 SQLite 文件 `data/{project_id}/mem.db`，连接按项目缓存 |
+| `sqlite_single` | ✅ P6 | 单库 `data/mem-single.db` + `project_id` 租户列过滤（实体 / 观测 / 关系 / 交接 / FTS 全租户化） |
 | `in_mem` | ✅ 已实现 | 纯内存 HashMap，测试参照实现 |
-| `sqlite_single` | 🔜 预留 | 单库 + 租户列过滤 |
 | `postgres` | 🔜 预留 | 单连接池，按 schema 或租户列隔离 |
 
 两份契约同时约束每个后端：
@@ -497,6 +497,7 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 | P4.3 | 配置单实例化：TOML + XDG 绝对路径 + 实例记录（`status` / `stop` 无需带参数） | ✅ |
 | P4.4 | 网页控制台：`/admin` 登录（Argon2id）+ 建项目 / 取 token / 浏览记忆 | ✅ |
 | P4.5 | 任务交接并入 memora：4 个 MCP 工具 + 7 个 REST 路由 + `handoff` CLI（设计见 `docs/handoff-integration-design.md`） | ✅ |
+| P6 | 第三后端 `sqlite_single`：单库 + `project_id` 租户列过滤（记忆 / 交接 / FTS 全租户化，契约 H1–H18 + bc_01–bc_07 全覆盖） | ✅ |
 | P5.1 | 会话表与跨机器会话恢复（`log_turn` / `get_session` / `list_sessions`） | 🔜 |
 | 后续 | 远程 embedding 语义检索、记忆版本与回滚、导入导出、控制台里改记忆 | 💡 |
 
