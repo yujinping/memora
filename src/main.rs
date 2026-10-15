@@ -124,15 +124,16 @@ fn main() -> ExitCode {
                 }
                 Command::Handoff { action } => {
                     // CLI 与 daemon 平级：只加载配置（端口 / token），不触碰存储
-                    let endpoint =
-                        match http::Endpoint::parse(parsed.handoff.server.as_deref().unwrap_or(""), config.port)
-                        {
-                            Ok(ep) => ep,
-                            Err(err) => {
-                                eprintln!("error: {err}");
-                                return ExitCode::from(2);
-                            }
-                        };
+                    let endpoint = match http::Endpoint::parse(
+                        parsed.handoff.server.as_deref().unwrap_or(""),
+                        config.port,
+                    ) {
+                        Ok(ep) => ep,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return ExitCode::from(2);
+                        }
+                    };
                     handoff_cli::run(
                         action,
                         &parsed.handoff,

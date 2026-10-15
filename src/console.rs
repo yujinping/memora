@@ -221,7 +221,10 @@ mod tests {
             "页面必须把管理接口统一挂在 /api/v1 前缀下"
         );
         for endpoint in ["/session", "/projects", "/graph"] {
-            assert!(CONSOLE_HTML.contains(endpoint), "页面必须调用 {endpoint} 接口");
+            assert!(
+                CONSOLE_HTML.contains(endpoint),
+                "页面必须调用 {endpoint} 接口"
+            );
         }
 
         // 不得引用任何外部资源：自托管常无外网，且外链会引入供应链与隐私问题。

@@ -15,7 +15,7 @@ pub mod sqlite_single;
 
 /// 常用类型的扁平重导出，便于上层 `use crate::storage::{...}` 一把取用。
 pub use mem::InMemBackend;
-pub use repo::{HandoffRepository, MemoryRepository};
+pub use repo::{ConversationRepository, HandoffRepository, MemoryRepository};
 pub use sqlite_file::SqliteFileBackend;
 pub use sqlite_single::SqliteSingleBackend;
 
@@ -82,7 +82,6 @@ impl BackendKind {
 ///
 /// @intent 中间件解析出项目后一次性产出，经请求扩展注入；handler 只从扩展取用。
 ///         `backend` 字段使 handler 无需再回查元库即可在诊断信息 / 响应中标注存储策略。
-///         P5 新增 `ConversationRepository` 时在此追加字段即可，对已有 handler 无影响。
 #[derive(Clone)]
 pub struct ProjectRepos {
     /// 项目标识
@@ -93,6 +92,8 @@ pub struct ProjectRepos {
     pub memory: Arc<dyn MemoryRepository>,
     /// 交接仓库（P4.3）
     pub handoff: Arc<dyn HandoffRepository>,
+    /// 会话仓库（P5.1）：细粒度逐轮 transcript
+    pub conversation: Arc<dyn ConversationRepository>,
 }
 
 /// 无 ID 的 ack：先按 [`HandoffRepository::resolve_handoff`] 的同一套规则寻址，再落到具体任务上。
@@ -293,10 +294,7 @@ mod tests {
             .iter()
             .map(|k| k.as_str())
             .collect();
-        assert_eq!(
-            kinds,
-            vec!["in_mem", "sqlite_file", "sqlite_single"]
-        );
+        assert_eq!(kinds, vec!["in_mem", "sqlite_file", "sqlite_single"]);
     }
 
     #[test]
@@ -305,10 +303,7 @@ mod tests {
         assert!(StorageRegistry::from_config(&cfg("in_mem")).is_ok());
         // P6：sqlite_single 已随本构建接线
         assert!(StorageRegistry::from_config(&cfg("sqlite_single")).is_ok());
-        assert_unsupported(
-            StorageRegistry::from_config(&cfg("postgres")),
-            "postgres",
-        );
+        assert_unsupported(StorageRegistry::from_config(&cfg("postgres")), "postgres");
         assert_unsupported(StorageRegistry::from_config(&cfg("mysql")), "mysql");
     }
 }

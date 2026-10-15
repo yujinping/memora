@@ -69,7 +69,9 @@ pub fn create_app(state: AppState) -> Router {
     let session_routes = Router::new()
         .route(
             "/session",
-            get(console::status).post(console::login).delete(console::logout),
+            get(console::status)
+                .post(console::login)
+                .delete(console::logout),
         )
         .with_state(state.clone());
 
@@ -93,7 +95,10 @@ pub fn create_app(state: AppState) -> Router {
             "/projects/{id}/handoffs",
             post(admin::handoff_save).get(admin::handoff_list),
         )
-        .route("/projects/{id}/handoffs/pending", get(admin::handoff_pending))
+        .route(
+            "/projects/{id}/handoffs/pending",
+            get(admin::handoff_pending),
+        )
         .route(
             "/projects/{id}/handoffs/pending/ack",
             post(admin::handoff_ack_pending),
@@ -983,6 +988,138 @@ mod tests {
         );
     }
 
+    /// P5.1 端到端：会话三工具经 MCP 协议层跑通写入 → 拉取 → 列表全链路。
+    ///
+    /// @intent 工具单测钉的是语义；本用例钉的是**协议面**——camelCase 别名
+    ///         （`sessionId`）、入参 schema、`isError` 语义错误、以及
+    ///         「轮次序号由服务端分配并回读」这条最容易被客户端违反的约定。
+    #[tokio::test]
+    async fn mcp_session_tools_round_trip_over_the_protocol() {
+        let (app, _dir) = setup().await;
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects",
+            Some("admin"),
+            serde_json::json!({ "project_id": "session-e2e" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "响应体：{body}");
+        let token = body["token"]
+            .as_str()
+            .expect("201 必须携带一次明文 token")
+            .to_string();
+
+        // 写三轮（含 camelCase 入参与 assistant / system 角色）
+        let mut last_index = -1_i64;
+        for (i, (role, content)) in [("user", "问题"), ("assistant", "回答"), ("system", "提示")]
+            .into_iter()
+            .enumerate()
+        {
+            let (status, resp) = rpc(
+                app.clone(),
+                Some(&token),
+                tool_call(
+                    i as i64 + 1,
+                    "log_turn",
+                    serde_json::json!({
+                        "sessionId": "resume-main",
+                        "role": role,
+                        "content": content
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "响应体：{resp}");
+            let view = structured(&resp);
+            assert_eq!(view["session_id"], "resume-main");
+            assert_eq!(
+                view["turn_index"],
+                serde_json::json!(i as i64),
+                "轮次序号必须由服务端分配（0 起、连续）"
+            );
+            last_index = view["turn_index"].as_i64().unwrap();
+        }
+        assert_eq!(last_index, 2, "三轮写完最大序号必须是 2");
+
+        // 拉回完整 transcript：逐字一致、按序
+        let (status, resp) = rpc(
+            app.clone(),
+            Some(&token),
+            tool_call(
+                4,
+                "get_session",
+                serde_json::json!({ "sessionId": "resume-main" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{resp}");
+        let turns = structured(&resp)["turns"]
+            .as_array()
+            .expect("必须返回 turns 数组")
+            .clone();
+        let got: Vec<(String, String)> = turns
+            .iter()
+            .map(|t| {
+                (
+                    t["role"].as_str().unwrap().into(),
+                    t["content"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("user".to_string(), "问题".to_string()),
+                ("assistant".to_string(), "回答".to_string()),
+                ("system".to_string(), "提示".to_string()),
+            ],
+            "transcript 必须按轮次逐字还原"
+        );
+
+        // 缺失会话 = 空 transcript（正常返回，非 isError）
+        let (status, resp) = rpc(
+            app.clone(),
+            Some(&token),
+            tool_call(5, "get_session", serde_json::json!({ "sessionId": "nope" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{resp}");
+        assert_eq!(structured(&resp)["turns"], serde_json::json!([]));
+
+        // 列表 + 前缀过滤
+        let (status, resp) = rpc(
+            app.clone(),
+            Some(&token),
+            tool_call(6, "list_sessions", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{resp}");
+        assert_eq!(
+            structured(&resp)["sessions"],
+            serde_json::json!(["resume-main"])
+        );
+
+        // 非法角色 → JSON-RPC `-32602`（语义错误，调用方可修正），而不是服务端故障。
+        // 形状约定见 mcp_tool_error_surfaces_as_jsonrpc_error 的 @intent 注释。
+        let (status, resp) = rpc(
+            app,
+            Some(&token),
+            tool_call(
+                7,
+                "log_turn",
+                serde_json::json!({
+                    "sessionId": "resume-main",
+                    "role": "Tool",
+                    "content": "x"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "响应体：{resp}");
+        assert_eq!(resp["error"]["code"], -32602, "响应体：{resp}");
+    }
+
     /// 重复 project_id 必须拒绝：静默覆盖会让既有 token 与新 token 指向同一项目。
     #[tokio::test]
     async fn admin_create_project_rejects_duplicate_id() {
@@ -1257,7 +1394,11 @@ mod tests {
         assert_eq!(body["task_id"], "current@zed", "无 ID 应落分片槽位：{body}");
         assert_eq!(body["revision"], 1);
         assert_eq!(body["goal"], "验收 REST 保存");
-        assert_eq!(body["acked_at"], serde_json::Value::Null, "新修订必为待接手");
+        assert_eq!(
+            body["acked_at"],
+            serde_json::Value::Null,
+            "新修订必为待接手"
+        );
         assert_eq!(body["next_steps"], serde_json::json!(["接 CLI"]));
 
         let (status, body) = get_with_token(
@@ -1375,21 +1516,16 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         // 截断必须发生在排序之后：limit=1 的结果应等于全量列表的第一项（与 H11 同构）。
-        let first = get_with_token(
-            app.clone(),
-            "/api/v1/projects/demo/handoffs",
-            Some("admin"),
-        )
-        .await
-        .1;
+        let first = get_with_token(app.clone(), "/api/v1/projects/demo/handoffs", Some("admin"))
+            .await
+            .1;
         assert_eq!(
             body["handoffs"].as_array().unwrap().len(),
             1,
             "响应体：{body}"
         );
         assert_eq!(
-            body["handoffs"][0]["task_id"],
-            first["handoffs"][0]["task_id"],
+            body["handoffs"][0]["task_id"], first["handoffs"][0]["task_id"],
             "limit 截断必须发生在排序之后"
         );
 
@@ -1426,9 +1562,12 @@ mod tests {
     async fn admin_handoff_pending_resolves_zero_id_entry() {
         let (app, _dir) = setup().await;
 
-        let (status, body) =
-            get_with_token(app.clone(), "/api/v1/projects/demo/handoffs/pending", Some("admin"))
-                .await;
+        let (status, body) = get_with_token(
+            app.clone(),
+            "/api/v1/projects/demo/handoffs/pending",
+            Some("admin"),
+        )
+        .await;
         assert_eq!(status, StatusCode::NO_CONTENT, "空仓库应 204：{body}");
 
         let (status, body) = send_json(
@@ -1441,9 +1580,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
 
-        let (status, body) =
-            get_with_token(app.clone(), "/api/v1/projects/demo/handoffs/pending", Some("admin"))
-                .await;
+        let (status, body) = get_with_token(
+            app.clone(),
+            "/api/v1/projects/demo/handoffs/pending",
+            Some("admin"),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "唯一待接手应 200：{body}");
         assert_eq!(body["task_id"], "current@zed");
         assert_eq!(body["goal"], "唯一的活");
@@ -1489,9 +1631,12 @@ mod tests {
         }
 
         // 若被 {task_id} 吃掉，这里会 200 返回单条 "pending" 任务，而非 300 候选
-        let (status, body) =
-            get_with_token(app.clone(), "/api/v1/projects/demo/handoffs/pending", Some("admin"))
-                .await;
+        let (status, body) = get_with_token(
+            app.clone(),
+            "/api/v1/projects/demo/handoffs/pending",
+            Some("admin"),
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::MULTIPLE_CHOICES,
@@ -1548,10 +1693,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "重复 ack 仍是正常返回：{body}");
         assert_eq!(body["won"], false, "已接手不得再次抢到");
-        assert_eq!(
-            body["handoff"]["acked_by"], "zed",
-            "接手方不得被后到者覆盖"
-        );
+        assert_eq!(body["handoff"]["acked_by"], "zed", "接手方不得被后到者覆盖");
 
         // 全部接手完毕后，零 ID 接手入口无活可干 → 204
         let (status, body) = send_json(
@@ -1590,9 +1732,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
 
-        let (status, _) =
-            delete_with_token(app.clone(), "/api/v1/projects/demo/handoffs/doomed", Some("admin"))
-                .await;
+        let (status, _) = delete_with_token(
+            app.clone(),
+            "/api/v1/projects/demo/handoffs/doomed",
+            Some("admin"),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
 
         let (status, _) = get_with_token(
@@ -1806,7 +1951,8 @@ mod tests {
     async fn session_status_reports_missing_console_password() {
         let (app, _dir) = setup_with_console(false).await;
 
-        let (status, body, _) = send_with_cookie(app.clone(), "GET", "/api/v1/session", None, None, None).await;
+        let (status, body, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/session", None, None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["console_login_enabled"], false);
         assert_eq!(body["authenticated"], false);
@@ -1839,16 +1985,13 @@ mod tests {
         let (app, _dir) = setup_with_console(true).await;
         let cookie = login(app.clone()).await;
 
-        let (status, body, _) = send_with_cookie(
-            app,
-            "GET",
-            "/api/v1/projects",
-            Some(&cookie),
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "会话 Cookie 应能通过管理面鉴权：{body}");
+        let (status, body, _) =
+            send_with_cookie(app, "GET", "/api/v1/projects", Some(&cookie), None, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "会话 Cookie 应能通过管理面鉴权：{body}"
+        );
         assert!(body.as_array().unwrap().len() >= 3);
     }
 
@@ -1889,15 +2032,25 @@ mod tests {
         let (app, _dir) = setup_with_console(true).await;
         let cookie = login(app.clone()).await;
 
-        let (status, _, headers) =
-            send_with_cookie(app.clone(), "DELETE", "/api/v1/session", Some(&cookie), None, None).await;
+        let (status, _, headers) = send_with_cookie(
+            app.clone(),
+            "DELETE",
+            "/api/v1/session",
+            Some(&cookie),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         let cleared = headers
             .get(header::SET_COOKIE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        assert!(cleared.contains("Max-Age=0"), "必须让浏览器立即丢弃：{cleared}");
+        assert!(
+            cleared.contains("Max-Age=0"),
+            "必须让浏览器立即丢弃：{cleared}"
+        );
 
         let (status, _, _) =
             send_with_cookie(app, "GET", "/api/v1/projects", Some(&cookie), None, None).await;
@@ -1913,8 +2066,15 @@ mod tests {
             "memora_session=",
             "memora_session=0000000000000000000000000000000000000000000000000000000000000000",
         ] {
-            let (status, _, _) =
-                send_with_cookie(app.clone(), "GET", "/api/v1/projects", Some(forged), None, None).await;
+            let (status, _, _) = send_with_cookie(
+                app.clone(),
+                "GET",
+                "/api/v1/projects",
+                Some(forged),
+                None,
+                None,
+            )
+            .await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{forged} 不得通过");
         }
     }
@@ -1962,7 +2122,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            status, StatusCode::UNAUTHORIZED,
+            status,
+            StatusCode::UNAUTHORIZED,
             "把项目 token 当会话 id 用必须被拒"
         );
     }
@@ -1989,7 +2150,8 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN, "跨站写请求必须被拒：{body}");
         assert_eq!(body["error"], "cross_origin_rejected");
 
-        let (status, _) = get_with_token(app.clone(), "/api/v1/projects/demo/stats", Some("admin")).await;
+        let (status, _) =
+            get_with_token(app.clone(), "/api/v1/projects/demo/stats", Some("admin")).await;
         assert_eq!(status, StatusCode::OK, "被拒的跨站请求不得删掉项目");
 
         // 同源写请求放行
@@ -2086,7 +2248,9 @@ mod tests {
             .unwrap();
         repos
             .memory
-            .create_relations(vec![crate::domain::RelationInput::new("alpha", "beta", "knows")])
+            .create_relations(vec![crate::domain::RelationInput::new(
+                "alpha", "beta", "knows",
+            )])
             .await
             .unwrap();
         repos
@@ -2111,7 +2275,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-        let (status, body) = get_with_token(app.clone(), "/api/v1/projects/demo/graph", Some("admin")).await;
+        let (status, body) =
+            get_with_token(app.clone(), "/api/v1/projects/demo/graph", Some("admin")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["project_id"], "demo");
         assert_eq!(body["entities"].as_array().unwrap().len(), 2);
@@ -2138,8 +2303,12 @@ mod tests {
         assert_eq!(body["relations"][0]["relation_type"], "knows");
 
         // 与统计口径一致：控制台看到的实体数应等于 stats 报出的实体数
-        let (_, stats) = get_with_token(app.clone(), "/api/v1/projects/demo/stats", Some("admin")).await;
-        assert_eq!(stats["entities"], body["entities"].as_array().unwrap().len());
+        let (_, stats) =
+            get_with_token(app.clone(), "/api/v1/projects/demo/stats", Some("admin")).await;
+        assert_eq!(
+            stats["entities"],
+            body["entities"].as_array().unwrap().len()
+        );
 
         let (status, _) = get_with_token(app, "/api/v1/projects/ghost/graph", Some("admin")).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "不存在的项目应报 404");

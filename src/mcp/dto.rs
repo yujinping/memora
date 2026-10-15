@@ -440,6 +440,73 @@ pub struct HandoffListResponse {
     pub handoffs: Vec<HandoffSummaryView>,
 }
 
+// ---------------------------------------------------------------------------
+// 会话工具（P5.1，docs/memory-system-design.md §5.4）
+// ---------------------------------------------------------------------------
+
+/// `log_turn` 入参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LogTurnRequest {
+    /// 会话标识（客户端生成，如 `2026-10-15-iptv-bugfix`）。首写即建会话
+    #[serde(alias = "sessionId")]
+    pub session_id: String,
+    /// 说话角色：`user` / `assistant` / `system`
+    pub role: String,
+    /// 该轮正文（必填，非空）
+    pub content: String,
+}
+
+/// `log_turn` 出参：落库后的完整轮次。
+///
+/// @intent 回读是硬约定：`turn_index` 由后端分配，调用方直接拿返回值续接下文，
+///         绝不允许「写完再猜序号」（与 handoff 回读带 id 同一哲学）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TurnView {
+    /// 会话标识
+    #[serde(alias = "sessionId")]
+    pub session_id: String,
+    /// 轮次序号，会话内从 0 单调递增
+    #[serde(alias = "turnIndex")]
+    pub turn_index: i64,
+    /// 说话角色
+    pub role: String,
+    /// 该轮正文
+    pub content: String,
+    /// 写入时间（Unix 秒）
+    #[serde(alias = "createdAt")]
+    pub created_at: i64,
+}
+
+/// `get_session` 入参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GetSessionRequest {
+    /// 会话标识；从未写入的会话返回空 transcript（不是错误）
+    #[serde(alias = "sessionId")]
+    pub session_id: String,
+}
+
+/// `get_session` 出参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GetSessionResponse {
+    /// 完整 transcript，按轮次升序
+    pub turns: Vec<TurnView>,
+}
+
+/// `list_sessions` 入参。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ListSessionsRequest {
+    /// 只列以该前缀开头的会话标识；省略 = 全部
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
+/// `list_sessions` 出参。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ListSessionsResponse {
+    /// 会话标识，按最近活跃降序（并列按标识升序）
+    pub sessions: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,10 +548,7 @@ mod tests {
         }))
         .expect_err("顶层多余字段必须报错，否则 observations 会被静默丢弃");
 
-        assert!(
-            err.to_string().contains("unknown field"),
-            "实际：{err}"
-        );
+        assert!(err.to_string().contains("unknown field"), "实际：{err}");
     }
 
     /// 加了 `deny_unknown_fields` 后，规范 snake_case 与官方 camelCase 别名必须都仍可用。
@@ -545,4 +609,3 @@ mod tests {
         }
     }
 }
-

@@ -415,6 +415,39 @@ fn slot_suffix(client: &str) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 会话（P5.1，docs/memory-system-design.md §5.4 / §2 conversations 表）
+// ---------------------------------------------------------------------------
+
+/// 会话一轮对话的写入输入。
+///
+/// @intent `turn_index` 与 `created_at` 都由后端分配：轮次序号必须单调且无空洞，
+///         交给调用方数只会数错；这也是「写操作回读带定位信息」约定的前提。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionInput {
+    /// 会话标识（客户端生成），项目内唯一寻址一个 transcript
+    pub session_id: String,
+    /// 说话角色，必须是 `user` / `assistant` / `system` 之一（docs §2 表注释）
+    pub role: String,
+    /// 该轮正文（必填，非空）
+    pub content: String,
+}
+
+/// 落库后的一轮对话。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    /// 会话标识
+    pub session_id: String,
+    /// 轮次序号，会话内从 0 单调递增、无空洞（后端分配）
+    pub turn_index: i64,
+    /// 说话角色
+    pub role: String,
+    /// 该轮正文
+    pub content: String,
+    /// 写入时间（Unix 秒）
+    pub created_at: i64,
+}
+
 #[cfg(test)]
 mod handoff_tests {
     use super::*;
@@ -423,7 +456,10 @@ mod handoff_tests {
     #[test]
     fn default_slot_is_sharded_by_client() {
         assert_eq!(default_handoff_task_id("zed"), "current@zed");
-        assert_eq!(default_handoff_task_id("  workbuddy  "), "current@workbuddy");
+        assert_eq!(
+            default_handoff_task_id("  workbuddy  "),
+            "current@workbuddy"
+        );
     }
 
     /// 未声明 client 时退回项目级单槽位（这是「没填 client」时唯一可用的语义）。

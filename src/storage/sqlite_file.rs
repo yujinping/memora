@@ -13,18 +13,18 @@
 
 use crate::domain::{
     AckOutcome, Entity, EntityInput, Graph, Handoff, HandoffInput, HandoffResolution,
-    HandoffSummary, Observation, ObservationInput, Relation, RelationInput,
+    HandoffSummary, Observation, ObservationInput, Relation, RelationInput, SessionInput, Turn,
 };
-use crate::entity::memory::{entities, handoffs, observations, relations};
+use crate::entity::memory::{conversations, entities, handoffs, observations, relations};
 use crate::error::StorageError;
 use crate::storage::normalize;
-use crate::storage::repo::{HandoffRepository, MemoryRepository};
+use crate::storage::repo::{ConversationRepository, HandoffRepository, MemoryRepository};
 use crate::storage::{BackendKind, ProjectRepos, StorageBackend};
 use async_trait::async_trait;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction, DbBackend,
-    EntityTrait, QueryFilter, QueryOrder, Statement, TransactionTrait,
+    EntityTrait, QueryFilter, QueryOrder, Statement, TransactionTrait, Value,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -85,6 +85,17 @@ const MEMORY_SCHEMA: &[&str] = &[
     )",
     // 「每任务只取最新修订」是 list / resolve 的共同形态，故索引按 (task_id, revision DESC)
     "CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id, revision DESC)",
+    // --- P5.1 会话：逐轮 transcript 追加表（docs/memory-system-design.md §2 / §5.4）---
+    // 主键 `(session_id, turn_index)`：轮次由后端在会话内单调分配，顺序即语义。
+    "CREATE TABLE IF NOT EXISTS conversations (\
+        session_id TEXT NOT NULL, \
+        turn_index INTEGER NOT NULL, \
+        role TEXT NOT NULL, \
+        content TEXT NOT NULL, \
+        created_at INTEGER NOT NULL, \
+        PRIMARY KEY (session_id, turn_index)\
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id, created_at)",
 ];
 
 /// 检索索引中「实体占位行」的 `obs_id` 取值（真实观测 id 自增，从 1 开始）。
@@ -266,7 +277,11 @@ impl SqliteMemoryRepo {
                     UNION \
                     SELECT entity_name AS n FROM observations WHERE content LIKE ? ESCAPE '\\'\
                  ) ORDER BY n",
-                [pattern.clone().into(), pattern.clone().into(), pattern.into()],
+                [
+                    pattern.clone().into(),
+                    pattern.clone().into(),
+                    pattern.into(),
+                ],
             ))
             .await?;
 
@@ -300,13 +315,16 @@ impl SqliteMemoryRepo {
 
         let mut grouped: HashMap<String, Vec<Observation>> = HashMap::new();
         for o in observation_rows {
-            grouped.entry(o.entity_name.clone()).or_default().push(Observation {
-                id: o.id,
-                entity_name: o.entity_name,
-                content: o.content,
-                created_at: o.created_at,
-                source: o.source,
-            });
+            grouped
+                .entry(o.entity_name.clone())
+                .or_default()
+                .push(Observation {
+                    id: o.id,
+                    entity_name: o.entity_name,
+                    content: o.content,
+                    created_at: o.created_at,
+                    source: o.source,
+                });
         }
 
         Ok(entity_rows
@@ -324,10 +342,8 @@ impl SqliteMemoryRepo {
     /// 按给定名字顺序排列实体（保持检索相关度序）。
     async fn fetch_ordered(&self, ordered_names: &[String]) -> Result<Vec<Entity>, StorageError> {
         let mut loaded = self.fetch_entities(ordered_names).await?;
-        let mut index: HashMap<String, Entity> = loaded
-            .drain(..)
-            .map(|e| (e.name.clone(), e))
-            .collect();
+        let mut index: HashMap<String, Entity> =
+            loaded.drain(..).map(|e| (e.name.clone(), e)).collect();
         Ok(ordered_names
             .iter()
             .filter_map(|n| index.remove(n))
@@ -497,7 +513,10 @@ impl MemoryRepository for SqliteMemoryRepo {
         Self::finish(txn, result).await
     }
 
-    async fn create_relations(&self, relation_inputs: Vec<RelationInput>) -> Result<(), StorageError> {
+    async fn create_relations(
+        &self,
+        relation_inputs: Vec<RelationInput>,
+    ) -> Result<(), StorageError> {
         let normalized = normalize::relations(&relation_inputs)?;
         if normalized.is_empty() {
             return Ok(());
@@ -564,13 +583,16 @@ impl MemoryRepository for SqliteMemoryRepo {
 
         let mut grouped: HashMap<String, Vec<Observation>> = HashMap::new();
         for o in observation_rows {
-            grouped.entry(o.entity_name.clone()).or_default().push(Observation {
-                id: o.id,
-                entity_name: o.entity_name,
-                content: o.content,
-                created_at: o.created_at,
-                source: o.source,
-            });
+            grouped
+                .entry(o.entity_name.clone())
+                .or_default()
+                .push(Observation {
+                    id: o.id,
+                    entity_name: o.entity_name,
+                    content: o.content,
+                    created_at: o.created_at,
+                    source: o.source,
+                });
         }
 
         Ok(Graph {
@@ -891,6 +913,112 @@ impl HandoffRepository for SqliteHandoffRepo {
     }
 }
 
+/// 单项目库的会话仓库（P5.1；与记忆 / 交接仓库共享同一个连接池）。
+///
+/// @intent 轮次序号用单条 `INSERT … SELECT MAX(turn_index)+1` 原子分配：
+///         SQLite 同一时刻只有一个写者，语句级原子性足以保证会话内序号
+///         单调且无空洞，不需要应用层再加锁。
+pub struct SqliteConversationRepo {
+    /// 项目库连接（与记忆 / 交接仓库同一份）
+    db: DatabaseConnection,
+}
+
+#[async_trait]
+impl ConversationRepository for SqliteConversationRepo {
+    async fn append_turn(&self, input: SessionInput) -> Result<Turn, StorageError> {
+        let (session_id, role, content) = normalize::session_turn(&input)?;
+        let created_at = now();
+
+        let res = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO conversations (session_id, turn_index, role, content, created_at) \
+                 SELECT ?, COALESCE(MAX(turn_index) + 1, 0), ?, ?, ? \
+                 FROM conversations WHERE session_id = ?",
+                [
+                    session_id.clone().into(),
+                    role.clone().into(),
+                    content.clone().into(),
+                    created_at.into(),
+                    session_id.clone().into(),
+                ],
+            ))
+            .await?;
+        if res.rows_affected() != 1 {
+            return Err(StorageError::Backend(
+                "conversation insert affected no rows".to_string(),
+            ));
+        }
+        let turn_index: i64 = match conversations::Entity::find()
+            .filter(conversations::Column::SessionId.eq(&session_id))
+            .order_by_desc(conversations::Column::TurnIndex)
+            .one(&self.db)
+            .await?
+        {
+            Some(m) => m.turn_index,
+            None => {
+                return Err(StorageError::Backend(
+                    "conversation insert succeeded but read-back found no turn".to_string(),
+                ))
+            }
+        };
+        Ok(Turn {
+            session_id,
+            turn_index,
+            role,
+            content,
+            created_at,
+        })
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<Vec<Turn>, StorageError> {
+        let models: Vec<conversations::Model> = conversations::Entity::find()
+            .filter(conversations::Column::SessionId.eq(session_id.trim()))
+            .order_by_asc(conversations::Column::TurnIndex)
+            .all(&self.db)
+            .await?;
+        Ok(models
+            .into_iter()
+            .map(|m| Turn {
+                session_id: m.session_id,
+                turn_index: m.turn_index,
+                role: m.role,
+                content: m.content,
+                created_at: m.created_at,
+            })
+            .collect())
+    }
+
+    async fn list_sessions(&self, prefix: Option<&str>) -> Result<Vec<String>, StorageError> {
+        // 用 substr 而不是 LIKE：session_id 允许 `_`，而它在 LIKE 里是单字符通配符
+        // （与交接列表的前缀过滤同一手法，见 [`SqliteHandoffRepo::list_latest`]）。
+        let mut sql =
+            String::from("SELECT session_id, MAX(created_at) AS last_at FROM conversations");
+        if prefix.is_some() {
+            sql.push_str(" WHERE substr(session_id, 1, length(?)) = ?");
+        }
+        sql.push_str(" GROUP BY session_id ORDER BY last_at DESC, session_id ASC");
+
+        let params: Vec<Value> = match prefix {
+            Some(p) => vec![p.to_string().into(), p.to_string().into()],
+            None => Vec::new(),
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                &sql,
+                params,
+            ))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.try_get::<String>("", "session_id").ok())
+            .collect())
+    }
+}
+
 /// SQLite 文件后端：按 project_id 换算出项目库路径。
 ///
 /// @intent `projects.db_path`（元库登记值）仅作记录，项目库位置以本后端推导结果为准，
@@ -967,7 +1095,8 @@ impl SqliteFileBackend {
             project_id: project_id.to_string(),
             backend: BackendKind::SqliteFile,
             memory: Arc::new(SqliteMemoryRepo { db: db.clone() }),
-            handoff: Arc::new(SqliteHandoffRepo { db }),
+            handoff: Arc::new(SqliteHandoffRepo { db: db.clone() }),
+            conversation: Arc::new(SqliteConversationRepo { db }),
         }
     }
 
@@ -1086,6 +1215,17 @@ mod tests {
         contract::run_handoff_contract(&*repos.handoff).await;
     }
 
+    /// 会话仓库必须与内存后端行为完全等价（C1–C6 各跑一遍）。
+    #[tokio::test]
+    async fn sqlite_file_satisfies_conversation_contract() {
+        let backend = SqliteFileBackend::new(temp_data_dir());
+        let repos = backend
+            .repositories_for("conversation-contract")
+            .await
+            .unwrap();
+        contract::run_conversation_contract(&*repos.conversation).await;
+    }
+
     /// 修订必须**物理留存且不可改写**；排序规则用可控的 `created_at` 钉死。
     ///
     /// @intent 契约层没有「读历史修订」的接口（产品上也不需要），因此「旧修订仍在」
@@ -1131,7 +1271,11 @@ mod tests {
             .map(|r| r.try_get::<String>("", "goal").unwrap())
             .collect();
         assert_eq!(revisions, vec![1, 2, 3], "三个修订必须同时留存（只追加）");
-        assert_eq!(goals, vec!["v1", "v2", "v3"], "旧修订内容不得被后续 save 改写");
+        assert_eq!(
+            goals,
+            vec!["v1", "v2", "v3"],
+            "旧修订内容不得被后续 save 改写"
+        );
 
         // 手工 created_at：o-2 与 o-3 同秒（比 task_id 升序），o-1 最旧（排最后）
         for (id, created_at) in [("o-2", 200_i64), ("o-1", 100), ("o-3", 200)] {
@@ -1194,11 +1338,7 @@ mod tests {
         }
 
         let graph = repo.read_graph().await.unwrap();
-        assert_eq!(
-            graph.entity_count(),
-            WRITERS,
-            "并发写入不得丢失任何实体"
-        );
+        assert_eq!(graph.entity_count(), WRITERS, "并发写入不得丢失任何实体");
     }
 
     /// 并发首次取用同一项目，必须只建立一个连接池。
@@ -1431,14 +1571,18 @@ mod tests {
         init_memory_db(&db).await.unwrap();
 
         let repo = SqliteMemoryRepo { db };
-        repo.create_entities(vec![EntityInput::new("legacy-e", "note").with_source("workbuddy")])
-            .await
-            .unwrap();
-        repo.add_observations(vec![
-            ObservationInput::new("legacy-e", vec!["带来源的事实".to_string()]).with_source("x"),
+        repo.create_entities(vec![
+            EntityInput::new("legacy-e", "note").with_source("workbuddy")
         ])
         .await
         .unwrap();
+        repo.add_observations(vec![ObservationInput::new(
+            "legacy-e",
+            vec!["带来源的事实".to_string()],
+        )
+        .with_source("x")])
+            .await
+            .unwrap();
 
         let graph = repo.read_graph().await.unwrap();
         assert_eq!(graph.entities[0].source, "workbuddy");
@@ -1524,8 +1668,23 @@ mod tests {
             .unwrap();
 
         for q in [
-            "\"", "*", "(", ")", "AND", "OR", "NOT", "NEAR", "^", ":", "a\"b", "'", "--", "50%",
-            "a_b", "\\", "记忆 OR 1=1",
+            "\"",
+            "*",
+            "(",
+            ")",
+            "AND",
+            "OR",
+            "NOT",
+            "NEAR",
+            "^",
+            ":",
+            "a\"b",
+            "'",
+            "--",
+            "50%",
+            "a_b",
+            "\\",
+            "记忆 OR 1=1",
         ] {
             assert!(repo.search_nodes(q).await.is_ok(), "查询 {q:?} 不应报错");
         }

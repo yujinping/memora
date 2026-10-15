@@ -186,6 +186,39 @@ pub mod memory {
 
         impl ActiveModelBehavior for ActiveModel {}
     }
+
+    /// 会话表 `conversations`（P5.1；主键为 `(session_id, turn_index)`，单项目库内无租户列）。
+    ///
+    /// @intent 逐轮 transcript 追加表：`turn_index` 由后端在会话内从 0 单调分配，
+    ///         无自增列——顺序即语义，任何排序都必须走主键序。
+    pub mod conversations {
+        use sea_orm::entity::prelude::*;
+
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+        #[sea_orm(table_name = "conversations")]
+        pub struct Model {
+            /// 会话标识（复合主键之一）
+            #[sea_orm(primary_key, column_type = "Text")]
+            pub session_id: String,
+            /// 轮次序号，会话内从 0 单调递增（复合主键之二）
+            #[sea_orm(primary_key, column_type = "BigInteger")]
+            pub turn_index: i64,
+            /// 说话角色：user / assistant / system
+            #[sea_orm(column_type = "Text")]
+            pub role: String,
+            /// 该轮正文
+            #[sea_orm(column_type = "Text")]
+            pub content: String,
+            /// 写入时间（Unix 秒）
+            #[sea_orm(column_type = "BigInteger")]
+            pub created_at: i64,
+        }
+
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+
+        impl ActiveModelBehavior for ActiveModel {}
+    }
 }
 /// 单库（单 SQLite 文件 + 租户列）实体：表结构与 [`memory`] 一致，仅多一列 `project_id`。
 ///
@@ -290,6 +323,42 @@ pub mod single {
             /// 写入来源标识，空串 = 未声明
             #[sea_orm(column_type = "Text", default_value = "")]
             pub source: String,
+        }
+
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+
+        impl ActiveModelBehavior for ActiveModel {}
+    }
+
+    /// 会话表 `conversations`（P5.1；主键为 `(project_id, session_id, turn_index)`）。
+    ///
+    /// @intent 列与 [`memory::conversations`] 一致，主键加租户维度：单库里不同项目
+    ///         可以有同名会话，轮次分配与拉取都必须带租户条件（见 `storage::sqlite_single`）。
+    pub mod conversations {
+        use sea_orm::entity::prelude::*;
+
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+        #[sea_orm(table_name = "conversations")]
+        pub struct Model {
+            /// 租户（项目）标识（复合主键之一）
+            #[sea_orm(primary_key, column_type = "Text")]
+            pub project_id: String,
+            /// 会话标识（复合主键之二）
+            #[sea_orm(primary_key, column_type = "Text")]
+            pub session_id: String,
+            /// 轮次序号，会话内从 0 单调递增（复合主键之三）
+            #[sea_orm(primary_key, column_type = "BigInteger")]
+            pub turn_index: i64,
+            /// 说话角色：user / assistant / system
+            #[sea_orm(column_type = "Text")]
+            pub role: String,
+            /// 该轮正文
+            #[sea_orm(column_type = "Text")]
+            pub content: String,
+            /// 写入时间（Unix 秒）
+            #[sea_orm(column_type = "BigInteger")]
+            pub created_at: i64,
         }
 
         #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -1,4 +1,5 @@
-//! MCP 工具层：把领域仓库暴露为 9 个标准记忆工具 + 4 个交接工具（Streamable HTTP 传输）。
+//! MCP 工具层：把领域仓库暴露为 9 个标准记忆工具 + 4 个交接工具 + 3 个会话工具
+//! （Streamable HTTP 传输）。
 //!
 //! @author yujinping
 //! @intent P3：以 rmcp（Rust MCP SDK）实现标准 MCP 服务端，语义对齐官方 MCP Memory，
@@ -15,14 +16,14 @@ pub use server::MemoraServer;
 
 use crate::config::Config;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
 /// 构造 `/mcp` 的 Streamable HTTP 服务。
 ///
 /// @intent 刻意选用**无状态**传输（`legacy_session_mode = false` + `json_response = true`），
 /// 理由有三：
-/// 1. 13 个工具都是「一问一答」，服务端无需向客户端推送，会话带来的只有状态与内存开销；
+/// 1. 16 个工具都是「一问一答」，服务端无需向客户端推送，会话带来的只有状态与内存开销；
 /// 2. 无会话即无「会话 id 被另一项目 token 复用」的越权面，隔离只由 token 决定；
 /// 3. 2GB 服务器的目标要求常驻内存尽量低，省略会话表是直接收益。
 ///

@@ -268,9 +268,18 @@ mod tests {
         assert!(constant_time_eq(b"", b""));
         assert!(constant_time_eq(b"admin-token", b"admin-token"));
 
-        assert!(!constant_time_eq(b"admin-token", b"admin-tokeN"), "末位差异");
-        assert!(!constant_time_eq(b"admin-token", b"Admin-token"), "首位差异");
-        assert!(!constant_time_eq(b"admin-token", b"admin-token "), "长度差异");
+        assert!(
+            !constant_time_eq(b"admin-token", b"admin-tokeN"),
+            "末位差异"
+        );
+        assert!(
+            !constant_time_eq(b"admin-token", b"Admin-token"),
+            "首位差异"
+        );
+        assert!(
+            !constant_time_eq(b"admin-token", b"admin-token "),
+            "长度差异"
+        );
         assert!(!constant_time_eq(b"short", b"longer-value"));
 
         // 全字节取值下的差异（含 0x00 与 0xff 的边界）

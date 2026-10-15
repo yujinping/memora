@@ -84,7 +84,9 @@ async fn ensure_backend_column(db: &DatabaseConnection) -> anyhow::Result<()> {
     if !has_backend {
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            format!("ALTER TABLE projects ADD COLUMN backend TEXT NOT NULL DEFAULT '{DEFAULT_BACKEND}'"),
+            format!(
+                "ALTER TABLE projects ADD COLUMN backend TEXT NOT NULL DEFAULT '{DEFAULT_BACKEND}'"
+            ),
         ))
         .await?;
     }
@@ -157,7 +159,9 @@ pub async fn find_project(
 ///         「确实删掉了」的区别（前者在管理面应报 404）。只删登记行，不动项目库文件——
 ///         物理数据的清理属存储后端的职责（`StorageBackend::drop_project`）。
 pub async fn delete_project(db: &DatabaseConnection, project_id: &str) -> anyhow::Result<bool> {
-    let result = Projects::delete_by_id(project_id.to_string()).exec(db).await?;
+    let result = Projects::delete_by_id(project_id.to_string())
+        .exec(db)
+        .await?;
     Ok(result.rows_affected > 0)
 }
 
@@ -182,11 +186,8 @@ mod tests {
     /// 临时元库。
     async fn temp_meta() -> DatabaseConnection {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!(
-            "memora_p2_meta_{}_{}.db",
-            std::process::id(),
-            n
-        ));
+        let path =
+            std::env::temp_dir().join(format!("memora_p2_meta_{}_{}.db", std::process::id(), n));
         let url = format!("sqlite://{}?mode=rwc", path.display());
         Database::connect(&url).await.unwrap()
     }
@@ -374,7 +375,10 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["keep".to_string()]);
         assert_eq!(
-            resolve_project_by_token(&db, "tk").await.unwrap().project_id,
+            resolve_project_by_token(&db, "tk")
+                .await
+                .unwrap()
+                .project_id,
             "keep"
         );
     }

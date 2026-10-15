@@ -346,7 +346,11 @@ fn send_signal(pid: i32, _signal: i32) -> io::Result<()> {
         ));
     }
     let handle = unsafe {
-        crate::process::OpenProcess(crate::process::PROCESS_TERMINATE, crate::process::FALSE, pid as u32)
+        crate::process::OpenProcess(
+            crate::process::PROCESS_TERMINATE,
+            crate::process::FALSE,
+            pid as u32,
+        )
     };
     if handle.is_null() {
         return Err(io::Error::last_os_error());

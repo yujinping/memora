@@ -184,7 +184,10 @@ impl fmt::Display for CliError {
                 write!(f, "`{flag}` is only valid with `handoff`")
             }
             CliError::TaskRequiredForRemove => {
-                write!(f, "`handoff rm` requires `--task <id>`: deletion must be explicit")
+                write!(
+                    f,
+                    "`handoff rm` requires `--task <id>`: deletion must be explicit"
+                )
             }
         }
     }
@@ -762,14 +765,20 @@ mod tests {
 
         let only_password = parse_args(&["--admin-password", "pw"]).unwrap();
         assert_eq!(only_password.overrides.admin_token, None);
-        assert_eq!(only_password.overrides.admin_password.as_deref(), Some("pw"));
+        assert_eq!(
+            only_password.overrides.admin_password.as_deref(),
+            Some("pw")
+        );
         assert_eq!(only_password.overrides.admin_password_hash, None);
 
         // `--admin-password-hash` 的取值必须原样保留：它本身含有 `$` 与 `,`，
         // 若被当作分隔符或需要转义，PHC 串就会在解析阶段被悄悄改坏。
         let phc = "$argon2id$v=19$m=19456,t=2,p=1$YWJjZGVmZ2hpamtsbW5vcA$aGFzaA";
         let only_hash = parse_args(&["--admin-password-hash", phc]).unwrap();
-        assert_eq!(only_hash.overrides.admin_password_hash.as_deref(), Some(phc));
+        assert_eq!(
+            only_hash.overrides.admin_password_hash.as_deref(),
+            Some(phc)
+        );
     }
 
     /// 帮助文本必须列出控制台相关选项与入口地址，否则用户无从知道它的存在。
@@ -804,8 +813,7 @@ mod tests {
             } else {
                 &["handoff", name]
             };
-            let cli = parse_args(args)
-                .unwrap_or_else(|e| panic!("`handoff {name}` 应被接受: {e}"));
+            let cli = parse_args(args).unwrap_or_else(|e| panic!("`handoff {name}` 应被接受: {e}"));
             assert_eq!(cli.command, Command::Handoff { action: expected });
         }
     }

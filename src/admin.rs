@@ -300,11 +300,7 @@ pub async fn project_stats(
         Ok(graph) => graph,
         Err(err) => return reply::internal_error(&err),
     };
-    let handoffs = match repos
-        .handoff
-        .list_handoffs(None, false, usize::MAX)
-        .await
-    {
+    let handoffs = match repos.handoff.list_handoffs(None, false, usize::MAX).await {
         Ok(items) => items.len(),
         Err(err) => return reply::internal_error(&err),
     };
@@ -442,7 +438,11 @@ pub async fn handoff_save(
         session_id: req.session_id,
     };
     match repos.handoff.save_handoff(input).await {
-        Ok(h) => (StatusCode::CREATED, Json(crate::mcp::tools::handoff_view(h))).into_response(),
+        Ok(h) => (
+            StatusCode::CREATED,
+            Json(crate::mcp::tools::handoff_view(h)),
+        )
+            .into_response(),
         Err(StorageError::InvalidInput(detail)) => reply::bad_request("invalid_input", &detail),
         Err(err) => reply::internal_error(&err),
     }
@@ -546,10 +546,9 @@ pub async fn handoff_get(
         Ok(crate::domain::HandoffResolution::Found(h)) => {
             Json(crate::mcp::tools::handoff_view(*h)).into_response()
         }
-        Ok(crate::domain::HandoffResolution::None) => reply::not_found(
-            "not_found",
-            &format!("handoff `{task_id}` not found"),
-        ),
+        Ok(crate::domain::HandoffResolution::None) => {
+            reply::not_found("not_found", &format!("handoff `{task_id}` not found"))
+        }
         // 显式 ID 不会产生歧义（歧义只发生在无 ID 解析）
         Ok(crate::domain::HandoffResolution::Ambiguous(_)) => {
             reply::internal_error(&"unreachable: explicit id resolved to ambiguous")
@@ -564,11 +563,7 @@ pub async fn handoff_get(
 /// @intent 与 `resolve_handoff` 同源：寻址规则只有一份实现。返回值按 resolution
 ///         分流——Found 200（回传 won 事实）、None 由调用方决定（204 或 404）、
 ///         Ambiguous 300 且 `won=false`（不产生任何副作用）。
-async fn ack_response(
-    repos: &ProjectRepos,
-    task_id: Option<&str>,
-    client: &str,
-) -> Response {
+async fn ack_response(repos: &ProjectRepos, task_id: Option<&str>, client: &str) -> Response {
     match repos.handoff.ack_handoff(task_id, client).await {
         Ok(outcome) => {
             let (status, handoff, candidates) =
@@ -595,7 +590,9 @@ async fn ack_response(
                 crate::mcp::dto::HandoffStatus::None => {
                     // 显式 ID 找不到任务是 404；零 ID 没有「当前待接手」是 204。
                     match task_id {
-                        Some(id) => reply::not_found("not_found", &format!("handoff `{id}` not found")),
+                        Some(id) => {
+                            reply::not_found("not_found", &format!("handoff `{id}` not found"))
+                        }
                         None => StatusCode::NO_CONTENT.into_response(),
                     }
                 }

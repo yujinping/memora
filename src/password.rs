@@ -245,7 +245,10 @@ mod tests {
             weak_password_reason("忆庐忆庐忆庐忆庐").is_none(),
             "8 个汉字应满足长度下限"
         );
-        assert!(weak_password_reason("忆庐").is_some(), "2 个汉字应被判为过短");
+        assert!(
+            weak_password_reason("忆庐").is_some(),
+            "2 个汉字应被判为过短"
+        );
     }
 
     /// 生成的口令必须落在字符集内、长度准确、且每次不同。
@@ -260,10 +263,7 @@ mod tests {
                 "出现字符集之外的字符：{pw}"
             );
             for ambiguous in ['0', 'O', 'o', '1', 'l', 'I'] {
-                assert!(
-                    !pw.contains(ambiguous),
-                    "不得含易混字符 {ambiguous}：{pw}"
-                );
+                assert!(!pw.contains(ambiguous), "不得含易混字符 {ambiguous}：{pw}");
             }
             assert!(
                 weak_password_reason(&pw).is_none(),

@@ -344,10 +344,7 @@ pub fn init(config: &Config, force: bool) -> Result<i32> {
         "  2. 后台常驻：{} start    （或使用下方 systemd unit）",
         exe.display()
     );
-    println!(
-        "  3. 打开控制台：http://localhost:{}/admin",
-        effective.port
-    );
+    println!("  3. 打开控制台：http://localhost:{}/admin", effective.port);
     println!();
     println!("{}", render_deploy_templates(&exe, &effective));
     Ok(0)

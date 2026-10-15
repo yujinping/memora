@@ -376,7 +376,10 @@ mod tests {
     #[test]
     fn cookie_value_parses_and_skips_malformed_segments() {
         let headers = headers_with(&[("cookie", "other=1; memora_session=abc123; theme=dark")]);
-        assert_eq!(cookie_value(&headers, COOKIE_NAME).as_deref(), Some("abc123"));
+        assert_eq!(
+            cookie_value(&headers, COOKIE_NAME).as_deref(),
+            Some("abc123")
+        );
 
         // 前后空白、多余分号、无值片段都不得影响目标项
         let messy = headers_with(&[("cookie", " ; ; memora_session = xyz ; ;; break")]);

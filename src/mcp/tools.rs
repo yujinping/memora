@@ -6,10 +6,12 @@
 //!         协议侧的宏、会话、HTTP 细节全部留在 `mcp::server`。
 //!         这也是 docs §12.5「handler 层对存储实现完全盲视」在 MCP 侧的落点。
 
-use crate::domain::{HandoffInput, HandoffResolution, EntityInput, ObservationInput, RelationInput};
+use crate::domain::{
+    EntityInput, HandoffInput, HandoffResolution, ObservationInput, RelationInput, SessionInput,
+};
 use crate::error::StorageError;
 use crate::mcp::dto::*;
-use crate::storage::{normalize, HandoffRepository, MemoryRepository};
+use crate::storage::{normalize, ConversationRepository, HandoffRepository, MemoryRepository};
 use rmcp::ErrorData;
 
 /// 官方对齐的记忆工具名（顺序即 `tools/list` 的稳定顺序）。
@@ -39,11 +41,17 @@ pub const HANDOFF_TOOL_NAMES: [&str; 4] = [
     "handoff_ack",
 ];
 
-/// 对外承诺的完整工具面 = 两个家族之和（供 `mcp::mod::assert_tool_manifest` 使用）。
+/// 会话工具名（P5.1）：细粒度逐轮 transcript 的读写。
 ///
-/// @intent 用**常量索引**拼出来而不是再抄一遍 13 个字符串：抄一遍就多一个漂移点，
+/// @intent 与 handoff 同一命名纪律——家族前缀 `session` 不需要，这三个名字本身就是
+///         「会话」语义；关键是与官方 9 工具的「动词_名词」分属不同语义域。
+pub const SESSION_TOOL_NAMES: [&str; 3] = ["log_turn", "get_session", "list_sessions"];
+
+/// 对外承诺的完整工具面 = 三个家族之和（供 `mcp::mod::assert_tool_manifest` 使用）。
+///
+/// @intent 用**常量索引**拼出来而不是再抄一遍 16 个字符串：抄一遍就多一个漂移点，
 ///         而漂移的后果是「启动自检通过、但清单与实际不符」——自检本身失去意义。
-pub const TOOL_NAMES: [&str; 13] = [
+pub const TOOL_NAMES: [&str; 16] = [
     MEMORY_TOOL_NAMES[0],
     MEMORY_TOOL_NAMES[1],
     MEMORY_TOOL_NAMES[2],
@@ -57,6 +65,9 @@ pub const TOOL_NAMES: [&str; 13] = [
     HANDOFF_TOOL_NAMES[1],
     HANDOFF_TOOL_NAMES[2],
     HANDOFF_TOOL_NAMES[3],
+    SESSION_TOOL_NAMES[0],
+    SESSION_TOOL_NAMES[1],
+    SESSION_TOOL_NAMES[2],
 ];
 
 /// 存储错误 → 工具错误。
@@ -487,6 +498,73 @@ pub async fn handoff_ack(
     })
 }
 
+// ---------------------------------------------------------------------------
+// 会话工具（P5.1，docs/memory-system-design.md §5.4）
+// ---------------------------------------------------------------------------
+
+/// `log_turn`：追加一轮对话，`turn_index` 由后端分配并回读。
+///
+/// @intent 细粒度 transcript 与 handoff（结论级摘要）互补：要把「完整对话原样带回」
+///         时用会话工具。回读 `turn_index` 是硬约定——调用方不数轮次。
+pub async fn log_turn(
+    repo: &dyn ConversationRepository,
+    req: LogTurnRequest,
+) -> Result<TurnView, ErrorData> {
+    let turn = repo
+        .append_turn(SessionInput {
+            session_id: req.session_id,
+            role: req.role,
+            content: req.content,
+        })
+        .await
+        .map_err(tool_error)?;
+    Ok(TurnView {
+        session_id: turn.session_id,
+        turn_index: turn.turn_index,
+        role: turn.role,
+        content: turn.content,
+        created_at: turn.created_at,
+    })
+}
+
+/// `get_session`：拉回完整 transcript（轮次升序）。
+///
+/// @intent 缺失会话返回空数组而非错误——「还没聊过」是正常状态，
+///         调用方无需为此分支重试或报错。
+pub async fn get_session(
+    repo: &dyn ConversationRepository,
+    req: GetSessionRequest,
+) -> Result<GetSessionResponse, ErrorData> {
+    let turns = repo
+        .get_session(&req.session_id)
+        .await
+        .map_err(tool_error)?;
+    Ok(GetSessionResponse {
+        turns: turns
+            .into_iter()
+            .map(|t| TurnView {
+                session_id: t.session_id,
+                turn_index: t.turn_index,
+                role: t.role,
+                content: t.content,
+                created_at: t.created_at,
+            })
+            .collect(),
+    })
+}
+
+/// `list_sessions`：列出会话标识（最近活跃降序），恢复方「先接最近的」。
+pub async fn list_sessions(
+    repo: &dyn ConversationRepository,
+    req: ListSessionsRequest,
+) -> Result<ListSessionsResponse, ErrorData> {
+    let sessions = repo
+        .list_sessions(req.prefix.as_deref())
+        .await
+        .map_err(tool_error)?;
+    Ok(ListSessionsResponse { sessions })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,7 +813,10 @@ mod tests {
         let r = &resp.relations[0];
         assert_eq!((r.from_name.as_str(), r.to_name.as_str()), ("a", "b"));
         assert_eq!(r.relation_type, "knows");
-        assert!(r.id > 0, "回读的关系必须带 id，否则无法调用 delete_relations");
+        assert!(
+            r.id > 0,
+            "回读的关系必须带 id，否则无法调用 delete_relations"
+        );
     }
 
     #[tokio::test]
@@ -842,7 +923,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let ids: Vec<i64> = added.entities[0].observations.iter().map(|o| o.id).collect();
+        let ids: Vec<i64> = added.entities[0]
+            .observations
+            .iter()
+            .map(|o| o.id)
+            .collect();
 
         let req = DeleteObservationsRequest {
             ids: vec![ids[0], ids[0], 999_999],
@@ -1111,12 +1196,9 @@ mod tests {
 
         let mut e = entity("src-e", "note");
         e.source = "workbuddy".to_string();
-        create_entities(
-            &*repo,
-            CreateEntitiesRequest { entities: vec![e] },
-        )
-        .await
-        .unwrap();
+        create_entities(&*repo, CreateEntitiesRequest { entities: vec![e] })
+            .await
+            .unwrap();
 
         let mut o = observation("src-e", &["来自 claude-code"]);
         o.source = "claude-code".to_string();
@@ -1131,12 +1213,9 @@ mod tests {
 
         let mut r = relation("src-e", "src-e", "self_ref");
         r.source = "cursor".to_string();
-        create_relations(
-            &*repo,
-            CreateRelationsRequest { relations: vec![r] },
-        )
-        .await
-        .unwrap();
+        create_relations(&*repo, CreateRelationsRequest { relations: vec![r] })
+            .await
+            .unwrap();
 
         let graph = read_graph(&*repo).await.unwrap();
         let e = &graph.entities[0];
@@ -1212,7 +1291,9 @@ mod tests {
     #[test]
     fn storage_errors_map_to_the_right_jsonrpc_codes() {
         assert_eq!(
-            tool_error(StorageError::InvalidInput("x".to_string())).code.0,
+            tool_error(StorageError::InvalidInput("x".to_string()))
+                .code
+                .0,
             INVALID_PARAMS
         );
         assert_eq!(
@@ -1243,15 +1324,15 @@ mod tests {
         assert!(MEMORY_TOOL_NAMES.contains(&"read_graph"));
     }
 
-    /// 两个家族无重名、合起来 13 个，且 `TOOL_NAMES` 确实是两者的并集。
+    /// 三个家族无重名、合起来 16 个，且 `TOOL_NAMES` 确实是三者的并集。
     ///
     /// @intent 这条钉住「对外承诺的工具面」本身：`assert_tool_manifest` 只比对清单与宏
     ///         实注册数，若清单自己漏了一族，自检会「一致地错」。
     #[test]
     fn tool_families_are_disjoint_and_cover_the_manifest() {
         let all: std::collections::HashSet<&&str> = TOOL_NAMES.iter().collect();
-        assert_eq!(TOOL_NAMES.len(), 13);
-        assert_eq!(all.len(), 13, "对外清单不得有重名");
+        assert_eq!(TOOL_NAMES.len(), 16);
+        assert_eq!(all.len(), 16, "对外清单不得有重名");
 
         for name in MEMORY_TOOL_NAMES {
             assert!(all.contains(&name), "记忆工具 {name} 不在对外清单里");
@@ -1264,6 +1345,10 @@ mod tests {
             );
         }
         assert_eq!(HANDOFF_TOOL_NAMES.len(), 4);
+        for name in SESSION_TOOL_NAMES {
+            assert!(all.contains(&name), "会话工具 {name} 不在对外清单里");
+        }
+        assert_eq!(SESSION_TOOL_NAMES.len(), 3);
     }
 
     // -----------------------------------------------------------------------
@@ -1274,7 +1359,9 @@ mod tests {
     #[tokio::test]
     async fn handoff_load_on_empty_repo_reports_none() {
         let repo = handoff_repo().await;
-        let res = handoff_load(&*repo, HandoffLoadRequest::default()).await.unwrap();
+        let res = handoff_load(&*repo, HandoffLoadRequest::default())
+            .await
+            .unwrap();
         assert_eq!(res.status, HandoffStatus::None);
         assert!(res.handoff.is_none());
         assert!(res.candidates.is_empty());
@@ -1302,9 +1389,13 @@ mod tests {
     #[tokio::test]
     async fn handoff_load_without_id_finds_the_only_pending() {
         let repo = handoff_repo().await;
-        handoff_save(&*repo, save_req("唯一的活", "进行中")).await.unwrap();
+        handoff_save(&*repo, save_req("唯一的活", "进行中"))
+            .await
+            .unwrap();
 
-        let res = handoff_load(&*repo, HandoffLoadRequest::default()).await.unwrap();
+        let res = handoff_load(&*repo, HandoffLoadRequest::default())
+            .await
+            .unwrap();
         assert_eq!(res.status, HandoffStatus::Found);
         let h = res.handoff.expect("found 必须带回完整记录");
         assert_eq!(h.goal, "唯一的活");
@@ -1323,7 +1414,9 @@ mod tests {
         handoff_save(&*repo, a).await.unwrap();
         handoff_save(&*repo, b).await.unwrap();
 
-        let res = handoff_load(&*repo, HandoffLoadRequest::default()).await.unwrap();
+        let res = handoff_load(&*repo, HandoffLoadRequest::default())
+            .await
+            .unwrap();
         assert_eq!(res.status, HandoffStatus::Ambiguous);
         assert!(res.handoff.is_none());
         let mut ids: Vec<String> = res.candidates.iter().map(|c| c.task_id.clone()).collect();
@@ -1417,13 +1510,142 @@ mod tests {
     #[tokio::test]
     async fn handoff_save_maps_invalid_input_to_invalid_params() {
         let repo = handoff_repo().await;
-        let err = handoff_save(&*repo, save_req("", "空目标")).await.unwrap_err();
+        let err = handoff_save(&*repo, save_req("", "空目标"))
+            .await
+            .unwrap_err();
         assert_eq!(err.code.0, INVALID_PARAMS);
 
         let mut bad_id = save_req("目标", "有进展");
         bad_id.task_id = Some("bad/id".to_string());
         let err = handoff_save(&*repo, bad_id).await.unwrap_err();
         assert_eq!(err.code.0, INVALID_PARAMS);
+    }
+
+    // -----------------------------------------------------------------------
+    // 会话工具（P5.1）
+    // -----------------------------------------------------------------------
+
+    /// 每个用例独立的会话仓库（同一后端，但走 `conversation` 字段）。
+    async fn conversation_repo() -> Arc<dyn ConversationRepository> {
+        InMemBackend::new()
+            .repositories_for("t")
+            .await
+            .unwrap()
+            .conversation
+    }
+
+    /// `log_turn` 回读必须带服务端分配的轮次序号；缺失会话拉回空 transcript。
+    #[tokio::test]
+    async fn log_turn_assigns_and_returns_turn_index() {
+        let repo = conversation_repo().await;
+        let t0 = log_turn(
+            &*repo,
+            LogTurnRequest {
+                session_id: "s-1".to_string(),
+                role: "user".to_string(),
+                content: "第一轮".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(t0.turn_index, 0, "首写必须分配 0");
+        let t1 = log_turn(
+            &*repo,
+            LogTurnRequest {
+                session_id: "s-1".to_string(),
+                role: "assistant".to_string(),
+                content: "第二轮".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(t1.turn_index, 1, "次写必须分配 1");
+
+        let got = get_session(
+            &*repo,
+            GetSessionRequest {
+                session_id: "s-1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.turns.len(), 2);
+        assert_eq!(got.turns[0].content, "第一轮");
+        assert_eq!(got.turns[1].role, "assistant");
+
+        let missing = get_session(
+            &*repo,
+            GetSessionRequest {
+                session_id: "s-nope".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            missing.turns.is_empty(),
+            "缺失会话 = 空 transcript，不是错误"
+        );
+    }
+
+    /// 非法入参（角色枚举外 / 空正文 / 非法 session_id）→ `-32602`。
+    #[tokio::test]
+    async fn log_turn_maps_invalid_input_to_invalid_params() {
+        let repo = conversation_repo().await;
+        for req in [
+            LogTurnRequest {
+                session_id: "s".to_string(),
+                role: "Tool".to_string(),
+                content: "x".to_string(),
+            },
+            LogTurnRequest {
+                session_id: "s".to_string(),
+                role: "user".to_string(),
+                content: "  ".to_string(),
+            },
+            LogTurnRequest {
+                session_id: "bad/id".to_string(),
+                role: "user".to_string(),
+                content: "x".to_string(),
+            },
+        ] {
+            let err = log_turn(&*repo, req).await.unwrap_err();
+            assert_eq!(err.code.0, INVALID_PARAMS);
+        }
+    }
+
+    /// list_sessions 返回最近活跃降序；get_session + list_sessions 组成恢复路径。
+    #[tokio::test]
+    async fn session_round_trip_via_list_and_get() {
+        let repo = conversation_repo().await;
+        for (sid, content) in [("s-a", "a1"), ("s-b", "b1"), ("s-a", "a2")] {
+            log_turn(
+                &*repo,
+                LogTurnRequest {
+                    session_id: sid.to_string(),
+                    role: "user".to_string(),
+                    content: content.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let listed = list_sessions(&*repo, ListSessionsRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            listed.sessions,
+            vec!["s-a".to_string(), "s-b".to_string()],
+            "a 有二轮（最近活跃）必须排前"
+        );
+        let filtered = list_sessions(
+            &*repo,
+            ListSessionsRequest {
+                prefix: Some("s-b".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(filtered.sessions, vec!["s-b".to_string()]);
     }
 
     // -----------------------------------------------------------------------
@@ -1498,7 +1720,9 @@ mod tests {
         .unwrap();
 
         // 接手方：零参数 load
-        let res = handoff_load(&*repo, HandoffLoadRequest::default()).await.unwrap();
+        let res = handoff_load(&*repo, HandoffLoadRequest::default())
+            .await
+            .unwrap();
         assert_eq!(res.status, HandoffStatus::Found);
         let h = res.handoff.expect("零 ID 主路径必须直接命中");
         let task_id = h.task_id; // ← 标识符唯一来源是工具出参
@@ -1529,7 +1753,9 @@ mod tests {
         handoff_save(&*repo, a).await.unwrap();
         handoff_save(&*repo, b).await.unwrap();
 
-        let res = handoff_load(&*repo, HandoffLoadRequest::default()).await.unwrap();
+        let res = handoff_load(&*repo, HandoffLoadRequest::default())
+            .await
+            .unwrap();
         assert_eq!(res.status, HandoffStatus::Ambiguous);
         assert!(res.handoff.is_none(), "歧义时绝不代选");
         let mut ids: Vec<String> = res.candidates.iter().map(|c| c.task_id.clone()).collect();

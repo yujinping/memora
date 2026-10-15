@@ -108,11 +108,16 @@ impl Endpoint {
                     format!("`--server {raw}`: invalid port `{port_raw}` (expected 1..=65535)")
                 })?;
                 if port == 0 {
-                    return Err(format!("`--server {raw}`: port 0 is not a valid server port"));
+                    return Err(format!(
+                        "`--server {raw}`: port 0 is not a valid server port"
+                    ));
                 }
                 (host.to_string(), port)
             }
-            _ => (authority.to_string(), scheme.default_port(default_http_port)),
+            _ => (
+                authority.to_string(),
+                scheme.default_port(default_http_port),
+            ),
         };
 
         Ok(Endpoint {
@@ -189,7 +194,10 @@ impl Client {
 
         let status = response.status().as_u16();
         let body = response.body_mut().read_to_string().map_err(|err| {
-            format!("reading response from {} failed: {err}", self.endpoint.base())
+            format!(
+                "reading response from {} failed: {err}",
+                self.endpoint.base()
+            )
         })?;
         Ok(Response { status, body })
     }
@@ -230,7 +238,10 @@ mod tests {
         let ep = Endpoint::parse("https://mem.example.com:8443/memora/", 6789).unwrap();
         assert_eq!(ep.port, 8443);
         assert_eq!(ep.prefix, "/memora", "尾斜杠应被剥掉");
-        assert_eq!(ep.url("/api/v1/projects"), "https://mem.example.com:8443/memora/api/v1/projects");
+        assert_eq!(
+            ep.url("/api/v1/projects"),
+            "https://mem.example.com:8443/memora/api/v1/projects"
+        );
     }
 
     #[test]
@@ -244,7 +255,10 @@ mod tests {
         // 缺 scheme 不猜：`--server mem.example.com` 被静默当 http 明文发公网是最坏结果
         assert!(Endpoint::parse("mem.example.com", 6789).is_err());
         assert!(Endpoint::parse("ftp://mem.example.com", 6789).is_err());
-        assert!(Endpoint::parse("https://", 6789).is_err(), "空 host 必须报错");
+        assert!(
+            Endpoint::parse("https://", 6789).is_err(),
+            "空 host 必须报错"
+        );
     }
 
     // ------------------------------------------------------ Client（真 socket）
@@ -253,7 +267,10 @@ mod tests {
     ///
     /// @intent 用真 socket 而不是 mock：被测的是「请求确实带上了 Authorization /
     ///         Content-Type、状态码与响应体原样透传」这一整条链路。
-    fn serve_once(status_line: &'static str, body: &'static str) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+    fn serve_once(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<Vec<u8>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
@@ -280,7 +297,11 @@ mod tests {
                     }
                 }
             }
-            let resp = format!("{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            let resp = format!(
+                "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
             std::io::Write::write_all(&mut stream, resp.as_bytes()).ok();
             buf
         });
@@ -292,14 +313,22 @@ mod tests {
         let (server, handle) = serve_once("HTTP/1.1 200 OK", r#"{"handoffs":[]}"#);
         let ep = Endpoint::parse(&server, 0).unwrap();
         let client = Client::new(ep.clone(), "tok-123".into(), Duration::from_secs(5));
-        let resp = client.send("GET", "/api/v1/projects/demo/handoffs", None).unwrap();
+        let resp = client
+            .send("GET", "/api/v1/projects/demo/handoffs", None)
+            .unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, r#"{"handoffs":[]}"#);
 
         let raw = String::from_utf8(handle.join().unwrap()).unwrap();
-        assert!(raw.starts_with("GET /api/v1/projects/demo/handoffs HTTP/1.1"), "请求行：{raw}");
+        assert!(
+            raw.starts_with("GET /api/v1/projects/demo/handoffs HTTP/1.1"),
+            "请求行：{raw}"
+        );
         // HTTP 头名不区分大小写（ureq 发小写头），断言须按小写比对
-        assert!(raw.to_lowercase().contains("authorization: bearer tok-123"), "请求头：{raw}");
+        assert!(
+            raw.to_lowercase().contains("authorization: bearer tok-123"),
+            "请求头：{raw}"
+        );
     }
 
     #[test]
@@ -308,13 +337,24 @@ mod tests {
         let ep = Endpoint::parse(&server, 0).unwrap();
         let client = Client::new(ep, "tok".into(), Duration::from_secs(5));
         let resp = client
-            .send("POST", "/api/v1/projects/demo/handoffs", Some(r#"{"goal":"g"}"#))
+            .send(
+                "POST",
+                "/api/v1/projects/demo/handoffs",
+                Some(r#"{"goal":"g"}"#),
+            )
             .unwrap();
         assert_eq!(resp.status, 201, "201 也属于正常返回");
 
         let raw = String::from_utf8(handle.join().unwrap()).unwrap();
-        assert!(raw.starts_with("POST /api/v1/projects/demo/handoffs HTTP/1.1"), "请求行：{raw}");
-        assert!(raw.to_lowercase().contains("content-type: application/json"), "请求头：{raw}");
+        assert!(
+            raw.starts_with("POST /api/v1/projects/demo/handoffs HTTP/1.1"),
+            "请求行：{raw}"
+        );
+        assert!(
+            raw.to_lowercase()
+                .contains("content-type: application/json"),
+            "请求头：{raw}"
+        );
         assert!(raw.contains(r#"{"goal":"g"}"#), "请求体：{raw}");
     }
 
@@ -327,7 +367,9 @@ mod tests {
         );
         let ep = Endpoint::parse(&server, 0).unwrap();
         let client = Client::new(ep, "tok".into(), Duration::from_secs(5));
-        let resp = client.send("GET", "/api/v1/projects/demo/handoffs/pending", None).unwrap();
+        let resp = client
+            .send("GET", "/api/v1/projects/demo/handoffs/pending", None)
+            .unwrap();
         assert_eq!(resp.status, 300);
         assert!(resp.body.contains("ambiguous"));
     }

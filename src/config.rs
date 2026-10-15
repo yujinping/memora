@@ -549,7 +549,8 @@ fn hash_checked_plain(plain: &str, source: &str) -> Result<String> {
     if let Some(reason) = password::weak_password_reason(plain) {
         bail!("{source} is not usable: {reason}");
     }
-    password::hash_password(plain).with_context(|| format!("cannot hash the password given by {source}"))
+    password::hash_password(plain)
+        .with_context(|| format!("cannot hash the password given by {source}"))
 }
 
 /// 解析日志级别：`RUST_LOG` > 文件 `log` > 默认值。
@@ -639,7 +640,10 @@ mod tests {
         assert_eq!(config.admin_user, "root");
         assert_eq!(config.admin_password_hash, phc);
         assert!(config.console_login_enabled());
-        assert!(password::verify_password("file-password", &config.admin_password_hash));
+        assert!(password::verify_password(
+            "file-password",
+            &config.admin_password_hash
+        ));
     }
 
     /// 未配置口令是一个**正常状态**，不是错误：只用 MCP / 脚本的用户无需口令，
@@ -683,18 +687,28 @@ mod tests {
         assert!(password::verify_password("from-flag", &all));
 
         // 2) flag 明文 > env 哈希串（flag 层整体高于 env 层）
-        let flag_plain_wins =
-            resolve_password_hash(None, Some("flag-plain"), Some(&env_phc), None, Some(&file_phc))
-                .unwrap();
+        let flag_plain_wins = resolve_password_hash(
+            None,
+            Some("flag-plain"),
+            Some(&env_phc),
+            None,
+            Some(&file_phc),
+        )
+        .unwrap();
         assert!(
             password::verify_password("flag-plain", &flag_plain_wins),
             "flag 层的明文口令应压过 env 层的哈希串"
         );
 
         // 3) env 哈希串 > env 明文
-        let env_hash_wins =
-            resolve_password_hash(None, None, Some(&env_phc), Some("env-plain"), Some(&file_phc))
-                .unwrap();
+        let env_hash_wins = resolve_password_hash(
+            None,
+            None,
+            Some(&env_phc),
+            Some("env-plain"),
+            Some(&file_phc),
+        )
+        .unwrap();
         assert!(password::verify_password("from-env", &env_hash_wins));
 
         // 4) env 明文 > 文件
@@ -787,18 +801,16 @@ mod tests {
         };
 
         let load = |overrides: &Overrides, env: &EnvVars| {
-            Config::load_with(
-                overrides,
-                Some(&path),
-                MissingPolicy::Reject,
-                env,
-            )
-            .unwrap()
-            .0
-            .admin_user
+            Config::load_with(overrides, Some(&path), MissingPolicy::Reject, env)
+                .unwrap()
+                .0
+                .admin_user
         };
 
-        assert_eq!(load(&Overrides::default(), &EnvVars::default()), "from-file");
+        assert_eq!(
+            load(&Overrides::default(), &EnvVars::default()),
+            "from-file"
+        );
         assert_eq!(load(&Overrides::default(), &env), "from-env");
 
         let with_flag = Overrides {

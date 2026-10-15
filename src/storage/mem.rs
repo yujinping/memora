@@ -7,11 +7,11 @@
 
 use crate::domain::{
     AckOutcome, Entity, EntityInput, Graph, Handoff, HandoffInput, HandoffResolution,
-    HandoffSummary, Observation, ObservationInput, Relation, RelationInput,
+    HandoffSummary, Observation, ObservationInput, Relation, RelationInput, SessionInput, Turn,
 };
 use crate::error::StorageError;
 use crate::storage::normalize;
-use crate::storage::repo::{HandoffRepository, MemoryRepository};
+use crate::storage::repo::{ConversationRepository, HandoffRepository, MemoryRepository};
 use crate::storage::{BackendKind, ProjectRepos, StorageBackend};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
@@ -227,7 +227,9 @@ impl MemoryRepository for InMemMemoryRepo {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 ];
-                terms.iter().all(|t| haystacks.iter().any(|h| h.contains(t)))
+                terms
+                    .iter()
+                    .all(|t| haystacks.iter().any(|h| h.contains(t)))
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -364,10 +366,7 @@ impl HandoffRepository for InMemHandoffRepo {
 
         let id = id.trim().to_string();
         let mut store = self.store.lock().unwrap();
-        let Some(latest) = store
-            .get_mut(&id)
-            .and_then(|revs| revs.last_mut())
-        else {
+        let Some(latest) = store.get_mut(&id).and_then(|revs| revs.last_mut()) else {
             return Ok(AckOutcome {
                 resolution: HandoffResolution::None,
                 won: false,
@@ -393,12 +392,69 @@ impl HandoffRepository for InMemHandoffRepo {
     }
 }
 
+/// 单项目的内存会话仓库（P5.1）。
+///
+/// @intent `BTreeMap<session_id, Vec<Turn>>`：按会话分桶、桶内即轮次序（下标 = turn_index）。
+///         与交接仓库同一把锁纪律——临界区内无 await，`std::sync::Mutex` 不跨 await 持有。
+pub struct InMemConversationRepo {
+    /// 项目会话状态
+    store: Mutex<BTreeMap<String, Vec<Turn>>>,
+}
+
+impl InMemConversationRepo {
+    /// 构造空仓库。
+    fn new() -> Self {
+        Self {
+            store: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ConversationRepository for InMemConversationRepo {
+    async fn append_turn(&self, input: SessionInput) -> Result<Turn, StorageError> {
+        // 先校验、再落库：非法轮次不产生半条记录（与交接 / 记忆写侧同规则）
+        let (session_id, role, content) = normalize::session_turn(&input)?;
+
+        let mut store = self.store.lock().unwrap();
+        let turns = store.entry(session_id.clone()).or_default();
+        let turn = Turn {
+            turn_index: turns.len() as i64,
+            session_id,
+            role,
+            content,
+            created_at: now(),
+        };
+        turns.push(turn.clone());
+        Ok(turn)
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<Vec<Turn>, StorageError> {
+        let store = self.store.lock().unwrap();
+        Ok(store.get(session_id.trim()).cloned().unwrap_or_default())
+    }
+
+    async fn list_sessions(&self, prefix: Option<&str>) -> Result<Vec<String>, StorageError> {
+        let store = self.store.lock().unwrap();
+        // 最近活跃 = 桶内最后一轮的 created_at；并列（同秒写完）按 session_id 升序
+        let mut items: Vec<(i64, &String)> = store
+            .iter()
+            .filter(|(sid, _)| prefix.is_none_or(|p| sid.starts_with(p)))
+            .map(|(sid, turns)| (turns.last().map_or(0, |t| t.created_at), sid))
+            .collect();
+        items.sort_by(|(ta, sa), (tb, sb)| tb.cmp(ta).then_with(|| sa.cmp(sb)));
+        Ok(items.into_iter().map(|(_, sid)| sid.clone()).collect())
+    }
+}
+
 /// 单项目的内存仓库集合（记忆 + 交接共享同一个项目条目，丢弃项目时一并消失）。
 struct InMemProject {
     /// 记忆仓库
     memory: Arc<InMemMemoryRepo>,
     /// 交接仓库
     handoff: Arc<InMemHandoffRepo>,
+    /// 会话仓库（P5.1）
+    conversation: Arc<InMemConversationRepo>,
 }
 
 /// 内存后端：按项目产出 `InMemMemoryRepo`，进程内不落盘。
@@ -438,6 +494,7 @@ impl StorageBackend for InMemBackend {
                     Arc::new(InMemProject {
                         memory: Arc::new(InMemMemoryRepo::new()),
                         handoff: Arc::new(InMemHandoffRepo::new()),
+                        conversation: Arc::new(InMemConversationRepo::new()),
                     })
                 })
                 .clone()
@@ -447,6 +504,7 @@ impl StorageBackend for InMemBackend {
             backend: BackendKind::InMem,
             memory: project.memory.clone(),
             handoff: project.handoff.clone(),
+            conversation: project.conversation.clone(),
         })
     }
 
@@ -490,6 +548,17 @@ mod tests {
         let backend = super::InMemBackend::new();
         let repos = backend.repositories_for("handoff-contract").await.unwrap();
         contract::run_handoff_contract(&*repos.handoff).await;
+    }
+
+    /// 会话仓库契约（P5.1）：与两个 SQLite 后端逐条一致。
+    #[tokio::test]
+    async fn in_mem_satisfies_conversation_contract() {
+        let backend = super::InMemBackend::new();
+        let repos = backend
+            .repositories_for("conversation-contract")
+            .await
+            .unwrap();
+        contract::run_conversation_contract(&*repos.conversation).await;
     }
 
     /// 不同项目必须互不可见。

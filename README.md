@@ -245,7 +245,7 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 
 ## MCP 工具
 
-13 个工具 = 9 个记忆工具（语义对齐官方 MCP Memory）+ 4 个交接工具（`handoff_*` 家族前缀，既有 9 个一个不改名）。**项目不在 URL 里**——由 `Authorization: Bearer <项目 token>` 解析出 `project_id`，从根上避免「路径与 token 指向不同项目」这类不一致。
+16 个工具 = 9 个记忆工具（语义对齐官方 MCP Memory）+ 4 个交接工具（`handoff_*` 家族前缀）+ 3 个会话工具（P5.1）。既有工具一个不改名。**项目不在 URL 里**——由 `Authorization: Bearer <项目 token>` 解析出 `project_id`，从根上避免「路径与 token 指向不同项目」这类不一致。
 
 | 工具 | 关键参数 | 行为 | 返回 |
 |---|---|---|---|
@@ -267,6 +267,14 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 | `handoff_load` | `task_id?` | 缺省取当前待接手的那条（唯一时直接命中，多条返回候选）；读取无副作用 | `{status: found/none/ambiguous, handoff?, candidates[]}` |
 | `handoff_list` | `unacked_only?=true, limit?=10, prefix?` | 列「有哪些活等着我」，摘要含 `goal / state_excerpt / client / session_id / 时间` | `{handoffs[]}` |
 | `handoff_ack` | `task_id?, client?` | 标记接手（CAS）；缺省接当前待接手那条；重复 ack 幂等不覆盖 | `{status, won, handoff?, candidates[]}` |
+
+**会话（session）家族**（P5.1）——细粒度逐轮 transcript，与交接（结论级摘要）互补；每轮 `turn_index` 由服务端分配并回读，**从不让客户端自己数轮次**：
+
+| 工具 | 关键参数 | 行为 | 返回 |
+|---|---|---|---|
+| `log_turn` | `session_id, role, content` | 追加一轮对话（`role` 必须是 `user` / `assistant` / `system`；首写即建会话） | 落库后的完整轮次 `{session_id, turn_index, role, content, created_at}` |
+| `get_session` | `session_id` | 拉回完整 transcript，按轮次升序；缺失会话返回空数组（正常返回，非错误） | `{turns[]}` |
+| `list_sessions` | `prefix?` | 列会话标识，按最近活跃降序（并列按标识升序） | `{sessions[]}` |
 
 **零 ID 主路径**：写入方不必给任务起名，接手方一个参数都不用传——`task_id` 只在工具结果里流转，**从不要求人输入**。多条待接手时服务端返回候选、绝不替调用方挑。交接规则随 `initialize` 的 `instructions` 连接即得（`HANDOFF RESUME` / `HANDOFF SAVE` 两段，措辞刻意零 ID）；可选的质量层见 `skills/memora-handoff/SKILL.md`（删掉它功能完全可用）。
 
@@ -345,7 +353,7 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
                            │
                   ┌────────┴────────┐
             MCP 工具层          REST 管理层
-      9 记忆 + 4 交接工具  项目增删 / 统计 / 全图 / 交接
+      9 记忆 + 4 交接 + 3 会话工具  项目增删 / 统计 / 全图 / 交接 / 会话
 ```
 
 **分层依赖单向，不得回指**：
@@ -369,7 +377,7 @@ mcp::dto 只被 tools 与 server 使用
 | `password.rs` | 口令哈希 / 校验 / 随机生成 | 只含哈希与口令，**不含任何 HTTP 概念**；随机量仍走系统熵，不引 rand 生态 |
 | `session.rs` | 内存会话表、Cookie 签发与解析、跨源判定 | 用内存表而非签名 Cookie：不必引入长期密钥；会话有效期**绝对**，不滑动 |
 | `admin.rs` | 项目生命周期 handler | 只经 `StorageRegistry` 取 trait 对象，不引用任何具体后端 |
-| `mcp/dto.rs` | 13 个工具的入参 / 出参契约（serde + JsonSchema） | 只描述协议，不含逻辑 |
+| `mcp/dto.rs` | 16 个工具的入参 / 出参契约（serde + JsonSchema） | 只描述协议，不含逻辑 |
 | `mcp/tools.rs` | 工具语义实现 | **只依赖 `Arc<dyn MemoryRepository>`**，可脱离 MCP 传输层用内存后端快速单测 |
 | `mcp/server.rs` | rmcp 宏装配 + 从请求上下文取仓库 | **唯一允许 `use rmcp` 的地方** |
 | `storage/` | Repository 契约 + 后端实现 | 方言差异锁死在各自 impl 内 |
@@ -498,7 +506,7 @@ SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目
 | P4.4 | 网页控制台：`/admin` 登录（Argon2id）+ 建项目 / 取 token / 浏览记忆 | ✅ |
 | P4.5 | 任务交接并入 memora：4 个 MCP 工具 + 7 个 REST 路由 + `handoff` CLI（设计见 `docs/handoff-integration-design.md`） | ✅ |
 | P6 | 第三后端 `sqlite_single`：单库 + `project_id` 租户列过滤（记忆 / 交接 / FTS 全租户化，契约 H1–H18 + bc_01–bc_07 全覆盖） | ✅ |
-| P5.1 | 会话表与跨机器会话恢复（`log_turn` / `get_session` / `list_sessions`） | 🔜 |
+| P5.1 | 会话表与跨机器会话恢复（`log_turn` / `get_session` / `list_sessions`，三后端契约 + MCP 协议端到端） | ✅ |
 | 后续 | 远程 embedding 语义检索、记忆版本与回滚、导入导出、控制台里改记忆 | 💡 |
 
 **非目标（首版范围外）**：内置大模型推理、复杂图谱推理 / 反思、多节点集群。

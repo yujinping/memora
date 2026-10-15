@@ -5,7 +5,7 @@
 //!          规则由两个后端共用，避免内存后端与 SQLite 后端的语义漂移
 //!          （行为等价是「换后端不改业务代码」的前提）。
 
-use crate::domain::{EntityInput, HandoffInput, ObservationInput, RelationInput};
+use crate::domain::{EntityInput, HandoffInput, ObservationInput, RelationInput, SessionInput};
 use crate::error::StorageError;
 
 /// 规范化单个实体：名称去空白后不得为空；类型为空则落为 `unknown`；来源仅去空白（可空）。
@@ -22,7 +22,11 @@ pub fn entity(input: &EntityInput) -> Result<(String, String, String), StorageEr
         "" => "unknown".to_string(),
         t => t.to_string(),
     };
-    Ok((name.to_string(), entity_type, input.source.trim().to_string()))
+    Ok((
+        name.to_string(),
+        entity_type,
+        input.source.trim().to_string(),
+    ))
 }
 
 /// 规范化实体批次。
@@ -35,11 +39,8 @@ pub fn relations(inputs: &[RelationInput]) -> Result<Vec<RelationKey>, StorageEr
     inputs
         .iter()
         .map(|r| {
-            let (from_name, to_name, relation_type) = (
-                r.from_name.trim(),
-                r.to_name.trim(),
-                r.relation_type.trim(),
-            );
+            let (from_name, to_name, relation_type) =
+                (r.from_name.trim(), r.to_name.trim(), r.relation_type.trim());
             if from_name.is_empty() || to_name.is_empty() || relation_type.is_empty() {
                 return Err(StorageError::InvalidInput(
                     "relation endpoints and type must be non-empty".to_string(),
@@ -201,7 +202,9 @@ pub fn handoff(input: &HandoffInput) -> Result<NormalizedHandoff, StorageError> 
 fn text_field(name: &str, raw: &str) -> Result<String, StorageError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(StorageError::InvalidInput(format!("{name} must be non-empty")));
+        return Err(StorageError::InvalidInput(format!(
+            "{name} must be non-empty"
+        )));
     }
     if trimmed.len() > HANDOFF_TEXT_MAX_BYTES {
         return Err(StorageError::InvalidInput(format!(
@@ -346,6 +349,78 @@ pub fn name_list(names: &[String]) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// 会话（P5.1，docs/memory-system-design.md §5.4 / §2 conversations 表）校验
+// ---------------------------------------------------------------------------
+
+/// 会话单轮正文上限。一轮对话可以比交接的结论字段长（它是过程记录，不是摘要），
+/// 但仍须有界：transcript 是整轮整轮读回的，无界正文会拖垮「拉回完整会话」。
+pub const SESSION_TEXT_MAX_BYTES: usize = 64 * 1024;
+
+/// 会话标识长度上限（字符）。
+pub const SESSION_ID_MAX_CHARS: usize = 128;
+
+/// 合法说话角色（docs §2 表注释：`'user' | 'assistant' | 'system'`）。
+///
+/// @intent 枚举在**校验层**定死而不是落在库层：role 拼错（如 `Assistant`）应当在
+///         写入前被拒绝，而不是落库后才在拉取 transcript 时冒出脏数据。
+pub const SESSION_ROLES: [&str; 3] = ["user", "assistant", "system"];
+
+/// 规范化一条会话轮次输入，返回 `(session_id, role, content)`（均已去首尾空白）。
+///
+/// @intent `session_id` 的字符集与 `task_id` 完全一致：两者都是「客户端生成、
+///         要放进 URL / 日志 / MCP 参数里的定位标识」，两套规则必然造成
+///         「这个名字 handoff 能用、会话不能用」的困惑。首写即建会话，
+///         不存在「会话必须先创建」的额外步骤。
+pub fn session_turn(input: &SessionInput) -> Result<(String, String, String), StorageError> {
+    let session_id = input.session_id.trim();
+    if session_id.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "session_id must be non-empty".to_string(),
+        ));
+    }
+    if session_id.chars().count() > SESSION_ID_MAX_CHARS {
+        return Err(StorageError::InvalidInput(format!(
+            "session_id must be at most {SESSION_ID_MAX_CHARS} characters"
+        )));
+    }
+    if let Some(bad) = session_id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-')))
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "session_id contains an unsupported character {bad:?}; allowed: A-Z a-z 0-9 . _ @ -"
+        )));
+    }
+
+    let role = input.role.trim();
+    if !SESSION_ROLES.contains(&role) {
+        return Err(StorageError::InvalidInput(format!(
+            "role must be one of {SESSION_ROLES:?}; got {:?}",
+            input.role
+        )));
+    }
+
+    let content = input.content.trim();
+    if content.is_empty() {
+        return Err(StorageError::InvalidInput(
+            "content must be non-empty; an empty turn conveys nothing worth resuming".to_string(),
+        ));
+    }
+    if content.len() > SESSION_TEXT_MAX_BYTES {
+        return Err(StorageError::InvalidInput(format!(
+            "content is {} bytes, over the {SESSION_TEXT_MAX_BYTES}-byte limit",
+            content.len()
+        )));
+    }
+
+    Ok((
+        session_id.to_string(),
+        role.to_string(),
+        content.to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,7 +456,12 @@ mod tests {
     fn relations_require_both_endpoints_and_type() {
         assert_eq!(
             relations(&[RelationInput::new(" a ", " b ", " knows ")]).unwrap(),
-            vec![("a".to_string(), "b".to_string(), "knows".to_string(), String::new())]
+            vec![(
+                "a".to_string(),
+                "b".to_string(),
+                "knows".to_string(),
+                String::new()
+            )]
         );
         assert!(relations(&[RelationInput::new("a", "", "knows")]).is_err());
         assert!(relations(&[RelationInput::new("a", "b", "  ")]).is_err());
@@ -416,7 +496,10 @@ mod tests {
             relations(&[RelationInput::new("a", "b", "knows").with_source(" cursor ")])
                 .unwrap()
                 .remove(0);
-        assert_eq!((from.as_str(), to.as_str(), rtype.as_str()), ("a", "b", "knows"));
+        assert_eq!(
+            (from.as_str(), to.as_str(), rtype.as_str()),
+            ("a", "b", "knows")
+        );
         assert_eq!(source, "cursor");
 
         let (_, contents, source) =
@@ -478,7 +561,9 @@ mod tests {
     #[test]
     fn handoff_accepts_explicit_task_id_with_dot_and_at() {
         assert_eq!(
-            handoff(&base().with_task("v1.2-api@refactor")).unwrap().task_id,
+            handoff(&base().with_task("v1.2-api@refactor"))
+                .unwrap()
+                .task_id,
             "v1.2-api@refactor"
         );
     }
@@ -553,12 +638,13 @@ mod tests {
     /// 数组保序且逐项去空白——接手方看到的顺序必须与写入方一致。
     #[test]
     fn handoff_preserves_item_order_and_trims_each() {
-        let n = handoff(&base().with_next_steps(vec![
-            " 第二步 ".to_string(),
-            "第一步".to_string(),
-        ]))
-        .unwrap();
-        assert_eq!(n.next_steps, vec!["第二步".to_string(), "第一步".to_string()]);
+        let n =
+            handoff(&base().with_next_steps(vec![" 第二步 ".to_string(), "第一步".to_string()]))
+                .unwrap();
+        assert_eq!(
+            n.next_steps,
+            vec!["第二步".to_string(), "第一步".to_string()]
+        );
     }
 
     /// 标识字段有界（它们不是正文，但不该无界）。

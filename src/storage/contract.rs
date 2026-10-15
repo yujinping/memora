@@ -8,9 +8,10 @@
 
 use crate::domain::{
     EntityInput, HandoffInput, HandoffResolution, HandoffSummary, ObservationInput, RelationInput,
+    SessionInput,
 };
 use crate::error::StorageError;
-use crate::storage::repo::{HandoffRepository, MemoryRepository};
+use crate::storage::repo::{ConversationRepository, HandoffRepository, MemoryRepository};
 use crate::storage::StorageBackend;
 
 /// 执行全部契约用例；任一断言失败即 panic（由调用方测试报告）。
@@ -154,12 +155,20 @@ async fn bc_06_handoffs_are_isolated_per_project(backend: &dyn StorageBackend) {
         .await
         .unwrap();
 
-    let a_list = a.handoff.list_handoffs(None, true, usize::MAX).await.unwrap();
+    let a_list = a
+        .handoff
+        .list_handoffs(None, true, usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(a_list.len(), 1, "A 项目应看到自己的交接");
     assert_eq!(a_list[0].task_id, saved.task_id);
 
     assert!(
-        b.handoff.list_handoffs(None, true, usize::MAX).await.unwrap().is_empty(),
+        b.handoff
+            .list_handoffs(None, true, usize::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
         "另一个项目不得看到本项目的交接"
     );
     assert_eq!(
@@ -168,7 +177,10 @@ async fn bc_06_handoffs_are_isolated_per_project(backend: &dyn StorageBackend) {
         "另一个项目的零 ID 解析必须是「没有待接手」"
     );
     assert_eq!(
-        b.handoff.resolve_handoff(Some("current@zed")).await.unwrap(),
+        b.handoff
+            .resolve_handoff(Some("current@zed"))
+            .await
+            .unwrap(),
         HandoffResolution::None,
         "即使知道 task_id，也不得跨项目读到别人的交接"
     );
@@ -231,8 +243,14 @@ async fn phase_02_create_entities_is_idempotent(repo: &dyn MemoryRepository) {
 
 async fn phase_03_invalid_inputs_are_rejected_atomically(repo: &dyn MemoryRepository) {
     // 空 / 纯空白实体名
-    assert_invalid_input(repo.create_entities(vec![EntityInput::new("", "person")]).await);
-    assert_invalid_input(repo.create_entities(vec![EntityInput::new("   ", "person")]).await);
+    assert_invalid_input(
+        repo.create_entities(vec![EntityInput::new("", "person")])
+            .await,
+    );
+    assert_invalid_input(
+        repo.create_entities(vec![EntityInput::new("   ", "person")])
+            .await,
+    );
 
     // 非法批次不得部分落库
     let err = repo
@@ -291,9 +309,15 @@ async fn phase_04_add_observations_appends(repo: &dyn MemoryRepository) {
         vec!["works at Acme", "偏好使用深色主题"],
         "观测应按写入顺序、按 id 升序返回"
     );
-    assert!(alice.observations[0].id < alice.observations[1].id, "观测 id 应递增");
     assert!(
-        alice.observations.iter().all(|o| o.entity_name == "c2-alice"),
+        alice.observations[0].id < alice.observations[1].id,
+        "观测 id 应递增"
+    );
+    assert!(
+        alice
+            .observations
+            .iter()
+            .all(|o| o.entity_name == "c2-alice"),
         "观测应归属正确实体"
     );
     assert!(alice.observations.iter().all(|o| o.created_at > 0));
@@ -414,7 +438,10 @@ async fn phase_08_open_nodes_filters_and_orders(repo: &dyn MemoryRepository) {
     );
 
     assert!(
-        repo.open_nodes(&["c8-ghost".to_string()]).await.unwrap().is_empty(),
+        repo.open_nodes(&["c8-ghost".to_string()])
+            .await
+            .unwrap()
+            .is_empty(),
         "未命中的名字应被跳过"
     );
 
@@ -480,10 +507,15 @@ async fn phase_10_delete_relations_by_id(repo: &dyn MemoryRepository) {
 }
 
 async fn phase_11_delete_entities_cascades(repo: &dyn MemoryRepository) {
-    repo.delete_entities(&["c2-acme".to_string()]).await.unwrap();
+    repo.delete_entities(&["c2-acme".to_string()])
+        .await
+        .unwrap();
 
     assert!(
-        repo.open_nodes(&["c2-acme".to_string()]).await.unwrap().is_empty(),
+        repo.open_nodes(&["c2-acme".to_string()])
+            .await
+            .unwrap()
+            .is_empty(),
         "实体应被删除"
     );
     assert!(
@@ -503,7 +535,10 @@ async fn phase_11_delete_entities_cascades(repo: &dyn MemoryRepository) {
         vec!["c2-alice", "c2-bob"],
         "其他实体不受影响"
     );
-    assert_eq!(contents(&open(repo, "c2-alice").await), vec!["偏好使用深色主题"]);
+    assert_eq!(
+        contents(&open(repo, "c2-alice").await),
+        vec!["偏好使用深色主题"]
+    );
     assert_eq!(
         sorted_names(&search(repo, "深色").await),
         vec!["c2-alice"],
@@ -512,7 +547,9 @@ async fn phase_11_delete_entities_cascades(repo: &dyn MemoryRepository) {
 }
 
 async fn phase_12_delete_is_idempotent(repo: &dyn MemoryRepository) {
-    repo.delete_entities(&["c12-ghost".to_string()]).await.unwrap();
+    repo.delete_entities(&["c12-ghost".to_string()])
+        .await
+        .unwrap();
 
     repo.delete_entities(&["c2-bob".to_string()]).await.unwrap();
     let g = graph(repo).await;
@@ -530,13 +567,17 @@ async fn phase_12_delete_is_idempotent(repo: &dyn MemoryRepository) {
 /// @intent 支撑「事后按客户端审计」：写侧三个工具均可携带来源，读侧三个模型必须原样带回；
 ///         未携带来源的写入落为空串，不得默认成别的值。
 async fn phase_13_sources_persist_and_round_trip(repo: &dyn MemoryRepository) {
-    repo.create_entities(vec![EntityInput::new("c13-src", "note").with_source("workbuddy")])
-        .await
-        .unwrap();
+    repo.create_entities(vec![
+        EntityInput::new("c13-src", "note").with_source("workbuddy")
+    ])
+    .await
+    .unwrap();
     // 同名重复创建不得覆盖首次登记的来源（与 entity_type 同规则）
-    repo.create_entities(vec![EntityInput::new("c13-src", "note").with_source("cursor")])
-        .await
-        .unwrap();
+    repo.create_entities(vec![
+        EntityInput::new("c13-src", "note").with_source("cursor")
+    ])
+    .await
+    .unwrap();
 
     repo.add_observations(vec![
         ObservationInput::new("c13-src", vec!["来自 claude-code 的事实".to_string()])
@@ -579,9 +620,11 @@ async fn phase_13_sources_persist_and_round_trip(repo: &dyn MemoryRepository) {
     assert_eq!(rel("refs"), "", "未携带来源的关系应落为空串");
 
     // 来源字段不得影响既有语义：重复三元组仍按三元组去重（来源不参与判重）
-    repo.create_relations(vec![RelationInput::new("c13-src", "c2-alice", "refs").with_source("x")])
-        .await
-        .unwrap();
+    repo.create_relations(vec![
+        RelationInput::new("c13-src", "c2-alice", "refs").with_source("x")
+    ])
+    .await
+    .unwrap();
     assert_eq!(
         graph(repo)
             .await
@@ -621,6 +664,260 @@ pub async fn run_handoff_contract(repo: &dyn HandoffRepository) {
     h16_save_resets_ack_state(repo).await;
     h17_delete_is_idempotent(repo).await;
     h18_invalid_input_is_atomic(repo).await;
+}
+
+// ---------------------------------------------------------------- 会话契约用例
+
+/// 执行会话仓库契约用例（每个后端各跑一遍，行为必须完全一致）。
+///
+/// @intent 会话的语义重心有两条：**轮次序号由后端分配**（单调、无空洞——调用方
+///         数出来的序号不可信）与**读路径永远成功**（缺失会话 = 空 transcript，
+///         与交接的「三种结果都是正常返回」同一哲学）。排序用例引入真实 sleep
+///         制造可区分的 `created_at`，是全契约唯一不靠平局裁决的排序断言。
+pub async fn run_conversation_contract(repo: &dyn ConversationRepository) {
+    c01_missing_session_is_an_empty_transcript(repo).await;
+    c02_turn_index_is_assigned_monotonically(repo).await;
+    c03_transcript_round_trips_in_order(repo).await;
+    c04_invalid_turns_are_rejected_atomically(repo).await;
+    c05_sessions_do_not_bleed_into_each_other(repo).await;
+    c06_list_orders_by_recency_and_filters_by_prefix(repo).await;
+}
+
+/// C1：从未写入的会话 = 空 transcript（正常返回），且不出现在列表里。
+async fn c01_missing_session_is_an_empty_transcript(repo: &dyn ConversationRepository) {
+    assert!(
+        repo.get_session("conv-missing").await.unwrap().is_empty(),
+        "缺失会话必须给出空 transcript，而不是报错"
+    );
+    let sessions = repo.list_sessions(None).await.unwrap();
+    assert!(
+        !sessions.contains(&"conv-missing".to_string()),
+        "没有任何轮次的会话不得出现在列表里"
+    );
+}
+
+/// C2：连续追加的轮次必须由后端分配出 `0,1,2,…` 的序号，回读带定位信息。
+async fn c02_turn_index_is_assigned_monotonically(repo: &dyn ConversationRepository) {
+    let session = "conv-mono";
+    let mut indices = Vec::new();
+    for i in 0..3 {
+        let turn = repo
+            .append_turn(SessionInput {
+                session_id: session.to_string(),
+                role: "user".to_string(),
+                content: format!("第 {i} 轮"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(turn.session_id, session, "回读必须带会话标识");
+        assert_eq!(turn.content, format!("第 {i} 轮"), "回读必须带正文");
+        assert!(turn.created_at > 0, "回读必须带写入时间");
+        indices.push(turn.turn_index);
+    }
+    assert_eq!(
+        indices,
+        vec![0, 1, 2],
+        "轮次序号必须从 0 起单调递增、无空洞"
+    );
+}
+
+/// C3：transcript 拉回必须与写入序列逐字一致、按轮次升序（role / content / index）。
+async fn c03_transcript_round_trips_in_order(repo: &dyn ConversationRepository) {
+    let session = "conv-mix";
+    let script = [
+        ("user", "问题 A"),
+        ("assistant", "回答 A"),
+        ("system", "提示"),
+        ("user", "追问 A"),
+    ];
+    for (role, content) in script {
+        repo.append_turn(SessionInput {
+            session_id: session.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+        })
+        .await
+        .unwrap();
+    }
+    let turns = repo.get_session(session).await.unwrap();
+    let got: Vec<(i64, &str, &str)> = turns
+        .iter()
+        .map(|t| (t.turn_index, t.role.as_str(), t.content.as_str()))
+        .collect();
+    let want: Vec<(i64, &str, &str)> = script
+        .iter()
+        .enumerate()
+        .map(|(i, (r, c))| (i as i64, *r, *c))
+        .collect();
+    assert_eq!(got, want, "transcript 必须按轮次升序逐字还原");
+    let stamps: Vec<i64> = turns.iter().map(|t| t.created_at).collect();
+    let mut sorted = stamps.clone();
+    sorted.sort_unstable();
+    assert_eq!(stamps, sorted, "同会话内写入时间不得倒退");
+}
+
+/// C4：非法轮次整批拒绝（写入前拦截），且不留下半条记录。
+async fn c04_invalid_turns_are_rejected_atomically(repo: &dyn ConversationRepository) {
+    let session = "conv-atomic";
+    repo.append_turn(SessionInput {
+        session_id: session.to_string(),
+        role: "user".to_string(),
+        content: "合法基线".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let oversized = "x".repeat(crate::storage::normalize::SESSION_TEXT_MAX_BYTES + 1);
+    let bad_inputs: Vec<(&str, SessionInput)> = vec![
+        (
+            "未知角色",
+            SessionInput {
+                session_id: session.to_string(),
+                role: "Tool".to_string(),
+                content: "内容".to_string(),
+            },
+        ),
+        (
+            "空角色",
+            SessionInput {
+                session_id: session.to_string(),
+                role: "  ".to_string(),
+                content: "内容".to_string(),
+            },
+        ),
+        (
+            "空正文",
+            SessionInput {
+                session_id: session.to_string(),
+                role: "user".to_string(),
+                content: "   ".to_string(),
+            },
+        ),
+        (
+            "空会话标识",
+            SessionInput {
+                session_id: "  ".to_string(),
+                role: "user".to_string(),
+                content: "内容".to_string(),
+            },
+        ),
+        (
+            "非法会话标识字符",
+            SessionInput {
+                session_id: "bad/id".to_string(),
+                role: "user".to_string(),
+                content: "内容".to_string(),
+            },
+        ),
+        (
+            "超长正文",
+            SessionInput {
+                session_id: session.to_string(),
+                role: "user".to_string(),
+                content: oversized,
+            },
+        ),
+    ];
+    for (label, input) in &bad_inputs {
+        let err = repo.append_turn(input.clone()).await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::InvalidInput(_)),
+            "{label} 必须判为调用方输入错误（-32602 一侧），实际：{err:?}"
+        );
+    }
+
+    let turns = repo.get_session(session).await.unwrap();
+    assert_eq!(
+        turns.len(),
+        1,
+        "被拒绝的轮次不得落库（原子性）：合法基线之外一个都不留"
+    );
+}
+
+/// C5：两个会话交错写入，transcript 互不渗漏。
+async fn c05_sessions_do_not_bleed_into_each_other(repo: &dyn ConversationRepository) {
+    let (a, b) = ("conv-iso-a", "conv-iso-b");
+    for (session, content) in [
+        (a, "甲-1"),
+        (b, "乙-1"),
+        (a, "甲-2"),
+        (b, "乙-2"),
+        (a, "甲-3"),
+    ] {
+        repo.append_turn(SessionInput {
+            session_id: session.to_string(),
+            role: "user".to_string(),
+            content: content.to_string(),
+        })
+        .await
+        .unwrap();
+    }
+    let turns_a = repo.get_session(a).await.unwrap();
+    let turns_b = repo.get_session(b).await.unwrap();
+    let contents_a: Vec<&str> = turns_a.iter().map(|t| t.content.as_str()).collect();
+    let contents_b: Vec<&str> = turns_b.iter().map(|t| t.content.as_str()).collect();
+    assert_eq!(
+        contents_a,
+        vec!["甲-1", "甲-2", "甲-3"],
+        "会话 A 的 transcript"
+    );
+    assert_eq!(contents_b, vec!["乙-1", "乙-2"], "会话 B 的 transcript");
+}
+
+/// C6：列表按最近活跃降序；前缀过滤不改相对顺序；无命中返回空。
+async fn c06_list_orders_by_recency_and_filters_by_prefix(repo: &dyn ConversationRepository) {
+    // 写入顺序：b → (sleep) → a 第一轮 → (sleep) → a 第二轮，
+    // 使 a 的最近活跃时间严格晚于 b（契约中唯一的真实等待）。
+    repo.append_turn(SessionInput {
+        session_id: "conv-rec-b".to_string(),
+        role: "user".to_string(),
+        content: "b 先写".to_string(),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    repo.append_turn(SessionInput {
+        session_id: "conv-rec-a".to_string(),
+        role: "user".to_string(),
+        content: "a 第一轮".to_string(),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    repo.append_turn(SessionInput {
+        session_id: "conv-rec-a".to_string(),
+        role: "assistant".to_string(),
+        content: "a 第二轮（使其成为最近活跃）".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let all = repo.list_sessions(None).await.unwrap();
+    assert_eq!(
+        all.first(),
+        Some(&"conv-rec-a".to_string()),
+        "最近活跃的会话必须排最前；实际：{all:?}"
+    );
+    let pos_a = all.iter().position(|s| s == "conv-rec-a").unwrap();
+    let pos_b = all.iter().position(|s| s == "conv-rec-b").unwrap();
+    assert!(
+        pos_a < pos_b,
+        "同一批会话里最近活跃的 a 必须排在 b 之前；实际：{all:?}"
+    );
+
+    let filtered = repo.list_sessions(Some("conv-rec")).await.unwrap();
+    assert_eq!(
+        filtered,
+        vec!["conv-rec-a".to_string(), "conv-rec-b".to_string()],
+        "前缀过滤必须保留最近活跃降序"
+    );
+    assert!(
+        repo.list_sessions(Some("conv-nope-"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "前缀无命中应返回空列表"
+    );
 }
 
 /// H1：空仓库上「查不到」是**正常返回**，不是错误。
@@ -684,7 +981,10 @@ async fn h02_first_save_lands_in_sharded_slot(repo: &dyn HandoffRepository) {
     // 夹具收尾：empty-arrays 只是「空数组回读」的验证品，必须显式接手，
     // 否则它会一直留在待接手集合里，破坏 H4「唯一待接手」与 H5「ack(None)
     // 命中 current@zed」的前提（各 H 阶段共享同一 repo，状态会向后泄漏）。
-    let acked = repo.ack_handoff(Some("empty-arrays"), "contract").await.unwrap();
+    let acked = repo
+        .ack_handoff(Some("empty-arrays"), "contract")
+        .await
+        .unwrap();
     assert!(acked.won, "夹具接手应当抢到");
 }
 
@@ -819,7 +1119,12 @@ async fn h08_writers_do_not_shadow_each_other(repo: &dyn HandoffRepository) {
         "workbuddy 的首次 save 不得变成 zed 槽位的下一个修订"
     );
     assert_eq!(
-        expect_found(repo.resolve_handoff(Some("current@workbuddy")).await.unwrap()).goal,
+        expect_found(
+            repo.resolve_handoff(Some("current@workbuddy"))
+                .await
+                .unwrap()
+        )
+        .goal,
         "workbuddy 的活",
         "workbuddy 槽位里必须是它自己的内容"
     );
@@ -850,11 +1155,18 @@ async fn h09_list_semantics(repo: &dyn HandoffRepository) {
     let all = repo.list_handoffs(None, false, usize::MAX).await.unwrap();
     let mut seen = std::collections::HashSet::new();
     for s in &all {
-        assert!(seen.insert(s.task_id.clone()), "任务 {} 在列表里重复出现", s.task_id);
+        assert!(
+            seen.insert(s.task_id.clone()),
+            "任务 {} 在列表里重复出现",
+            s.task_id
+        );
     }
     assert_ordering(&all);
 
-    let gamma = all.iter().find(|s| s.task_id == "gamma").expect("gamma 应在列表里");
+    let gamma = all
+        .iter()
+        .find(|s| s.task_id == "gamma")
+        .expect("gamma 应在列表里");
     assert!(gamma.acked, "已接手的条目在 all 列表里应标记 acked");
     assert_eq!(gamma.acked_by, "cursor", "acked_by 应反映接手方");
 
@@ -882,11 +1194,17 @@ async fn h10_list_summary_is_recognizable(repo: &dyn HandoffRepository) {
     .await
     .unwrap();
 
-    let listed = repo.list_handoffs(Some("excerpt"), true, usize::MAX).await.unwrap();
+    let listed = repo
+        .list_handoffs(Some("excerpt"), true, usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(listed.len(), 1);
     let s = &listed[0];
     assert_eq!(s.goal, "摘要可辨认性");
-    assert_eq!(s.session_id, "A1", "会话标签必须进摘要（它是人认得出的那一列）");
+    assert_eq!(
+        s.session_id, "A1",
+        "会话标签必须进摘要（它是人认得出的那一列）"
+    );
     assert_eq!(s.client, "zed");
     assert_eq!(s.next_step_count, 3);
     assert!(s.created_at > 0);
@@ -919,7 +1237,10 @@ async fn h11_list_truncates_after_ordering(repo: &dyn HandoffRepository) {
             .unwrap();
     }
 
-    let full = repo.list_handoffs(Some("lim-"), true, usize::MAX).await.unwrap();
+    let full = repo
+        .list_handoffs(Some("lim-"), true, usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(full.len(), 6);
     assert_ordering(&full);
 
@@ -932,25 +1253,41 @@ async fn h11_list_truncates_after_ordering(repo: &dyn HandoffRepository) {
     );
 
     assert!(
-        repo.list_handoffs(Some("lim-"), true, 0).await.unwrap().is_empty(),
+        repo.list_handoffs(Some("lim-"), true, 0)
+            .await
+            .unwrap()
+            .is_empty(),
         "limit=0 必须返回空集（而不是被当作「不限」）"
     );
 }
 
 /// H12：前缀过滤只影响「选哪些任务」，不影响排序与 limit 口径。
 async fn h12_list_prefix_filters_without_changing_order(repo: &dyn HandoffRepository) {
-    let lim = repo.list_handoffs(Some("lim-"), false, usize::MAX).await.unwrap();
+    let lim = repo
+        .list_handoffs(Some("lim-"), false, usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(lim.len(), 6, "前缀应恰好选中 6 条");
     assert!(lim.iter().all(|s| s.task_id.starts_with("lim-")));
 
-    let none = repo.list_handoffs(Some("nope-"), false, usize::MAX).await.unwrap();
+    let none = repo
+        .list_handoffs(Some("nope-"), false, usize::MAX)
+        .await
+        .unwrap();
     assert!(none.is_empty(), "无匹配前缀应返回空集");
 
     let two = repo.list_handoffs(Some("lim-"), false, 2).await.unwrap();
-    assert_eq!(ids(&two), ids(&lim[..2]), "前缀过滤后 limit 仍截断在排序之后");
+    assert_eq!(
+        ids(&two),
+        ids(&lim[..2]),
+        "前缀过滤后 limit 仍截断在排序之后"
+    );
 
     // 空前缀行为等同不过滤
-    let all_empty_prefix = repo.list_handoffs(Some(""), false, usize::MAX).await.unwrap();
+    let all_empty_prefix = repo
+        .list_handoffs(Some(""), false, usize::MAX)
+        .await
+        .unwrap();
     let all = repo.list_handoffs(None, false, usize::MAX).await.unwrap();
     assert_eq!(ids(&all_empty_prefix), ids(&all));
 }
@@ -1032,7 +1369,10 @@ async fn h17_delete_is_idempotent(repo: &dyn HandoffRepository) {
         HandoffResolution::None
     );
     assert!(
-        repo.list_handoffs(Some("ack-1"), false, usize::MAX).await.unwrap().is_empty(),
+        repo.list_handoffs(Some("ack-1"), false, usize::MAX)
+            .await
+            .unwrap()
+            .is_empty(),
         "删除后不得再出现在列表里"
     );
     repo.delete_handoff("ack-1").await.unwrap();
@@ -1084,8 +1424,8 @@ async fn h18_invalid_input_is_atomic(repo: &dyn HandoffRepository) {
 fn assert_ordering(items: &[HandoffSummary]) {
     for pair in items.windows(2) {
         let (a, b) = (&pair[0], &pair[1]);
-        let ok = a.created_at > b.created_at
-            || (a.created_at == b.created_at && a.task_id < b.task_id);
+        let ok =
+            a.created_at > b.created_at || (a.created_at == b.created_at && a.task_id < b.task_id);
         assert!(
             ok,
             "排序应为 created_at 降序、同秒 task_id 升序，但 {} (t={}) 排在 {} (t={}) 之前",

@@ -20,11 +20,8 @@ pub type Handle = *mut c_void;
 #[link(name = "kernel32")]
 extern "system" {
     /// 按 pid 打开进程句柄；失败返回 NULL。
-    pub fn OpenProcess(
-        dw_desired_access: u32,
-        b_inherit_handle: i32,
-        dw_process_id: u32,
-    ) -> Handle;
+    pub fn OpenProcess(dw_desired_access: u32, b_inherit_handle: i32, dw_process_id: u32)
+        -> Handle;
     /// 终止进程。
     pub fn TerminateProcess(h_process: Handle, u_exit_code: u32) -> i32;
     /// 读取进程退出码；进程存活时为 STILL_ACTIVE。

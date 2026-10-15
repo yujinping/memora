@@ -19,12 +19,12 @@
 
 use crate::domain::{
     AckOutcome, Entity, EntityInput, Graph, Handoff, HandoffInput, HandoffResolution,
-    HandoffSummary, Observation, ObservationInput, Relation, RelationInput,
+    HandoffSummary, Observation, ObservationInput, Relation, RelationInput, SessionInput, Turn,
 };
-use crate::entity::single::{entities, handoffs, observations, relations};
+use crate::entity::single::{conversations, entities, handoffs, observations, relations};
 use crate::error::StorageError;
 use crate::storage::normalize;
-use crate::storage::repo::{HandoffRepository, MemoryRepository};
+use crate::storage::repo::{ConversationRepository, HandoffRepository, MemoryRepository};
 use crate::storage::{BackendKind, ProjectRepos, StorageBackend};
 use async_trait::async_trait;
 use sea_orm::ActiveValue::Set;
@@ -101,6 +101,18 @@ const SINGLE_SCHEMA: &[&str] = &[
     // 「每任务只取最新修订」是 list / resolve 的共同形态，故索引按 (project_id, task_id, revision DESC)
     "CREATE INDEX IF NOT EXISTS idx_handoffs_tenant_task \
         ON handoffs(project_id, task_id, revision DESC)",
+    // --- P5.1 会话：逐轮 transcript 追加表，主键含租户维度 ---
+    "CREATE TABLE IF NOT EXISTS conversations (\
+        project_id TEXT NOT NULL, \
+        session_id TEXT NOT NULL, \
+        turn_index INTEGER NOT NULL, \
+        role TEXT NOT NULL, \
+        content TEXT NOT NULL, \
+        created_at INTEGER NOT NULL, \
+        PRIMARY KEY (project_id, session_id, turn_index)\
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_conversations_tenant_session \
+        ON conversations(project_id, session_id, created_at)",
 ];
 
 /// 检索索引中「实体占位行」的 `obs_id` 取值（真实观测 id 自增，从 1 开始）。
@@ -313,13 +325,16 @@ impl SqliteSingleMemoryRepo {
 
         let mut grouped: HashMap<String, Vec<Observation>> = HashMap::new();
         for o in observation_rows {
-            grouped.entry(o.entity_name.clone()).or_default().push(Observation {
-                id: o.id,
-                entity_name: o.entity_name,
-                content: o.content,
-                created_at: o.created_at,
-                source: o.source,
-            });
+            grouped
+                .entry(o.entity_name.clone())
+                .or_default()
+                .push(Observation {
+                    id: o.id,
+                    entity_name: o.entity_name,
+                    content: o.content,
+                    created_at: o.created_at,
+                    source: o.source,
+                });
         }
 
         Ok(entity_rows
@@ -337,10 +352,8 @@ impl SqliteSingleMemoryRepo {
     /// 按给定名字顺序排列实体（保持检索相关度序）。
     async fn fetch_ordered(&self, ordered_names: &[String]) -> Result<Vec<Entity>, StorageError> {
         let mut loaded = self.fetch_entities(ordered_names).await?;
-        let mut index: HashMap<String, Entity> = loaded
-            .drain(..)
-            .map(|e| (e.name.clone(), e))
-            .collect();
+        let mut index: HashMap<String, Entity> =
+            loaded.drain(..).map(|e| (e.name.clone(), e)).collect();
         Ok(ordered_names
             .iter()
             .filter_map(|n| index.remove(n))
@@ -537,7 +550,10 @@ impl MemoryRepository for SqliteSingleMemoryRepo {
         Self::finish(txn, result).await
     }
 
-    async fn create_relations(&self, relation_inputs: Vec<RelationInput>) -> Result<(), StorageError> {
+    async fn create_relations(
+        &self,
+        relation_inputs: Vec<RelationInput>,
+    ) -> Result<(), StorageError> {
         let normalized = normalize::relations(&relation_inputs)?;
         if normalized.is_empty() {
             return Ok(());
@@ -607,13 +623,16 @@ impl MemoryRepository for SqliteSingleMemoryRepo {
 
         let mut grouped: HashMap<String, Vec<Observation>> = HashMap::new();
         for o in observation_rows {
-            grouped.entry(o.entity_name.clone()).or_default().push(Observation {
-                id: o.id,
-                entity_name: o.entity_name,
-                content: o.content,
-                created_at: o.created_at,
-                source: o.source,
-            });
+            grouped
+                .entry(o.entity_name.clone())
+                .or_default()
+                .push(Observation {
+                    id: o.id,
+                    entity_name: o.entity_name,
+                    content: o.content,
+                    created_at: o.created_at,
+                    source: o.source,
+                });
         }
 
         Ok(Graph {
@@ -938,10 +957,128 @@ impl HandoffRepository for SqliteSingleHandoffRepo {
             .execute(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "DELETE FROM handoffs WHERE project_id = ? AND task_id = ?",
-                [self.project_id.clone().into(), task_id.trim().to_string().into()],
+                [
+                    self.project_id.clone().into(),
+                    task_id.trim().to_string().into(),
+                ],
             ))
             .await?;
         Ok(())
+    }
+}
+
+/// 单租户视图下的会话仓库（P5.1；与记忆 / 交接仓库共享同一个连接池）。
+///
+/// @intent 与文件后端同一套轮次分配手法（单条 `INSERT … SELECT MAX+1`），但**每个
+///         SQL 都带租户条件**：轮次上限的 MAX 只统计本项目的行——否则项目 A 的
+///         会话会把项目 B 的轮次序号顶起来；列表同样只看本租户。
+pub struct SqliteSingleConversationRepo {
+    /// 所属项目（租户）
+    project_id: String,
+    /// 共享库连接
+    db: DatabaseConnection,
+}
+
+#[async_trait]
+impl ConversationRepository for SqliteSingleConversationRepo {
+    async fn append_turn(&self, input: SessionInput) -> Result<Turn, StorageError> {
+        let (session_id, role, content) = normalize::session_turn(&input)?;
+        let created_at = now();
+
+        let res = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO conversations (project_id, session_id, turn_index, role, content, \
+                 created_at) \
+                 SELECT ?, ?, COALESCE(MAX(turn_index) + 1, 0), ?, ?, ? \
+                 FROM conversations WHERE project_id = ? AND session_id = ?",
+                [
+                    self.project_id.clone().into(),
+                    session_id.clone().into(),
+                    role.clone().into(),
+                    content.clone().into(),
+                    created_at.into(),
+                    self.project_id.clone().into(),
+                    session_id.clone().into(),
+                ],
+            ))
+            .await?;
+        if res.rows_affected() != 1 {
+            return Err(StorageError::Backend(
+                "conversation insert affected no rows".to_string(),
+            ));
+        }
+        let turn_index: i64 = match conversations::Entity::find()
+            .filter(conversations::Column::ProjectId.eq(&self.project_id))
+            .filter(conversations::Column::SessionId.eq(&session_id))
+            .order_by_desc(conversations::Column::TurnIndex)
+            .one(&self.db)
+            .await?
+        {
+            Some(m) => m.turn_index,
+            None => {
+                return Err(StorageError::Backend(
+                    "conversation insert succeeded but read-back found no turn".to_string(),
+                ))
+            }
+        };
+        Ok(Turn {
+            session_id,
+            turn_index,
+            role,
+            content,
+            created_at,
+        })
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<Vec<Turn>, StorageError> {
+        let models: Vec<conversations::Model> = conversations::Entity::find()
+            .filter(conversations::Column::ProjectId.eq(&self.project_id))
+            .filter(conversations::Column::SessionId.eq(session_id.trim()))
+            .order_by_asc(conversations::Column::TurnIndex)
+            .all(&self.db)
+            .await?;
+        Ok(models
+            .into_iter()
+            .map(|m| Turn {
+                session_id: m.session_id,
+                turn_index: m.turn_index,
+                role: m.role,
+                content: m.content,
+                created_at: m.created_at,
+            })
+            .collect())
+    }
+
+    async fn list_sessions(&self, prefix: Option<&str>) -> Result<Vec<String>, StorageError> {
+        // substr 而非 LIKE（session_id 允许 `_`）；租户条件永远在最前
+        let mut sql = String::from(
+            "SELECT session_id, MAX(created_at) AS last_at FROM conversations \
+             WHERE project_id = ?",
+        );
+        if prefix.is_some() {
+            sql.push_str(" AND substr(session_id, 1, length(?)) = ?");
+        }
+        sql.push_str(" GROUP BY session_id ORDER BY last_at DESC, session_id ASC");
+
+        let mut params: Vec<sea_orm::Value> = vec![self.project_id.clone().into()];
+        if let Some(p) = prefix {
+            params.push(p.to_string().into());
+            params.push(p.to_string().into());
+        }
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                &sql,
+                params,
+            ))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.try_get::<String>("", "session_id").ok())
+            .collect())
     }
 }
 
@@ -1014,6 +1151,10 @@ impl SqliteSingleBackend {
             }),
             handoff: Arc::new(SqliteSingleHandoffRepo {
                 project_id: project_id.to_string(),
+                db: db.clone(),
+            }),
+            conversation: Arc::new(SqliteSingleConversationRepo {
+                project_id: project_id.to_string(),
                 db,
             }),
         }
@@ -1063,7 +1204,14 @@ impl StorageBackend for SqliteSingleBackend {
 
         // 删该租户的全部行；共享库文件保留——其他项目还住在里面。
         // FTS 索引一并清（按租户），避免留下可被检索的幽灵内容。
-        for table in ["entities", "observations", "relations", "handoffs"] {
+        // conversations 无 FTS，但 transcript 同样是项目数据，必须一并清。
+        for table in [
+            "entities",
+            "observations",
+            "relations",
+            "handoffs",
+            "conversations",
+        ] {
             db.execute(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!("DELETE FROM {table} WHERE project_id = ?"),
@@ -1116,6 +1264,16 @@ mod tests {
         let backend = SqliteSingleBackend::new(temp_data_dir());
         let repos = backend.repositories_for("handoff-contract").await.unwrap();
         contract::run_handoff_contract(&*repos.handoff).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_single_satisfies_conversation_contract() {
+        let backend = SqliteSingleBackend::new(temp_data_dir());
+        let repos = backend
+            .repositories_for("conversation-contract")
+            .await
+            .unwrap();
+        contract::run_conversation_contract(&*repos.conversation).await;
     }
 
     #[tokio::test]
@@ -1208,6 +1366,77 @@ mod tests {
         assert_eq!(hits_a.len(), 1, "本租户必须能检索到");
         let hits_b = b.memory.search_nodes("深色").await.unwrap();
         assert!(hits_b.is_empty(), "其他租户不得检索到本租户内容");
+    }
+
+    /// 会话：同名 session_id 在不同项目里必须是**两个会话**，轮次序号各自独立。
+    ///
+    /// @intent 会话寻址键是 `session_id`，而客户端生成 id 时并不知道别的项目用了什么——
+    ///         单库里两个项目撞名是常态而非异常，MAX(turn_index) 的租户条件漏一处
+    ///         就会把别人项目的轮次顶起来，这里直接钉死。
+    #[tokio::test]
+    async fn conversations_are_scoped_to_tenant() {
+        use crate::domain::SessionInput;
+
+        let backend = SqliteSingleBackend::new(temp_data_dir());
+        let a = backend.repositories_for("con-a").await.unwrap();
+        let b = backend.repositories_for("con-b").await.unwrap();
+
+        // 两项目写同名会话：A 三轮、B 一轮
+        for content in ["a-1", "a-2", "a-3"] {
+            a.conversation
+                .append_turn(SessionInput {
+                    session_id: "shared-session".to_string(),
+                    role: "user".to_string(),
+                    content: content.to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        b.conversation
+            .append_turn(SessionInput {
+                session_id: "shared-session".to_string(),
+                role: "user".to_string(),
+                content: "b-1".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let ta = a.conversation.get_session("shared-session").await.unwrap();
+        let tb = b.conversation.get_session("shared-session").await.unwrap();
+        assert_eq!(
+            ta.iter().map(|t| t.content.as_str()).collect::<Vec<_>>(),
+            vec!["a-1", "a-2", "a-3"],
+            "A 的 transcript 不受 B 干扰"
+        );
+        assert_eq!(
+            tb.iter()
+                .map(|t| (t.turn_index, t.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "b-1")],
+            "B 的轮次序号必须独立从 0 起（MAX 只统计本租户）"
+        );
+
+        // 列表同样只见本租户的会话
+        assert_eq!(
+            a.conversation.list_sessions(Some("shared")).await.unwrap(),
+            vec!["shared-session".to_string()],
+        );
+        assert_eq!(
+            b.conversation.list_sessions(None).await.unwrap(),
+            vec!["shared-session".to_string()],
+        );
+
+        // drop A 项目：B 的会话必须原样保留（租户删行、共享库留存）
+        backend.drop_project("con-a").await.unwrap();
+        assert_eq!(
+            b.conversation
+                .get_session("shared-session")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "drop 掉的是 A 的租户行，B 的会话不得被连带删除"
+        );
     }
 
     /// 交接：同名任务（含零 ID 槽位）在不同项目里互不可见、各自独立修订。
@@ -1374,12 +1603,9 @@ mod tests {
         let dir = temp_data_dir();
         let backend = SqliteSingleBackend::new(dir);
         backend.repositories_for("twice").await.unwrap();
-        let db = Database::connect(format!(
-            "sqlite://{}?mode=rwc",
-            backend.db_path().display()
-        ))
-        .await
-        .unwrap();
+        let db = Database::connect(format!("sqlite://{}?mode=rwc", backend.db_path().display()))
+            .await
+            .unwrap();
         init_single_db(&db).await.unwrap();
         init_single_db(&db).await.unwrap();
         assert_eq!(backend.kind(), BackendKind::SqliteSingle);

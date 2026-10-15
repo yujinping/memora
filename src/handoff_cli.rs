@@ -85,7 +85,8 @@ pub fn run(
     let timeout = Duration::from_secs(opts.timeout.unwrap_or(10));
     let client = Client::new(cfg.endpoint.clone(), cfg.token.clone(), timeout);
 
-    let (project, auto) = resolve_project_via_server(&client, opts.project.as_deref(), env_project)?;
+    let (project, auto) =
+        resolve_project_via_server(&client, opts.project.as_deref(), env_project)?;
     if auto {
         eprintln!("server has exactly one project; using `{project}`");
     }
@@ -113,7 +114,10 @@ fn resolve_project_via_server(
     }
     let resp = client.send("GET", "/api/v1/projects", None)?;
     if resp.status != 200 {
-        return Err(format!("GET /api/v1/projects failed ({}): {}", resp.status, resp.body));
+        return Err(format!(
+            "GET /api/v1/projects failed ({}): {}",
+            resp.status, resp.body
+        ));
     }
     let ids: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(&resp.body)
         .map_err(|err| format!("project list is not valid JSON: {err}"))?
@@ -205,7 +209,10 @@ fn cmd_load(client: &Client, project: &str, opts: &HandoffOpts) -> Result<i32, S
             print_candidates(&parse(&resp.body));
             Ok(1)
         }
-        404 => Err(format!("handoff `{}` not found", opts.task.as_deref().unwrap_or(""))) ,
+        404 => Err(format!(
+            "handoff `{}` not found",
+            opts.task.as_deref().unwrap_or("")
+        )),
         other => Err(format!("load failed ({other}): {}", resp.body)),
     }
 }
@@ -213,7 +220,10 @@ fn cmd_load(client: &Client, project: &str, opts: &HandoffOpts) -> Result<i32, S
 fn cmd_ack(client: &Client, project: &str, opts: &HandoffOpts) -> Result<i32, String> {
     let path = match &opts.task {
         Some(task) => {
-            format!("/api/v1/projects/{project}/handoffs/{}/ack", url_encode(task))
+            format!(
+                "/api/v1/projects/{project}/handoffs/{}/ack",
+                url_encode(task)
+            )
         }
         None => format!("/api/v1/projects/{project}/handoffs/pending/ack"),
     };
@@ -228,7 +238,9 @@ fn cmd_ack(client: &Client, project: &str, opts: &HandoffOpts) -> Result<i32, St
                 Ok(0)
             } else {
                 let acked_by = v["handoff"]["acked_by"].as_str().unwrap_or("");
-                eprintln!("该交接已被他人接手（acked_by={acked_by}）；如需接手请先用 handoff list 确认");
+                eprintln!(
+                    "该交接已被他人接手（acked_by={acked_by}）；如需接手请先用 handoff list 确认"
+                );
                 Ok(1)
             }
         }
@@ -240,7 +252,10 @@ fn cmd_ack(client: &Client, project: &str, opts: &HandoffOpts) -> Result<i32, St
             print_candidates(&parse(&resp.body));
             Ok(1)
         }
-        404 => Err(format!("handoff `{}` not found", opts.task.as_deref().unwrap_or(""))),
+        404 => Err(format!(
+            "handoff `{}` not found",
+            opts.task.as_deref().unwrap_or("")
+        )),
         other => Err(format!("ack failed ({other}): {}", resp.body)),
     }
 }
@@ -346,7 +361,10 @@ fn render_summary(index: usize, s: &serde_json::Value, offset: time::UtcOffset) 
     let session = s["session_id"].as_str().unwrap_or("");
     let task_id = s["task_id"].as_str().unwrap_or("");
     let excerpt = s["state_excerpt"].as_str().unwrap_or("");
-    let time = s["created_at"].as_i64().map(|t| format_time(t, offset)).unwrap_or_default();
+    let time = s["created_at"]
+        .as_i64()
+        .map(|t| format_time(t, offset))
+        .unwrap_or_default();
     let who = if client.is_empty() && session.is_empty() {
         String::new()
     } else {
@@ -387,7 +405,9 @@ mod tests {
                         let len = text
                             .lines()
                             .find_map(|l| {
-                                l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().ok())
+                                l.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().ok())
                             })
                             .flatten()
                             .unwrap_or(0);
@@ -404,11 +424,9 @@ mod tests {
                 // 匹配规则：method 相等 + 路径以后缀结尾。`ends_with` 而非 `contains`：
                 // "/api/v1/projects" 会吃掉所有 handoffs 子路径；后缀与 method 组合
                 // 才能区分 `GET /handoffs/{task}` 与 `DELETE /handoffs/{task}`。
-                let hit = routes.iter().find(|(key, _, _)| {
-                    match key.split_once(' ') {
-                        Some((m, suffix)) => m == method && path_only.ends_with(suffix),
-                        None => path_only.ends_with(key),
-                    }
+                let hit = routes.iter().find(|(key, _, _)| match key.split_once(' ') {
+                    Some((m, suffix)) => m == method && path_only.ends_with(suffix),
+                    None => path_only.ends_with(key),
                 });
                 let (status, body) = match hit {
                     Some((_, s, b)) => (*s, *b),
@@ -466,7 +484,8 @@ mod tests {
 
     #[test]
     fn explicit_project_wins_over_everything() {
-        let (id, auto) = resolve_project_id(Some(" explicit "), Some("env"), &["a".into(), "b".into()]).unwrap();
+        let (id, auto) =
+            resolve_project_id(Some(" explicit "), Some("env"), &["a".into(), "b".into()]).unwrap();
         assert_eq!(id, "explicit");
         assert!(!auto);
     }
@@ -498,12 +517,18 @@ mod tests {
     #[test]
     fn time_is_formatted_as_utc_date_when_offset_is_utc() {
         // 2026-10-14 16:00:00 UTC
-        assert_eq!(format_time(1791993600, time::UtcOffset::UTC), "2026-10-14 16:00");
+        assert_eq!(
+            format_time(1791993600, time::UtcOffset::UTC),
+            "2026-10-14 16:00"
+        );
     }
 
     #[test]
     fn invalid_timestamp_falls_back_to_raw_digits() {
-        assert_eq!(format_time(i64::MAX, time::UtcOffset::UTC), i64::MAX.to_string());
+        assert_eq!(
+            format_time(i64::MAX, time::UtcOffset::UTC),
+            i64::MAX.to_string()
+        );
     }
 
     // ------------------------------------------------------ run（整链，经桩服务）
@@ -521,7 +546,10 @@ mod tests {
                 ]}"#,
             ),
         ]);
-        let cfg = HandoffConfig { endpoint: ep, token: TOKEN.into() };
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
         let out = run_list(&HandoffOpts::default(), &cfg).unwrap();
         assert_eq!(out, 0);
     }
@@ -532,7 +560,10 @@ mod tests {
             ("GET /api/v1/projects", 200, r#"[{"project_id":"solo"}]"#),
             ("GET /handoffs/pending", 204, ""),
         ]);
-        let cfg = HandoffConfig { endpoint: ep, token: TOKEN.into() };
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
         let out = run_load(&HandoffOpts::default(), &cfg).unwrap();
         assert_eq!(out, 0, "无待接手是正常状态");
     }
@@ -541,9 +572,16 @@ mod tests {
     fn ambiguous_load_exits_nonzero() {
         let ep = serve(vec![
             ("GET /api/v1/projects", 200, r#"[{"project_id":"solo"}]"#),
-            ("GET /handoffs/pending", 300, r#"{"status":"ambiguous","candidates":[{"task_id":"a"},{"task_id":"b"}]}"#),
+            (
+                "GET /handoffs/pending",
+                300,
+                r#"{"status":"ambiguous","candidates":[{"task_id":"a"},{"task_id":"b"}]}"#,
+            ),
         ]);
-        let cfg = HandoffConfig { endpoint: ep, token: TOKEN.into() };
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
         let out = run_load(&HandoffOpts::default(), &cfg).unwrap();
         assert_ne!(out, 0, "歧义必须非零退出（脚本需要人来选）");
     }
@@ -552,11 +590,21 @@ mod tests {
     fn lost_ack_race_exits_nonzero() {
         let ep = serve(vec![
             ("GET /api/v1/projects", 200, r#"[{"project_id":"solo"}]"#),
-            ("POST /pending/ack", 200, r#"{"status":"found","won":false,"handoff":{"acked_by":"zed"}}"#),
+            (
+                "POST /pending/ack",
+                200,
+                r#"{"status":"found","won":false,"handoff":{"acked_by":"zed"}}"#,
+            ),
         ]);
-        let cfg = HandoffConfig { endpoint: ep, token: TOKEN.into() };
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
         let out = run_ack(
-            &HandoffOpts { client: Some("cursor".into()), ..Default::default() },
+            &HandoffOpts {
+                client: Some("cursor".into()),
+                ..Default::default()
+            },
             &cfg,
         )
         .unwrap();
@@ -565,15 +613,26 @@ mod tests {
 
     #[test]
     fn save_reads_json_from_file() {
-        let path = std::env::temp_dir().join(format!("memora_cli_save_{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("memora_cli_save_{}.json", std::process::id()));
         std::fs::write(&path, r#"{"goal":"g","state":"s","client":"zed"}"#).unwrap();
         let ep = serve(vec![
             ("GET /api/v1/projects", 200, r#"[{"project_id":"solo"}]"#),
-            ("POST /handoffs", 201, r#"{"handoff":{"task_id":"current@zed","revision":1},"task_id":"current@zed","revision":1}"#),
+            (
+                "POST /handoffs",
+                201,
+                r#"{"handoff":{"task_id":"current@zed","revision":1},"task_id":"current@zed","revision":1}"#,
+            ),
         ]);
-        let cfg = HandoffConfig { endpoint: ep, token: TOKEN.into() };
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
         let out = run_save(
-            &HandoffOpts { file: Some(path.clone()), ..Default::default() },
+            &HandoffOpts {
+                file: Some(path.clone()),
+                ..Default::default()
+            },
             &cfg,
         )
         .unwrap();
@@ -586,9 +645,15 @@ mod tests {
         let path = std::env::temp_dir().join(format!("memora_cli_bad_{}.json", std::process::id()));
         std::fs::write(&path, "not json").unwrap();
         let ep = serve(vec![]); // 任何请求都会 404
-        let cfg = HandoffConfig { endpoint: ep, token: TOKEN.into() };
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
         let result = run_save(
-            &HandoffOpts { file: Some(path.clone()), ..Default::default() },
+            &HandoffOpts {
+                file: Some(path.clone()),
+                ..Default::default()
+            },
             &cfg,
         );
         assert!(result.is_err(), "非法 JSON 必须在发请求前被拒");
@@ -599,18 +664,38 @@ mod tests {
     #[test]
     fn rm_without_task_is_rejected_defensively() {
         let ep = serve(vec![]);
-        let cfg = HandoffConfig { endpoint: ep, token: TOKEN.into() };
-        let err = run_rm(&HandoffOpts { project: Some("solo".into()), ..Default::default() }, &cfg)
-            .unwrap_err();
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
+        let err = run_rm(
+            &HandoffOpts {
+                project: Some("solo".into()),
+                ..Default::default()
+            },
+            &cfg,
+        )
+        .unwrap_err();
         assert!(err.contains("--task"), "{err}");
     }
 
     #[test]
     fn rm_with_task_sends_delete() {
-        let ep = serve(vec![("DELETE /handoffs/gone", 200, r#"{"task_id":"gone"}"#)]);
-        let cfg = HandoffConfig { endpoint: ep, token: TOKEN.into() };
+        let ep = serve(vec![(
+            "DELETE /handoffs/gone",
+            200,
+            r#"{"task_id":"gone"}"#,
+        )]);
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
         let out = run_rm(
-            &HandoffOpts { project: Some("solo".into()), task: Some("gone".into()), ..Default::default() },
+            &HandoffOpts {
+                project: Some("solo".into()),
+                task: Some("gone".into()),
+                ..Default::default()
+            },
             &cfg,
         )
         .unwrap();
@@ -620,9 +705,15 @@ mod tests {
     #[test]
     fn explicit_project_skips_project_discovery() {
         let ep = serve(vec![("GET /handoffs/pending", 204, "")]);
-        let cfg = HandoffConfig { endpoint: ep, token: TOKEN.into() };
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
         let out = run_load(
-            &HandoffOpts { project: Some("solo".into()), ..Default::default() },
+            &HandoffOpts {
+                project: Some("solo".into()),
+                ..Default::default()
+            },
             &cfg,
         )
         .unwrap();
@@ -643,7 +734,10 @@ mod tests {
                 ]}"#,
             ),
         ]);
-        let cfg = HandoffConfig { endpoint: ep, token: TOKEN.into() };
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
         let out = run_list(&HandoffOpts::default(), &cfg).unwrap();
         assert_eq!(out, 0);
     }

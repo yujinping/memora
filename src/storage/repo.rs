@@ -7,7 +7,7 @@
 
 use crate::domain::{
     AckOutcome, Entity, EntityInput, Graph, Handoff, HandoffInput, HandoffResolution,
-    HandoffSummary, ObservationInput, RelationInput,
+    HandoffSummary, ObservationInput, RelationInput, SessionInput, Turn,
 };
 use crate::error::StorageError;
 
@@ -111,4 +111,27 @@ pub trait HandoffRepository: Send + Sync {
 
     /// 删除某任务的**全部修订**（幂等；不存在视为成功）。
     async fn delete_handoff(&self, task_id: &str) -> Result<(), StorageError>;
+}
+
+/// 会话领域仓库（P5.1，docs/memory-system-design.md §5.4）：细粒度 transcript 的读写入口。
+///
+/// @intent 与 handoff（结论级交接）互补：会话工具存**完整逐轮记录**，供新机器上
+///         原样拉回一段对话。仓库仍按项目隔离——`repositories_for(project_id)`
+///         返回的实例天然只见本项目的行，实现方不得在本 trait 方法里再收 project 参数。
+#[async_trait::async_trait]
+pub trait ConversationRepository: Send + Sync {
+    /// 追加一轮对话，`turn_index` 由后端分配（会话内从 0 单调递增、无空洞），
+    /// 返回落库后的完整轮次（含分配出的 `turn_index` / `created_at`）。
+    ///
+    /// @intent 回读是硬约定：MCP 工具层直接把返回值交给调用方续接，
+    ///         不允许「写完再猜序号」。会话不存在也**不是错误**——首写即建会话。
+    async fn append_turn(&self, input: SessionInput) -> Result<Turn, StorageError>;
+
+    /// 拉回完整会话 transcript，按 `turn_index` 升序。
+    /// 会话不存在（或从未写入）返回**空数组**——空 transcript 是合法答案，不是错误。
+    async fn get_session(&self, session_id: &str) -> Result<Vec<Turn>, StorageError>;
+
+    /// 列出会话标识：有 `prefix` 时按前缀过滤，按**最近活跃降序**、
+    /// 并列时按 `session_id` 升序（确定性排序，供恢复方「先接最近的」）。
+    async fn list_sessions(&self, prefix: Option<&str>) -> Result<Vec<String>, StorageError>;
 }
