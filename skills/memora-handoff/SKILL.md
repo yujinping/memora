@@ -1,23 +1,21 @@
 ---
 name: memora-handoff
-description: Use when writing or reviewing a handoff at a work checkpoint, or when presenting several pending handoffs for the user to choose from, to make the entries recognizable and the choice easy.
+description: Use when 在工作检查点写入或审阅交接、或要把多条待接手交接呈现给用户挑选时——让条目可辨认、选择零负担。
 ---
 
-- **Make the entry recognizable.** The next person reads a one-line list, not your
-  full context. Write `goal` as what the work IS ("把 handoff 并入 memora"), not
-  what you did ("改了 repo.rs")。Put the blocking detail in the first line of
-  `state` — that is the excerpt shown in the list.
-- **`next_steps` must be executable by someone with no memory of this session**:
-  name files by path, name the command to run, name the check that proves it worked.
-- **Prefer a few concrete steps over a summary.** Three actionable steps beat ten
-  vague ones; the reader wants to start, not to review.
-- **Pass a stable `session_id`** (e.g. `zed-20261014-2130`) so the entry is
-  distinguishable from your other sessions in someone else's list.
-- **Presenting candidates**: show a numbered table with goal, the state excerpt,
-  client, session label and time; ask the user to pick a number. Never make the user
-  read a task_id out loud.
-- **A meaningful checkpoint** is: a sub-task finished, a decision made that changes
-  direction, or you are about to run something long. Not after every tool call.
+- **让条目可辨认。** 接手的人读的是一行摘要，不是你的完整上下文。`goal` 写
+  「这项工作**是什么**」（如「把 handoff 并入 memora」），不要写「你**做了什么**」
+  （如「改了 repo.rs」）。阻塞细节放 `state` 的第一行——列表里展示的就是它。
+- **`next_steps` 必须能让对本会话毫无记忆的人直接执行**：文件写到路径、命令写全、
+  验证手段（跑什么、看什么算过）写明。
+- **宁要几步具体动作，不要一份总结。** 三条可执行步骤胜过十条模糊描述；
+  读的人要的是「马上开工」，不是「温习历史」。
+- **传一个稳定的 `session_id`**（如 `zed-20261014-2130`），让别人列表里能把
+  你这个会话和其他会话区分开。
+- **呈现候选时**：给出编号表格（goal、state 摘录、client、会话标签、时间），
+  请用户报数字挑选。**绝不让用户念 task_id**。
+- **有意义的检查点**是：一个子任务完成、一个改变方向的决策落定、或你即将
+  跑一件长任务。不是每次工具调用之后。
 
 > 这是 Memora 交接功能的**可选质量层**：判方向所需的基础规则在 MCP `instructions`
 > 里随连接下发（连接即得）。删掉本文件，交接功能完全可用——只是写得糙。
