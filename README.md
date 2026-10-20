@@ -123,7 +123,7 @@ http://localhost:6789/admin
 | 凭据形态 | 用户名 + 口令（默认种子用户名 `admin`）。口令以 **Argon2id** 哈希写入 `_meta.db` 的 `users` 表 |
 | 账号从哪来 | `users` 表为空时，用 `config.toml` 的 `admin_user` / `admin_password_hash` **播种**第一个管理员；之后**以库为准**，改配置不再影响登录 |
 | 多账号 | 控制台「账号」页可增删账号、改口令。删账号会立即踢掉该账号的全部会话；**最后一个账号禁止删除**（否则谁都被锁在门外） |
-| 口令从哪来 | `memora init` 生成 20 位随机口令并只打印一次；忘记且进不去时重跑 `memora init --force` 重新播种 |
+| 口令从哪来 | `memora init` 生成 20 位随机口令并只打印一次；**`--force` 重跑不会重置口令**（已配置则沿用，且账号以库为准）。忘记时：① 已登录则控制台「账号」页改，或 `PUT /api/v1/users/{username}`（只需 `ADMIN_TOKEN`）；② 进不去则删 `_meta.db` 的 `users` 表行后重启，按配置重新播种 |
 | 也可自己指定 | `--admin-password <明文>`（启动时即哈希，不落盘）、`--admin-password-hash <PHC>`，或环境变量 `ADMIN_PASSWORD` / `ADMIN_PASSWORD_HASH`。明文短于 8 字符**直接拒绝启动**——口令强度只在能拿到明文的那一刻可判 |
 | 会话 | 内存会话表 + `HttpOnly; SameSite=Strict` Cookie，12 小时**绝对**过期（不滑动、重启即失效）；检测到 HTTPS 时自动加 `Secure` |
 | 退出登录 | 页面上的「退出」，或 `DELETE /api/v1/session`（幂等，未登录也返回 204） |
