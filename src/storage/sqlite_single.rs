@@ -1368,6 +1368,32 @@ mod tests {
         assert!(hits_b.is_empty(), "其他租户不得检索到本租户内容");
     }
 
+    /// S7：`list_handoffs` 的 SQL 子查询与外层都带 `project_id`，必须按租户硬隔离。
+    /// 两项目写入**同名 task_id** 的交接，彼此都只能看到自己的那一份，不得串。
+    #[tokio::test]
+    async fn list_handoffs_is_scoped_to_tenant() {
+        let backend = SqliteSingleBackend::new(temp_data_dir());
+        let a = backend.repositories_for("lh-a").await.unwrap();
+        let b = backend.repositories_for("lh-b").await.unwrap();
+
+        a.handoff
+            .save_handoff(HandoffInput::new("A 的目标", "A 的状态").with_task("shared"))
+            .await
+            .unwrap();
+        b.handoff
+            .save_handoff(HandoffInput::new("B 的目标", "B 的状态").with_task("shared"))
+            .await
+            .unwrap();
+
+        let la = a.handoff.list_handoffs(None, false, 100).await.unwrap();
+        let lb = b.handoff.list_handoffs(None, false, 100).await.unwrap();
+
+        assert_eq!(la.len(), 1, "A 只应看到自己的 1 条");
+        assert_eq!(lb.len(), 1, "B 只应看到自己的 1 条");
+        assert_eq!(la[0].goal, "A 的目标", "不得串到 B 的交接");
+        assert_eq!(lb[0].goal, "B 的目标", "不得串到 A 的交接");
+    }
+
     /// 会话：同名 session_id 在不同项目里必须是**两个会话**，轮次序号各自独立。
     ///
     /// @intent 会话寻址键是 `session_id`，而客户端生成 id 时并不知道别的项目用了什么——

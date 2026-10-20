@@ -8,6 +8,20 @@
 use crate::domain::{EntityInput, HandoffInput, ObservationInput, RelationInput, SessionInput};
 use crate::error::StorageError;
 
+// 记忆写路径的容量上限（与 handoff 同源的「先整批校验、再落库」）。
+//
+// @intent 审计发现记忆写路径此前只有「非空」校验、无任何长度 / 条数上限；
+//         多项目共享服务端时，单 token 持有者可借此撑爆内存 / 磁盘。
+//         以下常量即为契约上限，所有记忆写入口共用同一套 enforcement。
+pub const MEMORY_NAME_MAX_BYTES: usize = 256;
+pub const MEMORY_TYPE_MAX_BYTES: usize = 128;
+pub const MEMORY_SOURCE_MAX_BYTES: usize = 256;
+pub const MEMORY_OBSERVATION_MAX_BYTES: usize = 16 * 1024;
+pub const MEMORY_OBSERVATIONS_PER_ENTITY_MAX: usize = 200;
+pub const MEMORY_ENTITIES_MAX: usize = 100;
+pub const MEMORY_RELATIONS_MAX: usize = 200;
+pub const MEMORY_OBSERVATIONS_MAX: usize = 500;
+
 /// 规范化单个实体：名称去空白后不得为空；类型为空则落为 `unknown`；来源仅去空白（可空）。
 ///
 /// 返回三元组 `(name, entity_type, source)`。
@@ -18,39 +32,102 @@ pub fn entity(input: &EntityInput) -> Result<(String, String, String), StorageEr
             "entity name must be non-empty".to_string(),
         ));
     }
+    if name.len() > MEMORY_NAME_MAX_BYTES {
+        return Err(StorageError::InvalidInput(format!(
+            "entity name is {} bytes, over the {MEMORY_NAME_MAX_BYTES}-byte limit",
+            name.len()
+        )));
+    }
     let entity_type = match input.entity_type.trim() {
         "" => "unknown".to_string(),
-        t => t.to_string(),
+        t => {
+            if t.len() > MEMORY_TYPE_MAX_BYTES {
+                return Err(StorageError::InvalidInput(format!(
+                    "entity type is {} bytes, over the {MEMORY_TYPE_MAX_BYTES}-byte limit",
+                    t.len()
+                )));
+            }
+            t.to_string()
+        }
     };
-    Ok((
-        name.to_string(),
-        entity_type,
-        input.source.trim().to_string(),
-    ))
+    let source = input.source.trim();
+    if source.len() > MEMORY_SOURCE_MAX_BYTES {
+        return Err(StorageError::InvalidInput(format!(
+            "source is {} bytes, over the {MEMORY_SOURCE_MAX_BYTES}-byte limit",
+            source.len()
+        )));
+    }
+    Ok((name.to_string(), entity_type, source.to_string()))
 }
 
 /// 规范化实体批次。
 pub fn entities(inputs: &[EntityInput]) -> Result<Vec<(String, String, String)>, StorageError> {
+    if inputs.len() > MEMORY_ENTITIES_MAX {
+        return Err(StorageError::InvalidInput(format!(
+            "create_entities accepts at most {MEMORY_ENTITIES_MAX} entities per call"
+        )));
+    }
     inputs.iter().map(entity).collect()
 }
 
 /// 规范化关系批次：两端与关系类型均不得为空；来源仅去空白（可空）。
 pub fn relations(inputs: &[RelationInput]) -> Result<Vec<RelationKey>, StorageError> {
+    if inputs.len() > MEMORY_RELATIONS_MAX {
+        return Err(StorageError::InvalidInput(format!(
+            "create_relations accepts at most {MEMORY_RELATIONS_MAX} relations per call"
+        )));
+    }
     inputs
         .iter()
         .map(|r| {
-            let (from_name, to_name, relation_type) =
-                (r.from_name.trim(), r.to_name.trim(), r.relation_type.trim());
-            if from_name.is_empty() || to_name.is_empty() || relation_type.is_empty() {
+            let from_name = r.from_name.trim();
+            if from_name.is_empty() {
                 return Err(StorageError::InvalidInput(
-                    "relation endpoints and type must be non-empty".to_string(),
+                    "relation from_name must be non-empty".to_string(),
                 ));
+            }
+            if from_name.len() > MEMORY_NAME_MAX_BYTES {
+                return Err(StorageError::InvalidInput(format!(
+                    "relation from_name is {} bytes, over the {MEMORY_NAME_MAX_BYTES}-byte limit",
+                    from_name.len()
+                )));
+            }
+            let to_name = r.to_name.trim();
+            if to_name.is_empty() {
+                return Err(StorageError::InvalidInput(
+                    "relation to_name must be non-empty".to_string(),
+                ));
+            }
+            if to_name.len() > MEMORY_NAME_MAX_BYTES {
+                return Err(StorageError::InvalidInput(format!(
+                    "relation to_name is {} bytes, over the {MEMORY_NAME_MAX_BYTES}-byte limit",
+                    to_name.len()
+                )));
+            }
+            let relation_type = r.relation_type.trim();
+            if relation_type.is_empty() {
+                return Err(StorageError::InvalidInput(
+                    "relation type must be non-empty".to_string(),
+                ));
+            }
+            if relation_type.len() > MEMORY_TYPE_MAX_BYTES {
+                return Err(StorageError::InvalidInput(format!(
+                    "relation type is {} bytes, over the {MEMORY_TYPE_MAX_BYTES}-byte limit",
+                    relation_type.len()
+                )));
+            }
+            let source = r.source.trim();
+            if source.len() > MEMORY_SOURCE_MAX_BYTES {
+                return Err(StorageError::InvalidInput(format!(
+                    "source is {} bytes, over the {MEMORY_SOURCE_MAX_BYTES}-byte limit",
+                    source.len()
+                )));
             }
             Ok((
                 from_name.to_string(),
                 to_name.to_string(),
                 relation_type.to_string(),
-                r.source.trim().to_string(),
+                source.to_string(),
             ))
         })
         .collect()
@@ -60,6 +137,11 @@ pub fn relations(inputs: &[RelationInput]) -> Result<Vec<RelationKey>, StorageEr
 pub fn observations(
     inputs: &[ObservationInput],
 ) -> Result<Vec<(String, Vec<String>, String)>, StorageError> {
+    if inputs.len() > MEMORY_OBSERVATIONS_MAX {
+        return Err(StorageError::InvalidInput(format!(
+            "add_observations accepts at most {MEMORY_OBSERVATIONS_MAX} observations per call"
+        )));
+    }
     inputs
         .iter()
         .map(|o| {
@@ -69,16 +151,41 @@ pub fn observations(
                     "observation entity name must be non-empty".to_string(),
                 ));
             }
-            if o.contents.iter().any(|c| c.trim().is_empty()) {
-                return Err(StorageError::InvalidInput(
-                    "observation content must be non-empty".to_string(),
-                ));
+            if entity_name.len() > MEMORY_NAME_MAX_BYTES {
+                return Err(StorageError::InvalidInput(format!(
+                    "observation entity name is {} bytes, over the {MEMORY_NAME_MAX_BYTES}-byte limit",
+                    entity_name.len()
+                )));
             }
-            Ok((
-                entity_name.to_string(),
-                o.contents.iter().map(|c| c.trim().to_string()).collect(),
-                o.source.trim().to_string(),
-            ))
+            if o.contents.len() > MEMORY_OBSERVATIONS_PER_ENTITY_MAX {
+                return Err(StorageError::InvalidInput(format!(
+                    "an entity may carry at most {MEMORY_OBSERVATIONS_PER_ENTITY_MAX} observations"
+                )));
+            }
+            let mut contents = Vec::with_capacity(o.contents.len());
+            for c in &o.contents {
+                let trimmed = c.trim();
+                if trimmed.is_empty() {
+                    return Err(StorageError::InvalidInput(
+                        "observation content must be non-empty".to_string(),
+                    ));
+                }
+                if trimmed.len() > MEMORY_OBSERVATION_MAX_BYTES {
+                    return Err(StorageError::InvalidInput(format!(
+                        "observation content is {} bytes, over the {MEMORY_OBSERVATION_MAX_BYTES}-byte limit",
+                        trimmed.len()
+                    )));
+                }
+                contents.push(trimmed.to_string());
+            }
+            let source = o.source.trim();
+            if source.len() > MEMORY_SOURCE_MAX_BYTES {
+                return Err(StorageError::InvalidInput(format!(
+                    "source is {} bytes, over the {MEMORY_SOURCE_MAX_BYTES}-byte limit",
+                    source.len()
+                )));
+            }
+            Ok((entity_name.to_string(), contents, source.to_string()))
         })
         .collect()
 }
@@ -508,6 +615,81 @@ mod tests {
                 .remove(0);
         assert_eq!(contents, vec!["x".to_string()]);
         assert_eq!(source, "w");
+    }
+
+    // -----------------------------------------------------------------------
+    // 记忆写路径的容量上限（S2 审计修复）
+    // -----------------------------------------------------------------------
+
+    /// 实体名 / 类型 / 来源均受单字段字节上限约束（边界值本身应通过）。
+    #[test]
+    fn entity_enforces_field_byte_limits() {
+        let ok = "n".repeat(MEMORY_NAME_MAX_BYTES);
+        assert!(entity(&EntityInput::new(ok.clone(), "person")).is_ok());
+        let over = "n".repeat(MEMORY_NAME_MAX_BYTES + 1);
+        assert!(
+            entity(&EntityInput::new(over, "person")).is_err(),
+            "名称超限必须被拒"
+        );
+
+        let over = "t".repeat(MEMORY_TYPE_MAX_BYTES + 1);
+        assert!(entity(&EntityInput::new("a", over)).is_err());
+
+        let over = "s".repeat(MEMORY_SOURCE_MAX_BYTES + 1);
+        assert!(entity(&EntityInput::new("a", "person").with_source(over)).is_err());
+    }
+
+    /// 关系两端与类型均受长度上限约束。
+    #[test]
+    fn relations_enforce_field_byte_limits() {
+        let over_name = "n".repeat(MEMORY_NAME_MAX_BYTES + 1);
+        assert!(
+            relations(&[RelationInput::new(over_name.clone(), "b", "knows")]).is_err(),
+            "起点超限必须被拒"
+        );
+        assert!(
+            relations(&[RelationInput::new("a", over_name, "knows")]).is_err(),
+            "终点超限必须被拒"
+        );
+        let over_type = "t".repeat(MEMORY_TYPE_MAX_BYTES + 1);
+        assert!(relations(&[RelationInput::new("a", "b", over_type)]).is_err());
+    }
+
+    /// 观测正文受单条长度上限，单实体观测条数也受上限。
+    #[test]
+    fn observations_enforce_field_and_count_limits() {
+        let over = "c".repeat(MEMORY_OBSERVATION_MAX_BYTES + 1);
+        assert!(
+            observations(&[ObservationInput::new("a", vec![over])]).is_err(),
+            "单条观测超过上限必须被拒"
+        );
+        let ok = "c".repeat(MEMORY_OBSERVATION_MAX_BYTES);
+        assert!(observations(&[ObservationInput::new("a", vec![ok])]).is_ok());
+
+        let many = vec!["c".to_string(); MEMORY_OBSERVATIONS_PER_ENTITY_MAX + 1];
+        assert!(
+            observations(&[ObservationInput::new("a", many)]).is_err(),
+            "单实体观测条数超限必须被拒"
+        );
+    }
+
+    /// 批量条数上限：单次调用不可无界。
+    #[test]
+    fn memory_batch_sizes_are_capped() {
+        let many_entities = (0..MEMORY_ENTITIES_MAX + 1)
+            .map(|i| EntityInput::new(format!("e{i}"), "person"))
+            .collect::<Vec<_>>();
+        assert!(entities(&many_entities).is_err());
+
+        let many_relations = (0..MEMORY_RELATIONS_MAX + 1)
+            .map(|i| RelationInput::new(format!("a{i}"), "b", "knows"))
+            .collect::<Vec<_>>();
+        assert!(relations(&many_relations).is_err());
+
+        let many_obs = (0..MEMORY_OBSERVATIONS_MAX + 1)
+            .map(|i| ObservationInput::new(format!("e{i}"), vec!["x".to_string()]))
+            .collect::<Vec<_>>();
+        assert!(observations(&many_obs).is_err());
     }
 
     /// `name_list` 与 `entity` 的去空白规则必须一致，否则「写入后按名回读」会漏命中。

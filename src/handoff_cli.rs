@@ -22,6 +22,23 @@ pub struct HandoffConfig {
     pub token: String,
 }
 
+/// 若以明文 HTTP 连向非本机地址，返回需向用户弹出的告警文案；否则返回 `None`。
+///
+/// @intent 把「是否告警」抽成纯函数，便于确定性测试（不经网络）。告警文案点明
+///         `ADMIN_TOKEN` 与全部交接数据将明文暴露，并建议改 https 或经 SSH 隧道
+///         （`ssh -L`）转发到本机后再用 `http://127.0.0.1` 访问。本机 / https 不告警
+///         （见 [`Endpoint::is_plaintext_to_remote`]）。
+pub fn plaintext_remote_warning(cfg: &HandoffConfig) -> Option<&'static str> {
+    if cfg.endpoint.is_plaintext_to_remote() {
+        Some(
+            "WARNING: 以明文 HTTP 连接非本机地址，ADMIN_TOKEN 与全部交接数据将以明文在网络中传输。\n\
+             建议改用 https，或通过 SSH 隧道（ssh -L）转发到本机后再用 http://127.0.0.1 访问。",
+        )
+    } else {
+        None
+    }
+}
+
 /// 项目解析：显式 `--project` → `MEMORA_PROJECT` → 服务端唯一项目。
 ///
 /// @intent 返回 `(project_id, auto_selected)`：自动选定时调用方要**打印选定了哪个**，
@@ -84,6 +101,12 @@ pub fn run(
 ) -> Result<i32, String> {
     let timeout = Duration::from_secs(opts.timeout.unwrap_or(10));
     let client = Client::new(cfg.endpoint.clone(), cfg.token.clone(), timeout);
+
+    // S5：明文 http 连非本机地址会把 ADMIN_TOKEN 与交接数据明文暴露，先醒目告警
+    // （不拒绝：内网 / SSH 隧道明文 http 是既定用法，交由用户判断）。
+    if let Some(warn) = plaintext_remote_warning(cfg) {
+        eprintln!("{warn}");
+    }
 
     let (project, auto) =
         resolve_project_via_server(&client, opts.project.as_deref(), env_project)?;
@@ -458,6 +481,27 @@ mod tests {
         Endpoint::parse(&format!("http://{addr}"), 0).unwrap()
     }
 
+    // --------------------------------------------------------- url_encode
+
+    /// S6：`url_encode` 必须把 `&`/`=`/`/` 等保留字以及空格转义成 `%XX`，
+    /// 否则拼进查询串会被当成参数分隔符 / 路径分隔符，导致交接请求被截断或越权。
+    /// 白名单外的任意字节一律转义，白名单内直通。
+    #[test]
+    fn url_encode_escapes_reserved_chars() {
+        // 空格 = 0x20
+        assert_eq!(url_encode("a b"), "a%20b");
+        // & = 0x26, = = 0x3D, / = 0x2F
+        assert_eq!(url_encode("a&b=c/d"), "a%26b%3Dc%2Fd");
+        // 中文（多字节）必须整体转义，不得直通
+        assert_eq!(url_encode("任务"), "%E4%BB%BB%E5%8A%A1");
+    }
+
+    #[test]
+    fn url_encode_passthrough_safe_chars() {
+        // 白名单：字母数字与 - _ . @ ~
+        assert_eq!(url_encode("A-Za.z_0~@"), "A-Za.z_0~@");
+    }
+
     fn run_load(opts: &HandoffOpts, cfg: &HandoffConfig) -> Result<i32, String> {
         run(crate::cli::HandoffAction::Load, opts, cfg, None)
     }
@@ -740,5 +784,48 @@ mod tests {
         };
         let out = run_list(&HandoffOpts::default(), &cfg).unwrap();
         assert_eq!(out, 0);
+    }
+
+    // ------------------------------------------------------ 明文 http 告警（S5）
+
+    #[test]
+    fn warns_on_plaintext_http_to_remote_host() {
+        let ep = Endpoint::parse("http://memora.example.com:6789", 6789).unwrap();
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
+        let warn = plaintext_remote_warning(&cfg);
+        assert!(warn.is_some(), "远程明文 http 必须产生告警");
+        assert!(
+            warn.unwrap().contains("明文 HTTP"),
+            "告警应点明明文传输风险"
+        );
+    }
+
+    #[test]
+    fn no_warning_for_loopback_http() {
+        let ep = Endpoint::parse("http://127.0.0.1:6789", 6789).unwrap();
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
+        assert!(
+            plaintext_remote_warning(&cfg).is_none(),
+            "本机明文 http 不告警"
+        );
+    }
+
+    #[test]
+    fn no_warning_for_https() {
+        let ep = Endpoint::parse("https://memora.example.com", 6789).unwrap();
+        let cfg = HandoffConfig {
+            endpoint: ep,
+            token: TOKEN.into(),
+        };
+        assert!(
+            plaintext_remote_warning(&cfg).is_none(),
+            "https 不告警"
+        );
     }
 }

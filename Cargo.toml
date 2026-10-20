@@ -1,6 +1,6 @@
 [package]
 name = "memora"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["yujinping"]
 description = "Memora (忆庐): 轻量自托管 AI 长期记忆服务 (MCP + SQLite)"
@@ -8,6 +8,10 @@ license = "MIT"
 
 [dependencies]
 axum = "0.8"
+# 主动限制 HTTP 请求体字节数（边缘防护，与 normalize 的字段级上限构成双层）。
+# 仅启用 `limit` 特性；tower-http 本就是 axum 的传递依赖，这里是显式声明以便直接引用
+# `BodyLimitLayer`（axum 的 `DefaultBodyLimit::max` 只给自有提取器设默认上限，不限制嵌套服务）。
+tower-http = { version = "0.6", default-features = false, features = ["limit"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 sea-orm = { version = "1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }

@@ -249,6 +249,7 @@ pub const DEFAULT_HANDOFF_LIST_LIMIT: usize = 10;
 /// @intent 出参里会带回最终 `task_id`，代理后续 save 时原样传回即「继续同一工作项」
 ///         ——ID 只在工具结果里流转，从不要求人输入（docs §3.7）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HandoffSaveRequest {
     /// 这活要达成什么（必填，非空）
     pub goal: String,
@@ -279,6 +280,7 @@ pub struct HandoffSaveRequest {
 
 /// `handoff_load` 入参。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HandoffLoadRequest {
     /// 省略 = 取当前待接手的那一条（只有一条时直接命中，多条时返回候选）
     #[serde(default, alias = "taskId")]
@@ -287,6 +289,7 @@ pub struct HandoffLoadRequest {
 
 /// `handoff_list` 入参。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HandoffListRequest {
     /// 缺省 `true`：只列待接手的。想考古（「上周交接了什么」）才显式传 `false`
     #[serde(default = "default_handoff_unacked_only", alias = "unackedOnly")]
@@ -301,6 +304,7 @@ pub struct HandoffListRequest {
 
 /// `handoff_ack` 入参。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HandoffAckRequest {
     /// 省略 = 接手当前唯一待接手的那条；多条时返回候选而**不代替调用方选择**
     #[serde(default, alias = "taskId")]
@@ -446,6 +450,7 @@ pub struct HandoffListResponse {
 
 /// `log_turn` 入参。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LogTurnRequest {
     /// 会话标识（客户端生成，如 `2026-10-15-iptv-bugfix`）。首写即建会话
     #[serde(alias = "sessionId")]
@@ -479,6 +484,7 @@ pub struct TurnView {
 
 /// `get_session` 入参。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetSessionRequest {
     /// 会话标识；从未写入的会话返回空 transcript（不是错误）
     #[serde(alias = "sessionId")]
@@ -494,6 +500,7 @@ pub struct GetSessionResponse {
 
 /// `list_sessions` 入参。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListSessionsRequest {
     /// 只列以该前缀开头的会话标识；省略 = 全部
     #[serde(default)]
@@ -551,6 +558,60 @@ mod tests {
         assert!(err.to_string().contains("unknown field"), "实际：{err}");
     }
 
+    /// S3（审计）：handoff / session 家族的 7 个请求 DTO 也必须启用 `deny_unknown_fields`。
+    ///
+    /// @intent 审计发现这 7 个结构体此前缺该属性，字段名拼错（如 `nextstep` 应为
+    ///         `next_steps`）会被 serde 静默忽略、服务端返回 200 而数据落地为空；
+    ///         本用例钉死「未知字段对全部入参结构体一律报错」，覆盖模块文档宣称的不变量。
+    #[test]
+    fn handoff_and_session_request_dtos_reject_unknown_fields() {
+        // (类型名, 故意带未知字段 `bogus` 的 JSON)
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "HandoffSaveRequest",
+                json!({"goal": "g", "state": "s", "bogus": 1}),
+            ),
+            ("HandoffLoadRequest", json!({"task_id": "x", "bogus": 1})),
+            ("HandoffListRequest", json!({"limit": 5, "bogus": 1})),
+            ("HandoffAckRequest", json!({"task_id": "x", "bogus": 1})),
+            (
+                "LogTurnRequest",
+                json!({"session_id": "s", "role": "user", "content": "c", "bogus": 1}),
+            ),
+            ("GetSessionRequest", json!({"session_id": "s", "bogus": 1})),
+            ("ListSessionsRequest", json!({"prefix": "p", "bogus": 1})),
+        ];
+
+        for (label, value) in cases {
+            let result: Result<(), serde_json::Error> = match label {
+                "HandoffSaveRequest" => {
+                    serde_json::from_value::<HandoffSaveRequest>(value.clone()).map(|_| ())
+                }
+                "HandoffLoadRequest" => {
+                    serde_json::from_value::<HandoffLoadRequest>(value.clone()).map(|_| ())
+                }
+                "HandoffListRequest" => {
+                    serde_json::from_value::<HandoffListRequest>(value.clone()).map(|_| ())
+                }
+                "HandoffAckRequest" => {
+                    serde_json::from_value::<HandoffAckRequest>(value.clone()).map(|_| ())
+                }
+                "LogTurnRequest" => {
+                    serde_json::from_value::<LogTurnRequest>(value.clone()).map(|_| ())
+                }
+                "GetSessionRequest" => {
+                    serde_json::from_value::<GetSessionRequest>(value.clone()).map(|_| ())
+                }
+                _ => serde_json::from_value::<ListSessionsRequest>(value.clone()).map(|_| ()),
+            };
+            let err = result.expect_err("未知字段必须报错，否则会静默丢数据");
+            assert!(
+                err.to_string().contains("unknown field"),
+                "[{label}] 错误信息应点明「未知字段」，实际：{err}"
+            );
+        }
+    }
+
     /// 加了 `deny_unknown_fields` 后，规范 snake_case 与官方 camelCase 别名必须都仍可用。
     #[test]
     fn deny_unknown_fields_coexists_with_the_official_aliases() {
@@ -581,6 +642,8 @@ mod tests {
     /// 就知道不许加额外字段，而不是等打到服务端才被拒。
     #[test]
     fn generated_schemas_forbid_additional_properties() {
+        // 全部 11 个**请求** DTO（记忆 4 + 交接 4 + 会话 3）必须声明 additionalProperties: false，
+        // 让调用的模型在生成参数时就知道不许加额外字段，而不是等打到服务端才被拒。
         let schemas: Vec<(&str, serde_json::Value)> = vec![
             (
                 "EntityParam",
@@ -597,6 +660,34 @@ mod tests {
             (
                 "CreateEntitiesRequest",
                 serde_json::to_value(schemars::schema_for!(CreateEntitiesRequest)).unwrap(),
+            ),
+            (
+                "HandoffSaveRequest",
+                serde_json::to_value(schemars::schema_for!(HandoffSaveRequest)).unwrap(),
+            ),
+            (
+                "HandoffLoadRequest",
+                serde_json::to_value(schemars::schema_for!(HandoffLoadRequest)).unwrap(),
+            ),
+            (
+                "HandoffListRequest",
+                serde_json::to_value(schemars::schema_for!(HandoffListRequest)).unwrap(),
+            ),
+            (
+                "HandoffAckRequest",
+                serde_json::to_value(schemars::schema_for!(HandoffAckRequest)).unwrap(),
+            ),
+            (
+                "LogTurnRequest",
+                serde_json::to_value(schemars::schema_for!(LogTurnRequest)).unwrap(),
+            ),
+            (
+                "GetSessionRequest",
+                serde_json::to_value(schemars::schema_for!(GetSessionRequest)).unwrap(),
+            ),
+            (
+                "ListSessionsRequest",
+                serde_json::to_value(schemars::schema_for!(ListSessionsRequest)).unwrap(),
             ),
         ];
 

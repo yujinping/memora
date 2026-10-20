@@ -1039,8 +1039,9 @@ pub struct SqliteFileBackend {
     ///         注意 sqlx 默认的 5 秒 busy_timeout 对此无效——它不是等待超时问题。
     ///
     /// @intent 闸门条目按项目保留而非用后即删：删除会让等待者与新来者落到**不同的**
-    ///         Mutex 上，重新出现并发建池。条目数等于活跃项目数，内存开销可忽略，
-    ///         并在 [`SqliteFileBackend::drop_project`] 中随项目生命周期清理。
+    ///         Mutex 上，重新出现并发建池（SQLITE_BUSY）。条目数等于曾创建过的项目数，
+    ///         内存开销可忽略；即便项目被删后重建，闸门复用旧条目、`create_pool`
+    ///         重建目录与文件，行为完全一致（见 [`SqliteFileBackend::drop_project`]）。
     openings: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -1141,15 +1142,23 @@ impl StorageBackend for SqliteFileBackend {
     async fn drop_project(&self, project_id: &str) -> Result<(), StorageError> {
         crate::storage::validate_project_id(project_id)?;
 
-        // 先摘除连接缓存再删文件：留着已打开的连接会让进程继续持有旧 inode（Unix 下
-        // 删除只是 unlink），表现为「项目已删除但仍有写入落在不可见的文件上」。
+        // 与 `repositories_for` 共用同一把「建池闸门」串行化：drop 期间任何并发取库
+        // 都必须等 drop 完成，否则会出现「drop 摘了缓存 → 并发取库走慢路径 recreate
+        // 目录并建池 → drop 的 `remove_dir_all` 又把刚建好的目录删掉 / 文件打开失败」
+        // 的数据损坏竞态（S4）。
+        // 闸门条目**保留不删**（见 `openings` 字段说明）：删除会让等待中的并发取库任务
+        // 落到另一把新 mutex 上，重新出现并发建池（SQLITE_BUSY）。条目数等于曾创建过的
+        // 项目数，内存开销可忽略；即便项目被删后重建，闸门复用旧条目、由 `create_pool`
+        // 重建目录与文件，行为完全一致。
+        let gate = self.gate_for(project_id).await;
+        let _guard = gate.lock().await;
+
+        // 摘除连接缓存：后续请求会重新建池（指向一个干净的、drop 之后的目录）。
         self.cache.lock().await.remove(project_id);
 
         // 整个项目目录一并删除：`mem.db` 之外还有 WAL 模式产生的 `-wal` / `-shm`，
         // 以及未来可能加入的附属文件；只删 mem.db 会留下可恢复的数据残片。
         let dir = self.data_dir.join(project_id);
-        // 闸门条目随项目生命周期清理，避免 openings 无限增长
-        self.openings.lock().await.remove(project_id);
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => Ok(()),
             // 从未落盘（或已被删过）⇒ 幂等成功
@@ -1466,6 +1475,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(graph.entity_count(), 1, "其他项目的数据必须完好");
+    }
+
+    /// 并发 `drop_project` 与 `repositories_for` 交错时，取库（建池 / 初始化）不得被
+    /// 并发 `remove_dir_all` 打断。
+    ///
+    /// @intent 这是 S4 竞态的回归测试。`drop_project` 旧实现「先摘缓存、再删目录」，
+    ///         两步之间存在窗口：并发 `repositories_for` 命中缓存缺失后会走慢路径
+    ///         `create_pool`（含 `create_dir_all` + `open` + `init_memory_db`，多次文件系统
+    ///         I/O await），此时 `drop_project` 的 `remove_dir_all` 会在这批文件刚建好时
+    ///         把它们删掉，导致 `repositories_for` 报 `(code: 14) unable to open database
+    ///         file`。修复后两者共用同一把 `openings` 闸门串行化，建池与删除永不同时发生。
+    ///
+    /// @intent 设计要点：取库任务与 drop 任务**各自循环约 2000 次**且并发执行，使两者的
+    ///         生命周期充分重叠——drop 的 `remove_dir_all` 必然在某次 `create_pool` 中途撞上
+    ///         目录（旧实现 code 14）。取库为单任务串行（一次只建一个池），不引入「多池并发
+    ///         写同文件」的 SQLITE_BUSY 噪声；修复后单一闸门把 drop 与建池严格串行，全部 `Ok`。
+    ///
+    /// @intent 必须 `multi_thread`：单线程 runtime 下 spawn 任务协作式轮流执行，
+    ///         文件系统调用之间无真实并发，用例会假绿。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drop_project_racing_repositories_for_does_not_corrupt_db() {
+        let backend = std::sync::Arc::new(SqliteFileBackend::new(temp_data_dir()));
+        const ITERS: usize = 2000;
+
+        // 取库循环：一次只建一个池，不引入写竞争噪声。
+        let b = backend.clone();
+        let open_task = tokio::spawn(async move {
+            let mut opened = 0usize;
+            for _ in 0..ITERS {
+                b.repositories_for("chaos").await?;
+                opened += 1;
+            }
+            Ok::<usize, StorageError>(opened)
+        });
+        // drop 循环：持续与取库重叠，制造「删目录 vs 建池」的竞争。
+        let d = backend.clone();
+        let drop_task = tokio::spawn(async move {
+            for _ in 0..ITERS {
+                d.drop_project("chaos").await?;
+            }
+            Ok::<(), StorageError>(())
+        });
+
+        // 取库任务不得因竞争出现 code 14 / I/O 错误
+        let opened = open_task
+            .await
+            .expect("任务不得 panic")
+            .expect("并发 drop+open 不得报错");
+        drop_task
+            .await
+            .expect("任务不得 panic")
+            .expect("并发 drop+open 不得报错");
+        assert!(opened > 0, "应成功取到库");
+
+        // 尘埃落定后稳定访问必须干净：目录存在且可写入回读
+        let repos = backend.repositories_for("chaos").await.unwrap();
+        repos
+            .memory
+            .create_entities(vec![EntityInput::new("final", "concept")])
+            .await
+            .unwrap();
+        let graph = repos.memory.read_graph().await.unwrap();
+        assert!(
+            graph.entity_count() >= 1,
+            "最终写入必须可回读，不得被并发 drop 误删"
+        );
     }
 
     /// 每项目一个独立文件，互不可见。

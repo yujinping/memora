@@ -137,6 +137,24 @@ impl Endpoint {
     pub fn url(&self, path: &str) -> String {
         format!("{}{}{}", self.base(), self.prefix, path)
     }
+
+    /// 是否以明文 HTTP 连向非本机地址（token / 交接数据将明文暴露）。
+    ///
+    /// @intent 本机（127.0.0.1 / localhost / ::1）或经 SSH 隧道时明文 http 是既定用法
+    ///         （docs/handoff-integration-design.md §5.4），无需告警；连向其它地址则
+    ///         `ADMIN_TOKEN` 与全部交接内容将以明文在网络上传输，必须醒目提示改用
+    ///         https 或隧道。仅供 `handoff_cli` 决策是否弹告警，不改任何连接行为。
+    pub fn is_plaintext_to_remote(&self) -> bool {
+        match self.scheme {
+            Scheme::Https => false,
+            Scheme::Http => !is_loopback_host(&self.host),
+        }
+    }
+}
+
+/// host 是否为本机回环地址（连向这些地址的明文 http 视为安全，无需告警）。
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost" || host == "::1" || host == "127.0.0.1" || host.starts_with("127.")
 }
 
 /// 阻塞式 REST 客户端（持有 `ADMIN_TOKEN`，全部请求带 Bearer 头）。
@@ -259,6 +277,40 @@ mod tests {
             Endpoint::parse("https://", 6789).is_err(),
             "空 host 必须报错"
         );
+    }
+
+    // ------------------------------------------------------ is_plaintext_to_remote
+
+    #[test]
+    fn loopback_http_is_not_flagged_as_plaintext_remote() {
+        for host in ["http://127.0.0.1:6789", "http://localhost:6789"] {
+            let ep = Endpoint::parse(host, 6789).unwrap();
+            assert!(
+                !ep.is_plaintext_to_remote(),
+                "{host} 是本机地址，明文 http 属既定用法，不应告警"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_http_is_flagged_as_plaintext_remote() {
+        for host in [
+            "http://memora.example.com:6789",
+            "http://10.0.0.5:6789",
+            "http://192.168.1.10:6789",
+        ] {
+            let ep = Endpoint::parse(host, 6789).unwrap();
+            assert!(
+                ep.is_plaintext_to_remote(),
+                "{host} 非本机，明文 http 会暴露 token，必须告警"
+            );
+        }
+    }
+
+    #[test]
+    fn https_is_never_flagged_as_plaintext_remote() {
+        let ep = Endpoint::parse("https://memora.example.com", 6789).unwrap();
+        assert!(!ep.is_plaintext_to_remote());
     }
 
     // ------------------------------------------------------ Client（真 socket）

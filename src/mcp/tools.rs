@@ -70,10 +70,18 @@ pub const TOOL_NAMES: [&str; 16] = [
     SESSION_TOOL_NAMES[2],
 ];
 
+/// 服务端故障对 MCP 客户端暴露的通用文案（不含任何内部细节）。
+///
+/// @intent 后端原始报错（表名 / SQL 片段 / 文件路径）只进服务端日志，绝不回传给客户端——
+///         否则等于把内部拓扑免费送去做侦察。`Backend` 分支据此返回固定文案。
+const INTERNAL_ERROR_MESSAGE: &str = "internal server error";
+
 /// 存储错误 → 工具错误。
 ///
 /// @intent 区分「调用方可修正」与「服务端故障」：入参非法、实体不存在属于前者（-32602），
 ///         后端不可用 / 项目 id 非法属于后者（-32603）。调用方据此决定是否重试或改参数。
+///         其中 `Backend` 携带的是底层数据库原始报错（`StorageError` 已将其转成字符串），
+///         含表名 / SQL / 路径等内部细节——**只记录到服务端日志，绝不回传客户端**。
 fn tool_error(err: StorageError) -> ErrorData {
     match err {
         StorageError::InvalidInput(m) => ErrorData::invalid_params(m, None),
@@ -86,7 +94,10 @@ fn tool_error(err: StorageError) -> ErrorData {
         StorageError::Unsupported(k) => {
             ErrorData::internal_error(format!("unsupported storage backend: {k}"), None)
         }
-        StorageError::Backend(m) => ErrorData::internal_error(m, None),
+        StorageError::Backend(m) => {
+            tracing::error!(error = %m, "storage backend error; see server log for details");
+            ErrorData::internal_error(INTERNAL_ERROR_MESSAGE.to_string(), None)
+        }
     }
 }
 
@@ -1112,7 +1123,14 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_code(err, INVALID_PARAMS);
+        assert_code(err.clone(), INVALID_PARAMS);
+        // U4：错误信息必须点出字段名 `query`，否则调用方（CLI / 客户端）拿到
+        // 的是「non-empty」这种无主语的提示，不知道该改哪个入参。
+        assert!(
+            err.message.to_lowercase().contains("query"),
+            "错误信息应点出字段名 query，实际：{}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -1310,9 +1328,34 @@ mod tests {
             assert_eq!(
                 tool_error(server_side.clone()).code.0,
                 INTERNAL_ERROR,
-                "{server_side:?} 属服务端故障，不应误导调用方去改参数"
-            );
-        }
+            "{server_side:?} 属服务端故障，不应误导调用方去改参数"
+        );
+    }
+}
+
+    /// S1（审计）：后端故障对客户端只暴露通用文案，不得泄露 SQLite 表名 / SQL / 路径等内部细节。
+    ///
+    /// @intent `StorageError::Backend` 携带的是底层数据库原始报错，原样回传给 MCP 客户端
+    ///         等于把内部拓扑免费送去做侦察。正确做法是返回固定通用文案，原始错误仅入服务端日志。
+    ///         本用例先以「当前实现仍原样回传」为前提断言其失败，再驱动修复（TDD red 阶段）。
+    #[test]
+    fn backend_error_does_not_leak_internals_to_client() {
+        let raw =
+            "table entities has no column named foo (SQL: SELECT foo FROM entities WHERE id=1)";
+        let err = tool_error(StorageError::Backend(raw.to_string()));
+        assert_eq!(err.code.0, INTERNAL_ERROR, "服务端故障必须走 -32603");
+        assert_eq!(
+            err.message, "internal server error",
+            "客户端不应看到任何内部细节"
+        );
+        assert!(
+            !err.message.contains("entities"),
+            "表名不得泄露到客户端"
+        );
+        assert!(
+            !err.message.contains("SELECT"),
+            "SQL 片段不得泄露到客户端"
+        );
     }
 
     /// 官方语义的 9 个记忆工具一个都不许改名（客户端零改造的承诺）。

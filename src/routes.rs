@@ -16,6 +16,7 @@ use crate::reply::internal_error;
 use crate::state::AppState;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
+use tower_http::limit::RequestBodyLimitLayer;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use sea_orm::DatabaseConnection;
@@ -32,6 +33,10 @@ async fn list_projects(meta: DatabaseConnection) -> Response {
         Err(err) => internal_error(&err),
     }
 }
+
+/// HTTP 请求体上限（字节）。与 `normalize` 的逐字段上限共同构成「边缘 + 语义」双层防护：
+/// 边缘先拦住明显超规的巨请求，语义层再校验字段长度，避免单 token 持有者撑爆内存 / 磁盘。
+pub const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 
 /// 装配路由：
 /// - `/health` 公开；
@@ -63,7 +68,6 @@ async fn list_projects(meta: DatabaseConnection) -> Response {
 ///         否则永远无法登录。若把它并进同一个 `route_layer`，`POST /session` 会
 ///         在进入 handler 前就被 401 拒掉——这是一个只在「第一次用浏览器」时才暴露的
 ///         装配错误，故有对应用例钉住。
-///
 /// @intent 控制台路由的兜底顺序（`/admin` → `/assets/*` → 其余 `/*path` 回退到入口 HTML）
 ///         是 SPA 的必要条件：Vue Router 使用 history 模式，用户刷新 `/admin/projects/foo`
 ///         时浏览器会真的请求那个路径，而服务端只有 `index.html` 一个页面。
@@ -152,6 +156,11 @@ pub fn create_app(state: AppState) -> Router {
         .merge(asset_routes)
         .merge(mcp_routes)
         .nest("/api/v1", session_routes.merge(api_routes))
+        // 边缘 body 上限：先拦住明显超规的巨请求，再交给语义层（normalize）做字段级校验。
+        // 放在最外层，使 /mcp 嵌套服务与 /api/v1 都受同一上限约束。
+        // 用 `BodyLimitLayer` 而非 `DefaultBodyLimit`：后者只给 axum 自有提取器设默认上限，
+        // 不会限制 rmcp 嵌套服务读取的原始 body（审计发现的盲区）。
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
 }
 
 #[cfg(test)]
@@ -345,6 +354,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// 请求体超过上限必须在边缘被拒（413），不得进入协议层或落到 normalize 校验。
+    ///
+    /// @intent S2 审计：此前 `/mcp` 等端点无 body 上限，单 token 持有者可借此拖垮服务端。
+    ///         本用例钉死「巨 body 在鉴权之后、解析之前被 413 拦下」。显式带 `Content-Length`
+    ///         ——边缘层据此在调用 rmcp 之前即短路返回 413，而非让协议层读爆后兜底成 500。
+    #[tokio::test]
+    async fn oversized_request_body_is_rejected_with_413() {
+        let (app, _dir) = setup().await;
+        // 1.5 MiB 的合法 JSON-RPC 体外壳，远超 MAX_REQUEST_BODY_BYTES
+        let big = "a".repeat(MAX_REQUEST_BODY_BYTES + 512 * 1024);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": { "junk": big }
+        })
+        .to_string();
+        let len = body.len();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_LENGTH, len)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "超限 body 必须 413"
+        );
     }
 
     /// 未授权请求必须在进入 MCP 协议层之前被拒（无 token 时连 Host 校验都不该走到）。
