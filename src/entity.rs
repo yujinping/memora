@@ -32,6 +32,40 @@ pub mod project {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+/// 控制台账号实体：`users` 表（全局 `_meta.db`）。
+///
+/// @intent 在此之前「控制台凭据」是一对配置项（`admin_user` + `admin_password_hash`），
+///         只能有一个账号，且换账号必须改文件、重启服务。有了本表之后账号是**数据**：
+///         可增删、可改口令，而配置文件退化为「初始管理员的种子」。
+pub mod user {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "users")]
+    pub struct Model {
+        /// 登录名（主键；大小写敏感，与展示名一致）
+        ///
+        /// @intent 不做归一化（例如强制小写）：登录名同时是日志里的主体标识，
+        ///         静默改写会让「我明明建的是 Alice」变成一次无效排查。
+        #[sea_orm(primary_key, column_type = "Text")]
+        pub username: String,
+        /// 口令的 Argon2id PHC 串（**不存明文**）
+        #[sea_orm(column_type = "Text")]
+        pub password_hash: String,
+        /// 创建时间（Unix 秒）
+        #[sea_orm(column_type = "BigInteger")]
+        pub created_at: i64,
+        /// 最近一次口令变更时间（Unix 秒）
+        #[sea_orm(column_type = "BigInteger")]
+        pub updated_at: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 /// 项目库（`data/{project_id}/mem.db`）实体：实体 / 观测 / 关系三元组。
 ///
 /// @intent sea-orm 在该文件中仅作为**后端实现内部的** SQL 执行层与类型映射层，

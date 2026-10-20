@@ -108,6 +108,23 @@ impl SessionStore {
         self.lock().remove(id).is_some()
     }
 
+    /// 销毁某账号的全部会话，返回被销毁的条数。
+    ///
+    /// @intent 删除账号时必须调用它：会话表与账号表是两份独立状态，只删账号会让
+    ///         被删者手里的 Cookie 继续有效到过期（最长 12 小时）——
+    ///         表现为「删了账号，对方还进得来」，而这正是「删账号」这一动作
+    ///         要消除的风险。
+    ///
+    /// @intent 返回条数而不是 `() `：handler 把它写进日志与响应，
+    ///         「删掉 0 个会话」与「删掉 2 个会话」对排查是不同的信息
+    ///         （前者说明对方没登录，后者说明刚刚踢掉了两台设备）。
+    pub fn remove_user(&self, user: &str) -> usize {
+        let mut guard = self.lock();
+        let before = guard.len();
+        guard.retain(|_, session| session.user != user);
+        before - guard.len()
+    }
+
     /// 当前会话数（含尚未被清理的过期条目）。
     ///
     /// @intent 仅供测试观察 `create` / `remove` 对表的实际影响。刻意不叫 `len`：
@@ -368,6 +385,29 @@ mod tests {
         store.remove(&a);
         assert!(store.get(&a).is_none());
         assert!(store.get(&b).is_some(), "登出其中一个不应影响另一个");
+    }
+
+    // ------------------------------------------------------- 按账号销毁
+
+    /// 删除某账号时连带销毁它的全部会话，且不得波及别人的会话。
+    ///
+    /// @intent 这是「删账号」这一动作真正生效的一半：只删账号行的话，
+    ///         被删者手里的 Cookie 仍能用满 12 小时，而这恰好是删除账号要消除的风险。
+    #[test]
+    fn removing_a_user_revokes_only_that_users_sessions() {
+        let store = SessionStore::new();
+        let alice_a = store.create("alice").unwrap();
+        let alice_b = store.create("alice").unwrap();
+        let bob = store.create("bob").unwrap();
+
+        assert_eq!(store.remove_user("alice"), 2, "应销毁 alice 的两个会话");
+        assert!(store.get(&alice_a).is_none());
+        assert!(store.get(&alice_b).is_none());
+        assert!(store.get(&bob).is_some(), "bob 的会话不得被波及");
+        assert_eq!(store.count_sessions(), 1);
+
+        assert_eq!(store.remove_user("alice"), 0, "重复销毁应返回 0 而非 panic");
+        assert_eq!(store.remove_user("never-existed"), 0);
     }
 
     // ------------------------------------------------------------ Cookie

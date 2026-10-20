@@ -48,6 +48,10 @@ pub struct NewProject {
 }
 
 /// 建表 + 迁移（幂等：可对全新库与 P1 遗留库重复执行）。
+///
+/// @intent `users` 表与 `projects` 表同库同生命周期：账号是控制台的凭据来源，
+///         而 `_meta.db` 是唯一「一定存在」的库（它由启动流程保证）。把账号放进
+///         项目库会让「没有项目时无法登录」——那恰好是首次部署的状态。
 pub async fn init_meta_db(db: &DatabaseConnection) -> anyhow::Result<()> {
     // SQL 一律由 DEFAULT_BACKEND 插值，使「默认后端」在全库只有一处字面量；
     // 该常量是内部固定值，不来自用户输入，无注入面。
@@ -63,6 +67,26 @@ pub async fn init_meta_db(db: &DatabaseConnection) -> anyhow::Result<()> {
     db.execute(Statement::from_string(DbBackend::Sqlite, sql))
         .await?;
     ensure_backend_column(db).await?;
+    ensure_users_table(db).await?;
+    Ok(())
+}
+
+/// 建 `users` 表（P7 控制台账号）。
+///
+/// @intent 单独一个 `CREATE TABLE IF NOT EXISTS`，与 `projects` 并列而不是塞进上面
+///         那条格式串：两张表没有关系，混在一条语句里只会让「加一张表」变成
+///         「改一条长 SQL」。
+async fn ensure_users_table(db: &DatabaseConnection) -> anyhow::Result<()> {
+    db.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "CREATE TABLE IF NOT EXISTS users (\
+            username TEXT PRIMARY KEY, \
+            password_hash TEXT NOT NULL, \
+            created_at INTEGER NOT NULL, \
+            updated_at INTEGER NOT NULL\
+        )",
+    ))
+    .await?;
     Ok(())
 }
 
@@ -151,6 +175,29 @@ pub async fn find_project(
         .one(db)
         .await?;
     Ok(row.map(record_of))
+}
+
+/// 更新项目 token 的摘要，返回项目是否存在。
+///
+/// @intent 「轮换 token」是控制台里「token 丢了 / 疑似泄漏」的**唯一出路**：
+///         库内只有摘要，读不回来，只能换一把新的。返回 `bool` 让 handler 区分
+///         「项目不存在（404）」与「已轮换（200）」——静默成功会让界面上显示一个
+///         实际没生效的新 token。
+///
+/// @intent 只改 `token_hash`，不动 `db_path` 与 `backend`：轮换凭据不该影响
+///         数据的存放位置，否则一次「换 token」会连带把项目迁移到别处。
+pub async fn update_token(
+    db: &DatabaseConnection,
+    project_id: &str,
+    token: &str,
+) -> anyhow::Result<bool> {
+    let affected = Projects::update_many()
+        .col_expr(Column::TokenHash, Expr::value(sha256_hex(token)))
+        .filter(Column::ProjectId.eq(project_id))
+        .exec(db)
+        .await?
+        .rows_affected;
+    Ok(affected > 0)
 }
 
 /// 删除项目登记行，返回是否确有该行。
