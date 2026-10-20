@@ -1,0 +1,89 @@
+/**
+ * 全局样式与设计变量。
+ *
+ * @author yujinping
+ * @intent 用 Tailwind v4 的 CSS-first 配置：主题色在这里以 CSS 变量声明，
+ *         组件里一律写语义名（`bg-surface` / `text-muted`）而不是具体色值。
+ *         这样「深色/浅色」只是换一组变量，不必在每个组件里写 `dark:` 变体——
+ *         后者的规模会随组件数量线性增长，且总有几处会被漏掉。
+ *
+ * @intent 深色是默认且是唯一被刻意调过的主题：本服务的使用场景是开发者
+ *         在自己的机器 / 服务器上长时间挂着，而浅色主题作为「跟在系统后面」
+ *         的兜底存在（见 `@media (prefers-color-scheme: light)`），
+ *         不追求两套都精雕细琢。
+ */
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0e1116;
+  --color-surface: #161b23;
+  --color-surface-2: #1d2430;
+  --color-surface-3: #252e3c;
+  --color-line: #2b3543;
+  --color-ink: #e7ebf2;
+  --color-muted: #94a1b5;
+  --color-faint: #6b7788;
+  --color-brand: #4c8dff;
+  --color-brand-ink: #ffffff;
+  --color-danger: #ff6b6b;
+  --color-warn: #f0b34a;
+  --color-ok: #3ddc97;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --color-bg: #f3f5f9;
+    --color-surface: #ffffff;
+    --color-surface-2: #f7f9fc;
+    --color-surface-3: #eef2f8;
+    --color-line: #dbe2ec;
+    --color-ink: #1a2130;
+    --color-muted: #5b6779;
+    --color-faint: #8a95a5;
+    --color-brand: #2563eb;
+    --color-danger: #d92d20;
+    --color-warn: #b45309;
+    --color-ok: #067647;
+  }
+}
+
+html,
+body {
+  background-color: var(--color-bg);
+  color: var(--color-ink);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 等宽字体用于标识符：项目 id、token、task_id、文件路径。
+   这类内容需要逐字符辨认，比例字体里的 `l/1/I` 与 `0/O` 会直接导致抄错。 */
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-ligatures: none;
+}
+
+/* 焦点环：键盘导航必须看得见。用 outline 而不是 box-shadow，
+   这样它不会改变布局尺寸，也不会被 overflow 裁掉。 */
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 1px;
+}
+
+/* 滚动条：默认样式在深色背景上是一块亮色，视觉上非常突兀。 */
+* {
+  scrollbar-color: var(--color-surface-3) transparent;
+  scrollbar-width: thin;
+}
+
+/* 页面切换动画。刻意只有 120ms：控制台的导航是高频操作，
+   任何超过 200ms 的过渡都会让「点一下」感觉迟钝。 */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 120ms ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
