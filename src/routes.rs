@@ -35,7 +35,11 @@ async fn list_projects(meta: DatabaseConnection) -> Response {
 
 /// 装配路由：
 /// - `/health` 公开；
-/// - `/admin` 公开：网页控制台页面本体，不含任何数据，登录由页面自行发起；
+/// - `/admin` 公开：控制台 SPA 入口，不含任何数据，登录由页面自行发起；
+/// - `/assets/*` 公开：控制台的构建产物（js / css），同样不含任何数据；
+///   ⚠ 它们看起来「只是一堆静态文件」，但**不是**公开前缀之外的东西：
+///   漏掉这一条的表现是「页面能打开、样式与脚本全 404」，而 HTML 本身 200，
+///   排查时极易误判为前端构建问题。
 /// - `/mcp` 为 MCP Streamable HTTP 端点，需 **Bearer 项目 token**；
 /// - `/api/v1/session` 登录 / 登出 / 自检（登录必须公开，故单独成群、不挂鉴权中间件）；
 /// - `/api/v1` 其余端点需管理凭据：`ADMIN_TOKEN` Bearer，或控制台会话 Cookie。
@@ -59,6 +63,12 @@ async fn list_projects(meta: DatabaseConnection) -> Response {
 ///         否则永远无法登录。若把它并进同一个 `route_layer`，`POST /session` 会
 ///         在进入 handler 前就被 401 拒掉——这是一个只在「第一次用浏览器」时才暴露的
 ///         装配错误，故有对应用例钉住。
+///
+/// @intent 控制台路由的兜底顺序（`/admin` → `/assets/*` → 其余 `/*path` 回退到入口 HTML）
+///         是 SPA 的必要条件：Vue Router 使用 history 模式，用户刷新 `/admin/projects/foo`
+///         时浏览器会真的请求那个路径，而服务端只有 `index.html` 一个页面。
+///         兜底必须**排在 `/mcp`、`/api/v1`、`/assets` 之后**，否则一次手滑就会把
+///         MCP 的 POST 吞进 HTML 里——那种缺陷在浏览器里看不出来，只在客户端 404。
 pub fn create_app(state: AppState) -> Router {
     // MCP 端点：Bearer 鉴权 → 注入 ProjectRepos → 交给 rmcp 协议层
     let mcp_routes = Router::new()
@@ -89,6 +99,20 @@ pub fn create_app(state: AppState) -> Router {
         .route("/projects/{id}", delete(admin::delete_project))
         .route("/projects/{id}/stats", get(admin::project_stats))
         .route("/projects/{id}/graph", get(admin::project_graph))
+        // token 轮换（P7）：旧 token 立即失效，明文只在新响应里出现一次
+        .route(
+            "/projects/{id}/token",
+            post(admin::rotate_project_token),
+        )
+        // 控制台账号（P7）：登录名是路径段，故含非法字符时由 handler 自行判定
+        .route(
+            "/users",
+            get(admin::list_users).post(admin::create_user),
+        )
+        .route(
+            "/users/{username}",
+            delete(admin::delete_user).put(admin::update_user_password),
+        )
         // 交接（P4.3）：静态段 `pending` 必须先于 `{task_id}` 注册（matchit 对静态段
         // 优先，但先注册是防退化的自文档写法），并有专门用例钉住路由遮蔽。
         .route(
@@ -114,10 +138,18 @@ pub fn create_app(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_auth))
         .with_state(state.clone());
 
-    // 公开端点：健康检查与控制台页面
+    // 控制台静态资源：命中清单直接吐字节，未命中一律 404（不回退 HTML——
+    // 否则一个写错的 js 路径会拿到 200 的 HTML，浏览器报语法错误，极难定位）
+    let asset_routes = Router::new()
+        .route("/assets/{*path}", get(console::asset))
+        .route("/favicon.svg", get(console::icon));
+
+    // 公开端点：健康检查、控制台入口、SPA 路由回退
     Router::new()
         .route("/health", get(health))
         .route("/admin", get(console::page))
+        .route("/admin/{*path}", get(console::page))
+        .merge(asset_routes)
         .merge(mcp_routes)
         .nest("/api/v1", session_routes.merge(api_routes))
 }
@@ -168,11 +200,16 @@ mod tests {
         setup_with_console(false).await
     }
 
-    /// 同上，但可开启网页控制台登录（配置 `admin_user` / `admin_password_hash`）。
+    /// 同上，但可播种一份控制台账号。
     ///
-    /// @intent 控制台相关用例需要一份真实的口令哈希，而 argon2 的默认参数单次约需
-    ///         数十毫秒——若每个用例都现算，整套测试会被拖慢到难以接受。故此处算一次、
-    ///         在所有控制台用例间共享（`console_app` 的 OnceLock）。
+    /// @intent 控制台登录的真相源是 `users` 表，不是配置项——配置里的
+    ///         `admin_user` / `admin_password_hash` 只在 `memora init` 时充当
+    ///         **种子**。故此处直接往库里写账号，而不是改 `config`：
+    ///         后者在改完之后「配置有口令但表是空的」，登录会一律 401，
+    ///         测试会以「口令错误」的形式误报。
+    ///
+    /// @intent 口令哈希由 `console_password_hash` 缓存共享——argon2 默认参数单次约需
+    ///         数十毫秒，每个用例现算会把整套测试拖慢到难以接受。
     async fn setup_with_console(with_console: bool) -> (Router, PathBuf) {
         let data_dir = temp_data_dir();
         let meta_path = data_dir.join("_meta.db");
@@ -203,8 +240,12 @@ mod tests {
         // 免得多造一份配置（两份配置容易在后续改动中悄悄分叉）。
         let storage = StorageRegistry::from_config(&config).unwrap();
         if with_console {
+            // @intent 只改 `admin_user`（供 `status` 在 Bearer 登录时回报身份），
+            //         口令则写进 `users` 表——即生产路径下 `memora init` 所做的那一步。
             config.admin_user = CONSOLE_USER.to_string();
-            config.admin_password_hash = console_password_hash();
+            crate::users::create(&db, CONSOLE_USER, &console_password_hash())
+                .await
+                .unwrap();
         }
 
         let state = AppState::new(db, config, storage);
@@ -1942,7 +1983,7 @@ mod tests {
         assert!(html.contains("Memora"), "应返回控制台页面");
     }
 
-    /// 未配置口令时，自检接口必须如实报告，且登录被拒。
+    /// 没有控制台账号时，自检接口必须如实报告，且登录被拒。
     ///
     /// @intent 这是「功能不可用」与「口令错」的分野：前者页面会给修复指引，
     ///         后者只是提示重试。若两者都返回裸 401，用户只能看到一个无法登录、
@@ -1956,6 +1997,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["console_login_enabled"], false);
         assert_eq!(body["authenticated"], false);
+        assert_eq!(body["users"], 0, "账号数应如实为 0：{body}");
 
         let (status, body, _) = send_with_cookie(
             app,
@@ -1971,8 +2013,8 @@ mod tests {
             body["detail"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("not configured"),
-            "应明确告知是「未配置口令」而非「口令错误」：{body}"
+                .contains("no console account"),
+            "应明确告知是「尚无账号」而非「口令错误」：{body}"
         );
     }
 

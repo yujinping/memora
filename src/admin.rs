@@ -19,6 +19,7 @@ use crate::meta::{self, NewProject};
 use crate::reply;
 use crate::state::AppState;
 use crate::storage::{validate_project_id, BackendKind, ProjectRepos};
+use crate::users;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -70,6 +71,228 @@ pub struct DeleteProjectResponse {
     pub project_id: String,
     /// 是否确实删除了持久化数据；后端未注册时为 `false`（如实报告，不假装成功）
     pub data_removed: bool,
+}
+
+/// 轮换项目 token 的响应体。
+///
+/// @intent 形状与 [`CreateProjectResponse`] 刻意保持一致（`project_id` / `token` /
+///         `backend`），使控制台可以复用同一段「一次性展示 token」的界面。
+///         唯一的语义差别是 `token` 是**新**的、旧 token 已立即失效。
+#[derive(Debug, Serialize)]
+pub struct RotateTokenResponse {
+    /// 项目标识
+    pub project_id: String,
+    /// 新明文 token（仅此一次；旧 token 已失效）
+    pub token: String,
+    /// 该项目使用的存储后端标识
+    pub backend: String,
+}
+
+/// 轮换项目 token：生成新 token → 覆盖摘要 → 返回明文（仅此一次）。
+///
+/// @intent 与「删除 + 重建项目」的区别是本接口存在的全部理由：重建会连同记忆一起
+///         丢掉，而轮换只换凭据。token 泄漏时的正确处置是轮换，不是销毁数据。
+///
+/// @intent 不做「旧 token 宽限期」：一次轮换之后旧 token 立刻 401。宽限期看起来
+///         更平滑，实际是把「泄漏的 token 还能用一段时间」做成默认行为——
+///         而用户按下「轮换」时的预期恰恰相反。
+pub async fn rotate_project_token(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Response {
+    if let Err(err) = validate_project_id(&project_id) {
+        return reply::bad_request("invalid_request", &err.to_string());
+    }
+
+    let record = match meta::find_project(&state.meta, &project_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return project_not_found(&project_id),
+        Err(err) => return reply::internal_error(&err),
+    };
+
+    let token = match auth::generate_token() {
+        Ok(token) => token,
+        Err(err) => return reply::internal_error(&err),
+    };
+
+    match meta::update_token(&state.meta, &project_id, &token).await {
+        Ok(true) => {}
+        // 查到了又更新不到：另一个请求刚删掉了它。按 404 报告，与「本来就没有」同解。
+        Ok(false) => return project_not_found(&project_id),
+        Err(err) => return reply::internal_error(&err),
+    }
+
+    tracing::info!(project_id = %project_id, "project token rotated");
+    Json(RotateTokenResponse {
+        project_id,
+        token,
+        backend: record.backend,
+    })
+    .into_response()
+}
+
+// ---------------------------------------------------------------- 控制台账号（P7）
+
+/// 创建账号请求体。
+#[derive(Debug, Deserialize)]
+pub struct CreateUserRequest {
+    /// 登录名（不得含空白，见 `users::validate_username`）
+    pub username: String,
+    /// 明文口令（仅在本次请求的内存中存在，入库前哈希）
+    pub password: String,
+}
+
+/// 修改口令请求体。
+#[derive(Debug, Deserialize)]
+pub struct UpdatePasswordRequest {
+    /// 新明文口令
+    pub password: String,
+}
+
+/// 账号的对外形态。
+///
+/// @intent **不含** `password_hash`：它属于「永远不该出现在响应里」的字段，
+///         而漏掉一次就是一个离线爆破的起点。单独定义视图而不是给
+///         `users::UserRecord` 加 `Serialize`，是为了让「加一个字段」不会
+///         顺手把哈希也带上——那样必须显式改这里。
+#[derive(Debug, Serialize)]
+pub struct UserView {
+    /// 登录名
+    pub username: String,
+    /// 创建时间（Unix 秒）
+    pub created_at: i64,
+    /// 最近一次口令变更时间（Unix 秒）
+    pub updated_at: i64,
+}
+
+impl From<users::UserRecord> for UserView {
+    fn from(record: users::UserRecord) -> Self {
+        Self {
+            username: record.username,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
+/// 账号列表。
+pub async fn list_users(State(state): State<AppState>) -> Response {
+    match users::list(&state.meta).await {
+        Ok(records) => Json(records.into_iter().map(UserView::from).collect::<Vec<_>>())
+            .into_response(),
+        Err(err) => reply::internal_error(&err),
+    }
+}
+
+/// 创建账号（201）。
+///
+/// @intent 口令强度在**能拿到明文的唯一时刻**校验（与 `config` 模块对
+///         `--admin-password` 的处置同源）：入库存的是哈希，之后再无从判断强度。
+///         弱口令不会让任何检查失败，只会在某天被爆破。
+pub async fn create_user(
+    State(state): State<AppState>,
+    Json(req): Json<CreateUserRequest>,
+) -> Response {
+    let username = match users::validate_username(&req.username) {
+        Ok(name) => name,
+        Err(reason) => return reply::bad_request("invalid_request", &reason),
+    };
+
+    if let Some(reason) = crate::password::weak_password_reason(&req.password) {
+        return reply::bad_request("weak_password", &reason);
+    }
+
+    // 先查后插：与 `create_project` 同一取向——在此拦下能给出 409，而唯一约束
+    // 在库层兜底（并发插入时后到者得到 500，而不是静默覆盖原口令）。
+    match users::find(&state.meta, &username).await {
+        Ok(Some(_)) => {
+            return reply::conflict(
+                "user_exists",
+                &format!("user `{username}` already exists"),
+            )
+        }
+        Ok(None) => {}
+        Err(err) => return reply::internal_error(&err),
+    }
+
+    let hash = match crate::password::hash_password(&req.password) {
+        Ok(hash) => hash,
+        Err(err) => return reply::internal_error(&err),
+    };
+    if let Err(err) = users::create(&state.meta, &username, &hash).await {
+        return reply::internal_error(&err);
+    }
+
+    tracing::info!(user = %username, "console user created");
+    match users::find(&state.meta, &username).await {
+        Ok(Some(record)) => (StatusCode::CREATED, Json(UserView::from(record))).into_response(),
+        Ok(None) => reply::internal_error(&"user vanished right after being created"),
+        Err(err) => reply::internal_error(&err),
+    }
+}
+
+/// 删除账号。
+///
+/// @intent **拒绝删除最后一个账号**：删掉它会让控制台永久无法登录（登录需要库里有
+///         账号），而唯一的补救手段是手工改库或删掉 `_meta.db`——后者会连带
+///         丢掉全部项目登记。这不是「多一层保护」，而是这个操作在这个状态下
+///         等于把管理面锁死。
+///
+/// @intent 顺带**销毁该账号的所有会话**：不这么做的话，被删账号手里的 Cookie
+///         还能继续用到会话过期（最长 12 小时），「删账号」看起来生效了一半。
+pub async fn delete_user(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+) -> Response {
+    match users::count(&state.meta).await {
+        Ok(total) if total <= 1 => {
+            return reply::conflict(
+                "last_user",
+                "refusing to delete the only console account: it would leave no way to \
+                 sign in; create another account first",
+            )
+        }
+        Ok(_) => {}
+        Err(err) => return reply::internal_error(&err),
+    }
+
+    match users::delete(&state.meta, &username).await {
+        Ok(true) => {
+            let removed = state.sessions.remove_user(&username);
+            tracing::info!(user = %username, sessions = removed, "console user deleted");
+            Json(json!({ "username": username, "sessions_revoked": removed })).into_response()
+        }
+        Ok(false) => reply::not_found("not_found", &format!("user `{username}` not found")),
+        Err(err) => reply::internal_error(&err),
+    }
+}
+
+/// 修改口令。
+///
+/// @intent 改口令**不踢掉已有会话**（与删除账号相反）：用户改口令的动机通常是
+///         「想换一个」，而不是「怀疑被入侵」。若怀疑被入侵，正确动作是删除账号；
+///         把两者混在一起会让「改个口令」变成一次强制重新登录，收益为零。
+pub async fn update_user_password(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    Json(req): Json<UpdatePasswordRequest>,
+) -> Response {
+    if let Some(reason) = crate::password::weak_password_reason(&req.password) {
+        return reply::bad_request("weak_password", &reason);
+    }
+    let hash = match crate::password::hash_password(&req.password) {
+        Ok(hash) => hash,
+        Err(err) => return reply::internal_error(&err),
+    };
+
+    match users::update_password(&state.meta, &username, &hash).await {
+        Ok(true) => {
+            tracing::info!(user = %username, "console password updated");
+            Json(json!({ "username": username })).into_response()
+        }
+        Ok(false) => reply::not_found("not_found", &format!("user `{username}` not found")),
+        Err(err) => reply::internal_error(&err),
+    }
 }
 
 /// 项目用量统计。

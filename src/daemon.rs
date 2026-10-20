@@ -1165,7 +1165,9 @@ mod tests {
     ///         模板改了必须重新编译（模板经 `include_str!` 内嵌）。
     #[test]
     fn reverse_proxy_template_covers_every_public_prefix() {
-        for prefix in ["/mcp", "/api/v1", "/admin", "/health"] {
+        // 前缀清单必须与 `routes::create_app` 的公开路由一致：漏一条的表现是
+        // 「直连正常、反代 404」（/admin 与 /assets 都踩过），而两边各自看都没错。
+        for prefix in ["/admin", "/assets/", "/favicon.svg", "/mcp", "/api/v1", "/health"] {
             assert!(
                 CADDYFILE.contains(&format!("handle {prefix}")),
                 "反代模板缺少对 {prefix} 的代理规则——公网部署下该前缀会返回 404：\n{CADDYFILE}"

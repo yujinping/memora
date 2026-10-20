@@ -40,6 +40,7 @@ mod routes;
 mod session;
 mod state;
 mod storage;
+mod users;
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -193,11 +194,37 @@ fn finish(result: Result<i32>) -> ExitCode {
 async fn serve(config: Config) -> Result<()> {
     std::fs::create_dir_all(&config.data_dir)?;
 
-    // 元库 _meta.db 存放项目注册信息（projects 表）
+    // 元库 _meta.db 存放项目注册信息（projects 表）与控制台账号（users 表）
     let meta_path = Path::new(&config.data_dir).join("_meta.db");
     let url = format!("sqlite://{}?mode=rwc", meta_path.display());
     let db = Database::connect(&url).await?;
     meta::init_meta_db(&db).await?;
+
+    // 控制台账号的种子：配置里的 `admin_user` / `admin_password_hash` 只在
+    // `users` 表为空时生效（见 `users::bootstrap_admin`）。此后账号以库为准，
+    // 改配置不再影响登录——这条边界写在这里而不是散在 handler 里，
+    // 是为了让「账号到底从哪来」只有一个答案。
+    match users::bootstrap_admin(&db, &config.admin_user, &config.admin_password_hash).await {
+        Ok(users::BootstrapOutcome::Created { username }) => {
+            tracing::info!(user = %username, "seeded the initial console admin from the config")
+        }
+        Ok(users::BootstrapOutcome::Skipped { existing }) => tracing::debug!(
+            users = existing,
+            "console users already exist; the config credentials are ignored (library wins)"
+        ),
+        Ok(users::BootstrapOutcome::NoSecret) => tracing::warn!(
+            config_file = %config.config_path.display(),
+            "no console account exists and no admin password is configured: \
+             the web console cannot be used until you run `memora init --force` \
+             or create an account in the console"
+        ),
+        // 种子失败不该让服务起不来：MCP 与脚本用的 ADMIN_TOKEN 通路完全不依赖它。
+        // 但必须显式告警——否则「控制台登不进去」会变成一次无从排查的静默失败。
+        Err(err) => tracing::error!(
+            error = %err,
+            "failed to seed the initial console admin; the console may be unusable"
+        ),
+    }
 
     // 存储后端注册表：本构建可用的后端 + 校验默认后端
     let storage = StorageRegistry::from_config(&config)?;
@@ -254,17 +281,21 @@ fn warn_about_risky_config(config: &Config) {
 
     // 未配置控制台口令是**允许**的（只用 MCP 与脚本的部署无需它），但必须让运维知道
     // 「为什么 /admin 打不开」——否则这就是一次无从排查的「功能好像没有」。
+    //
+    // @intent P7 起这条告警的含义变了：`admin_password_hash` 现在只是**种子**，
+    //         真正决定能否登录的是 `_meta.db.users` 里有没有账号。故这里只在
+    //         「配置里没有口令」时提示如何补种，而不再声称「控制台登录被禁用」——
+    //         库里已有账号时，那句话是错的。
     if !config.console_login_enabled() {
         tracing::warn!(
             config_file = %config.config_path.display(),
-            "admin_password_hash is not set: the web console (/admin) is available but its \
-             login is disabled. Run `memora init --force` to generate credentials, or set \
-             admin_password_hash in the config file"
+            "admin_password_hash is not set: if the users table is empty the console has no \
+             account to sign in with. Run `memora init --force` to generate seed credentials"
         );
     } else {
         tracing::info!(
             user = %config.admin_user,
-            "web console enabled at /admin"
+            "web console available at /admin (config credentials seed the first account only)"
         );
     }
 

@@ -1,4 +1,4 @@
-//! 网页控制台：`/admin` 页面本体，以及它使用的登录 / 登出 / 自检接口。
+//! 网页控制台：会话接口（登录 / 登出 / 自检）与内嵌前端产物。
 //!
 //! @author yujinping
 //! @intent 背景：管理面最初只有 `POST /api/v1/projects` 这类接口，创建项目必须 `curl`
@@ -6,33 +6,74 @@
 //!         人类界面**（设计文档里检索「控制台 / 登录 / 浏览器」为零命中），
 //!         于是「怎么建一个项目」这件事只有脚本能回答。本模块补上这条路。
 //!
-//! @intent 页面以 `include_str!` 内嵌进二进制，不引入前端构建步骤、不新增依赖，
-//!         与 `deploy/` 模板的做法一致；仍是单二进制，拷过去就能用。
-//!         代价是改动页面需要重新编译——对一个自托管服务而言，这比引入
-//!         node 工具链划算得多。
+//! @intent P7：控制台从一张手写 HTML（638 行内联脚本）升级为 **Vue3 + Vite + Tailwind**
+//!         构建的 SPA。构建产物由 `build.rs` 收集、经 `include_bytes!` 内嵌，
+//!         运行时由 [`asset`] 按路径直接吐字节——没有 `dist` 目录、没有运行时解压，
+//!         仍然是一个可执行文件拷过去就能用的单二进制。
+//!         代价是改动前端需要先 `pnpm build`；`build.rs` 会在产物缺失时用占位页替换，
+//!         使「只改后端」的场景不必装 node 工具链（见 `build.rs` 的文档）。
 //!
 //! @intent 页面**不携带任何凭据**：它自己在浏览器里请求 `/api/v1/session` 登录，
 //!         凭据存在会话 Cookie 中（HttpOnly，脚本读不到）。因此 `/admin` 本身
-//!         无需鉴权——它只是一张登录表单，没有任何数据。
+//!         无需鉴权——它只是一份空壳 HTML，没有任何数据。
+//!
+//! @intent 账号来源在 P7 换成了 `_meta.db.users`（见 [`crate::users`]）：本模块的登录
+//!         只负责「查库校验 → 开会话」，不再直接读配置里的口令哈希。配置文件里的
+//!         `admin_user` / `admin_password_hash` 退化为**首次启动的种子**。
 //!
 //! 状态码约定（与 `admin` 模块一致）：
-//! - 401：口令错误，或未配置登录口令（凭据无法成立）
+//! - 401：口令错误，或系统中还没有任何可登录账号（凭据无法成立）
 //! - 403：来源不被接受（跨站写请求）
-//! - 500：服务端故障（熵源不可用）
+//! - 500：服务端故障（元库不可用、熵源不可用）
 
 use crate::auth::{authenticate_admin, AdminIdentity};
-use crate::password;
 use crate::reply;
 use crate::session;
 use crate::state::AppState;
+use crate::users;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-/// `/admin` 页面本体（内嵌）。
-const CONSOLE_HTML: &str = include_str!("console.html");
+/// 前端构建产物清单（由 `build.rs` 生成）。
+///
+/// @intent 用「生成一个 Rust 源文件」而不是「生成的 JSON + 运行时解析」：后者要求
+///         字节序列以 `&'static [u8]` 之外的形式存在（例如 `Vec<u8>` 常量），
+///         等于在启动时多做一次无意义的拷贝与解析；而 `include_bytes!` 直接把
+///         文件内容编进只读数据段，零运行时代价。
+mod manifest {
+    include!(concat!(env!("OUT_DIR"), "/console_assets.rs"));
+}
+
+/// 单条内嵌资源。
+pub struct Asset {
+    /// 去掉前导 `/` 的请求路径（如 `assets/index-abc123.js`）
+    pub path: &'static str,
+    /// 文件内容
+    pub bytes: &'static [u8],
+    /// 响应用的 MIME 类型
+    pub content_type: &'static str,
+    /// 是否是可以长期缓存的指纹资源（文件名含内容哈希）
+    pub immutable: bool,
+}
+
+/// 全部内嵌资源（含 `index.html`）。
+pub static ASSETS: &[Asset] = manifest::ASSETS;
+
+/// SPA 入口文件（服务端渲染不了路由，所有未知路径都回退到它）。
+pub static INDEX_HTML: &[u8] = manifest::INDEX_HTML;
+
+/// 按请求路径查找资源。
+///
+/// @intent 线性扫描而非哈希表：资源数量是个位数（入口 HTML + 一个 js + 一个 css），
+///         构建一个 `HashMap` 的成本远高于扫这几次字符串比较，而且它得是
+///         `LazyLock`——启动时多一次分配，换来的收益为零。
+pub fn find_asset(path: &str) -> Option<&'static Asset> {
+    let trimmed = path.trim_start_matches('/');
+    ASSETS.iter().find(|asset| asset.path == trimmed)
+}
 
 /// 登录请求体。
 #[derive(Debug, Deserialize)]
@@ -56,39 +97,120 @@ pub struct LoginResponse {
 ///
 /// @intent `console_login_enabled` 会暴露给未登录访客。这是刻意的：页面必须知道
 ///         该不该渲染登录框，否则只能给一个必然失败的输入界面。它泄漏的信息
-///         仅限于「这台 memora 是否配了控制台口令」，对攻击者没有实际帮助。
+///         仅限于「这台 memora 是否已建过任何账号」，对攻击者没有实际帮助。
 #[derive(Debug, Serialize)]
 pub struct SessionStatus {
-    /// 是否已配置控制台口令（未配置时登录不可用）
+    /// 系统中是否存在可登录账号（无账号时登录不可用）
     pub console_login_enabled: bool,
     /// 本次请求是否已通过鉴权
     pub authenticated: bool,
     /// 已登录时的用户名
     pub user: Option<String>,
+    /// 账号总数（凭证来自库，故此处顺带给出规模，便于「为什么进不去」的判断）
+    ///
+    /// @intent 这与 `console_login_enabled` 是同一件事的两种精度，看似冗余，
+    ///         但它们在页面上的用途不同：前者决定「是否渲染登录框」，
+    ///         后者用于在「一个账号都没有」时给出**可执行**的修复指引
+    ///         （`memora init` 还是手工建账号，取决于是否曾经播种过）。
+    pub users: usize,
 }
 
-/// 返回控制台页面。
+/// 返回控制台页面（SPA 入口）。
 ///
-/// @intent `Cache-Control: no-store`：页面本身不含数据，但浏览器缓存它反而会造成
-///         「已更新二进制、浏览器仍跑旧页面」的困惑，而这不属于值得排查的问题。
+/// @intent `Cache-Control: no-store`：入口 HTML 的指纹资源名会随后端版本变化，
+///         而浏览器缓存 HTML 反而会造成「已更新二进制、浏览器仍跑旧页面」的困惑，
+///         这不属于值得排查的问题。指纹资源本身则走 [`asset_response`] 的
+///         `immutable` 长缓存。
 pub async fn page() -> Response {
+    html_response(INDEX_HTML)
+}
+
+/// `GET /assets/{path}`：返回一份构建产物。
+///
+/// @intent 未命中时返回 **404 而不是回退入口 HTML**。回退看起来更"友好"，
+///         实际会让一个写错的 js 路径拿到 `200 text/html`，浏览器随后报
+///         `Unexpected token '<'`——错误信息指向 HTML 内容而不是缺失的文件。
+///         静态资源就该有静态资源的语义失败。
+pub async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    match find_asset(&format!("assets/{path}")) {
+        Some(asset) => asset_response(asset),
+        None => {
+            tracing::debug!(path = %path, "console asset not found");
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
+}
+
+/// `GET /favicon.svg`：站点图标。
+///
+/// @intent 单独一条路由而不是让前端产物带一个二进制 ico：SVG 是纯文本、
+///         体积小到可以直接写在源码里，且 `favicon` 缺失会在每个浏览器里留一条
+///         404 噪声日志——正好掩盖真正需要看的那条。
+pub async fn icon() -> Response {
+    const FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+<rect width="32" height="32" rx="8" fill="#4c8dff"/>
+<path d="M9 22V10h3l4 6 4-6h3v12h-3v-7l-4 6-4-6v7z" fill="#fff"/>
+</svg>"##;
     (
         StatusCode::OK,
         [
-            ("content-type", "text/html; charset=utf-8"),
-            ("cache-control", "no-store"),
-            // 页面不含任何外部资源与内联事件处理器之外的脚本来源，故可以收紧到
-            // `self`；`'unsafe-inline'` 仅用于页面内的 <script> 与 <style>。
-            (
-                "content-security-policy",
-                "default-src 'none'; style-src 'self' 'unsafe-inline'; \
-                 script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; \
-                 form-action 'none'",
-            ),
-            ("x-content-type-options", "nosniff"),
-            ("referrer-policy", "same-origin"),
+            (header::CONTENT_TYPE.as_str(), "image/svg+xml"),
+            (header::CACHE_CONTROL.as_str(), "public, max-age=86400"),
         ],
-        CONSOLE_HTML,
+        FAVICON,
+    )
+        .into_response()
+}
+
+/// 以控制台入口的响应头返回一份 HTML。
+///
+/// @intent CSP 收紧到 `'self'`：前端产物已无任何内联脚本与内联样式
+///         （Vite 把 js/css 都产出为独立文件），故 `'unsafe-inline'` 可以彻底去掉。
+///         这是把控制台换成构建产物的一个附带收益——手写页面时代它必须留着
+///         `'unsafe-inline'`，否则页面自身的 `<script>` 与 `<style>` 都跑不起来。
+///
+/// @intent `img-src 'self' data:`：允许内联 SVG 图标（`data:` 不可执行，
+///         且比放开一整类外部域安全得多）。
+fn html_response(body: &'static [u8]) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL.as_str(), "no-store"),
+            (
+                header::CONTENT_SECURITY_POLICY.as_str(),
+                "default-src 'none'; style-src 'self'; script-src 'self'; \
+                 connect-src 'self'; img-src 'self' data:; font-src 'self'; \
+                 base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS.as_str(), "nosniff"),
+            (header::REFERRER_POLICY.as_str(), "same-origin"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// 返回一份静态资源。
+///
+/// @intent 缓存策略分两档，判据是「文件名是否含内容哈希」而不是「是不是 HTML」：
+///         Vite 产出的 `assets/index-<hash>.js` 内容与名字一一对应，可以永久缓存；
+///         入口 HTML 与 `favicon.ico` 这类固定名字的资源必须 `no-store`，
+///         否则升级后浏览器会拿旧 HTML 去引用已不存在的旧 js，页面白屏。
+pub fn asset_response(asset: &Asset) -> Response {
+    let cache = if asset.immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE.as_str(), asset.content_type),
+            (header::CACHE_CONTROL.as_str(), cache),
+            (header::X_CONTENT_TYPE_OPTIONS.as_str(), "nosniff"),
+        ],
+        asset.bytes,
     )
         .into_response()
 }
@@ -97,59 +219,67 @@ pub async fn page() -> Response {
 ///
 /// @intent 之所以公开：它是页面的启动调用，必须在登录之前就能问出「要不要显示登录框」。
 ///         它不返回任何项目数据，只回答「你是谁 / 要不要登录」。
+///
+/// @intent 账号数为 0 时 `console_login_enabled` 为 `false`，而不是「True 但登录必失败」。
+///         这两种表达对页面的含义完全不同：前者可以给出修复指引，后者只能让用户
+///         对着一个永远 401 的登录框反复重试。
 pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let identity = authenticate_admin(&state, &headers);
+    let total = match users::count(&state.meta).await {
+        Ok(total) => total,
+        Err(err) => return reply::internal_error(&err),
+    };
     Json(SessionStatus {
-        console_login_enabled: state.config.console_login_enabled(),
+        console_login_enabled: total > 0,
         authenticated: identity.is_some(),
         user: match identity {
             Some(AdminIdentity::Session { user }) => Some(user),
             Some(AdminIdentity::BearerToken) => Some(state.config.admin_user.clone()),
             None => None,
         },
+        users: total,
     })
     .into_response()
 }
 
 /// 登录：校验用户名与口令，成功后签发会话 Cookie。
 ///
-/// @intent 用户名不匹配时**仍然执行**一次口令校验。否则「用户名错」会因跳过 argon2
-///         而快出一个数量级，形成可利用的用户名枚举信道；而用户名恰恰是本服务唯一
-///         的公开标识（默认 `admin`），一旦可枚举，爆破就只需面对口令这一层。
-///         因此两个条件都先求值、再合并判定。
+/// @intent 校验**完全**交给 [`users::authenticate`]：那里已经处理了「账号不存在时
+///         也要跑一次哈希」这一时序要求（否则会形成账号枚举信道），
+///         而此处若自己拼 `find` + `verify`，这条约束就会在重构中悄悄丢失。
 pub async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Response {
-    if !state.config.console_login_enabled() {
+    let total = match users::count(&state.meta).await {
+        Ok(total) => total,
+        Err(err) => return reply::internal_error(&err),
+    };
+    if total == 0 {
         tracing::warn!(
             config_file = %state.config.config_path.display(),
-            "login attempt rejected: no admin password is configured"
+            "login attempt rejected: no console user exists yet"
         );
         return reply::unauthorized_with(
-            "console login is not configured; set admin_password_hash in the config file \
-             (or run `memora init`)",
+            "no console account exists yet; run `memora init` to seed the initial admin \
+             (it uses admin_user / admin_password_hash from the config file)",
         );
     }
 
-    let user_ok = crate::auth::constant_time_eq(
-        req.username.trim().as_bytes(),
-        state.config.admin_user.as_bytes(),
-    );
-    // 无论用户名对错都要跑完：见本函数的 @intent。
-    let password_ok = password::verify_password(&req.password, &state.config.admin_password_hash);
+    let record = match users::authenticate(&state.meta, &req.username, &req.password).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            tracing::warn!(
+                user = %req.username.trim(),
+                "console login failed"
+            );
+            return reply::unauthorized_with("invalid username or password");
+        }
+        Err(err) => return reply::internal_error(&err),
+    };
 
-    if !(user_ok && password_ok) {
-        tracing::warn!(
-            user = %req.username.trim(),
-            username_matched = user_ok,
-            "console login failed"
-        );
-        return reply::unauthorized_with("invalid username or password");
-    }
-
-    let id = match state.sessions.create(&state.config.admin_user) {
+    let id = match state.sessions.create(&record.username) {
         Ok(id) => id,
         Err(err) => return reply::internal_error(&err),
     };
@@ -161,12 +291,12 @@ pub async fn login(
         &session::build_session_cookie(&id, session::SESSION_TTL, secure),
     );
 
-    tracing::info!(user = %state.config.admin_user, "console login succeeded");
+    tracing::info!(user = %record.username, "console login succeeded");
     (
         StatusCode::OK,
         response_headers,
         Json(LoginResponse {
-            user: state.config.admin_user.clone(),
+            user: record.username,
             expires_in_secs: session::SESSION_TTL.as_secs(),
         }),
     )
@@ -198,140 +328,149 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
 mod tests {
     use super::*;
 
-    /// 内嵌页面必须真的存在、非空，且引用了控制台所需的接口。
+    /// 内嵌资源必须真的存在、非空，且入口 HTML 引用了指纹资源。
     ///
-    /// @intent `include_str!` 的路径错误会在编译期报错，但**内容走样**（例如误改了
-    ///         文件名指向一个空文件）不会。这条断言把「页面被打包进二进制」钉住。
-    ///
-    /// @intent 断言的是「API 前缀 + 路径片段」，而不是拼好的完整 URL：页面里写的是
-    ///         `const API = "/api/v1"` 与 `api("GET", "/session")`，完整串
-    ///         `/api/v1/session` 在源码中根本不存在。按完整串断言会得到一个
-    ///         永远失败的用例，而永远失败的用例的归宿是被删掉——测试必须描述
-    ///         实现里真实存在的东西。这一点在实测中踩到过。
+    /// @intent `include_bytes!` 的路径错误会在编译期报错，但**内容走样**
+    ///         （例如 `build.rs` 吐了一个占位页）不会。这条断言把「前端产物真的
+    ///         被打包进二进制」钉住——占位页的构建也必须能跑通测试，所以这里
+    ///         断言的是一份**真产物**独有的特征：`<script type="module">` 引用了
+    ///         `/assets/` 下的指纹文件。
     #[test]
-    fn embedded_console_page_is_present_and_self_contained() {
-        assert!(CONSOLE_HTML.len() > 1024, "页面内容过短，疑似未正确内嵌");
+    fn embedded_console_is_a_real_vite_build() {
+        let html = String::from_utf8_lossy(INDEX_HTML);
+        assert!(html.len() > 256, "入口页面过短，疑似占位页：{html}");
+        assert!(html.contains("<!DOCTYPE html") || html.contains("<!doctype html"));
         assert!(
-            CONSOLE_HTML.contains("<!DOCTYPE html") || CONSOLE_HTML.contains("<html"),
-            "应是一份完整的 HTML 文档"
+            html.contains("/assets/"),
+            "入口页面必须引用 /assets/ 下的构建产物：{html}"
         );
 
+        let scripts: Vec<&Asset> = ASSETS
+            .iter()
+            .filter(|a| a.content_type.contains("javascript"))
+            .collect();
+        let styles: Vec<&Asset> = ASSETS
+            .iter()
+            .filter(|a| a.content_type.contains("css"))
+            .collect();
+        // @intent 不断言「js 恰好一个」：路由用 `() => import(...)` 懒加载页面，
+        //         每个页面因此成为一个独立分块（当前约 9 个）。钉死数量会让
+        //         「新增一个页面」变成一次测试失败，而它并不是错误。
+        //         真正需要钉住的是「入口引用的 js/css 都在清单里」与
+        //         「css 只有一份」——后者是因为 Vite 的样式产物不会分块，
+        //         出现两份通常意味着 `@theme` 被某处重复引入。
+        assert!(!scripts.is_empty(), "应当至少内嵌一个 js 产物");
+        assert_eq!(styles.len(), 1, "应当恰好内嵌一个 css 产物");
         assert!(
-            CONSOLE_HTML.contains(r#"const API = "/api/v1""#),
-            "页面必须把管理接口统一挂在 /api/v1 前缀下"
+            scripts.iter().any(|a| a.path == "assets/index.js"),
+            "入口分块缺失，清单：{:?}",
+            ASSETS.iter().map(|a| a.path).collect::<Vec<_>>()
         );
-        for endpoint in ["/session", "/projects", "/graph"] {
-            assert!(
-                CONSOLE_HTML.contains(endpoint),
-                "页面必须调用 {endpoint} 接口"
-            );
-        }
 
-        // 不得引用任何外部资源：自托管常无外网，且外链会引入供应链与隐私问题。
-        for forbidden in ["http://cdn", "https://cdn", "//unpkg", "googleapis"] {
+        for asset in ASSETS {
+            assert!(!asset.bytes.is_empty(), "资源为空：{}", asset.path);
             assert!(
-                !CONSOLE_HTML.contains(forbidden),
-                "页面不得依赖外部资源：{forbidden}"
+                !asset.path.starts_with('/'),
+                "清单里的路径不得带前导斜杠：{}",
+                asset.path
             );
         }
     }
 
-    /// 页面必须包含「token 只显示一次」的提示——这是创建流程里最容易造成不可逆
-    /// 损失的认知点（明文 token 只在创建响应里出现一次）。
-    #[test]
-    fn embedded_page_warns_that_the_token_is_shown_once() {
-        assert!(
-            CONSOLE_HTML.contains("只显示一次") || CONSOLE_HTML.contains("仅显示一次"),
-            "页面必须明示 token 只出现一次"
-        );
-    }
-
-    /// 脚本引用的每一个元素 id 都必须真实存在，且 id 不得重复。
+    /// 入口 HTML 引用的每个 `/assets/...` 都必须在清单里能找到。
     ///
-    /// @intent 这是**无浏览器**条件下最有价值的一条断言。控制台的脚本在文档末尾一次性
-    ///         绑定全部按钮与输入框，任何一个 id 拼错都会在 `addEventListener` 处抛
-    ///         `TypeError: Cannot read properties of null`，**且脚本就此中断**——表现是
-    ///         「页面打开后一片空白，登录框都不出现」，而服务端日志里没有任何异常
-    ///         （浏览器端错误不会回传），端到端 HTTP 用例也全绿。
-    ///         这类缺陷在没有浏览器的环境里几乎只能靠肉眼逐行比对，故固化下来。
-    ///
-    /// @intent id 重复同样致命：`getElementById` 只返回第一个匹配元素，
-    ///         第二个永远不会被绑定，症状与拼错 id 完全一样（点了没反应）。
+    /// @intent 这是**无浏览器**条件下最有价值的一条断言：`build.rs` 若只收集了
+    ///         一部分文件（例如正则漏掉了 `.css`），页面会在浏览器里静默丢掉样式，
+    ///         而服务端日志毫无异常、HTTP 用例也全绿。这类缺陷只能靠比对清单钉住。
     #[test]
-    fn every_dom_reference_in_the_page_resolves() {
-        let ids = collect_ids(CONSOLE_HTML);
-        assert!(!ids.is_empty(), "页面里应至少有一个带 id 的元素");
-
+    fn every_asset_referenced_by_the_entry_page_is_embedded() {
+        let html = String::from_utf8_lossy(INDEX_HTML);
         let mut missing = Vec::new();
-        for reference in collect_id_references(CONSOLE_HTML) {
-            if !ids.contains(&reference) {
-                missing.push(reference);
+        let mut rest = html.as_ref();
+        while let Some(at) = rest.find("/assets/") {
+            rest = &rest[at..];
+            let end = rest
+                .find(|c: char| c == '"' || c == '\'' || c == '>' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            let reference = &rest[..end];
+            if find_asset(reference).is_none() {
+                missing.push(reference.to_string());
             }
+            rest = &rest[end..];
         }
         assert!(
             missing.is_empty(),
-            "脚本引用了不存在的元素 id：{missing:?}（页面共有 {ids:?}）"
+            "入口页面引用了未内嵌的资源：{missing:?}（清单：{:?}）",
+            ASSETS.iter().map(|a| a.path).collect::<Vec<_>>()
         );
     }
 
-    /// 展示不可信内容时只许走 `textContent`，不得用任何解析 HTML 的写入口。
+    /// 指纹资源必须长缓存，入口页面必须不缓存。
     ///
-    /// @intent 控制台展示的实体名与观测内容都来自 AI 客户端写入的记忆库，是不可信数据。
-    ///         用 `innerHTML` 渲染等于在自己的管理界面里开一个存储型 XSS——而这一条
-    ///         用肉眼审查极难持续保证（任何一个新字段都可能顺手写成 innerHTML）。
-    ///         断言里用带前导点的 `.innerHTML` 而非裸词，是为了不与注释中
-    ///         「绝不使用 innerHTML」这句话本身冲突。
+    /// @intent 两者写反的后果不对称且都很隐蔽：指纹资源 `no-store` 只是浪费带宽，
+    ///         而入口 HTML 被缓存会让**升级后白屏**——旧 HTML 指向已不存在的旧 js。
     #[test]
-    fn page_renders_untrusted_text_without_html_parsing_apis() {
-        for forbidden in [
-            ".innerHTML",
-            ".outerHTML",
-            "insertAdjacentHTML",
-            "document.write(",
-            "eval(",
-        ] {
-            assert!(
-                !CONSOLE_HTML.contains(forbidden),
-                "页面不得使用 {forbidden}：记忆内容是不可信数据，必须经 textContent 写入"
-            );
-        }
+    fn cache_policy_follows_content_addressing() {
+        let html = Asset {
+            path: "index.html",
+            bytes: b"x",
+            content_type: "text/html",
+            immutable: false,
+        };
+        let js = Asset {
+            path: "assets/index-abc.js",
+            bytes: b"x",
+            content_type: "application/javascript",
+            immutable: true,
+        };
+        // @intent 这里只断言「空路径不命中」与「前导斜杠会被归一化」，
+        //         不断言 `index.html` 能被 `find_asset` 命中——入口页面走的是
+        //         独立的 `INDEX_HTML` 常量与 `page` handler，**不在** `ASSETS`
+        //         清单里（见 `build.rs` 里 `if relative == ENTRY { continue }`）。
+        //         断言它会命中，等于要求清单里存两份入口页面。
+        assert!(find_asset("").is_none(), "空路径不得命中任何资源");
         assert!(
-            CONSOLE_HTML.contains("node.textContent = String(opts.text)"),
-            "页面应存在一个统一经 textContent 写文本的建元素助手"
+            find_asset("assets/index.js").is_some(),
+            "入口分块应在清单中，清单：{:?}",
+            ASSETS.iter().map(|a| a.path).collect::<Vec<_>>()
         );
-    }
+        assert!(
+            find_asset("/assets/index.js").is_some(),
+            "带前导斜杠也应命中（服务端需与浏览器给出的路径形态无关）"
+        );
+        assert!(
+            find_asset("assets/missing.js").is_none(),
+            "清单外的资源必须落空，交由 handler 返回 404"
+        );
 
-    /// 收集 HTML 里全部 `id="..."` 取值；重复即断言失败。
-    fn collect_ids(html: &str) -> std::collections::BTreeSet<String> {
-        let mut ids = std::collections::BTreeSet::new();
-        let mut rest = html;
-        while let Some(at) = rest.find("id=\"") {
-            rest = &rest[at + 4..];
-            let Some(end) = rest.find('"') else { break };
-            let id = &rest[..end];
-            assert!(
-                ids.insert(id.to_string()),
-                "元素 id 重复：{id}——getElementById 只会命中的第一个，另一个绑不上事件"
-            );
-            rest = &rest[end..];
-        }
-        ids
-    }
+        // 通过响应头验证策略（不进 axum 状态机，直接看构造结果）
+        let js_resp = asset_response(&js);
+        let policy = js_resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(policy.contains("immutable"), "指纹资源应可永久缓存：{policy}");
 
-    /// 收集脚本里 `$("...")` 形式的元素引用。
-    ///
-    /// @intent 页面的取元素助手固定叫 `$` 且只接受字符串字面量，故这种朴素扫描足够；
-    ///         若将来引入 `$(变量)` 的用法，本函数会静默漏掉它——那时需要改成
-    ///         真正的解析而不是正则。
-    fn collect_id_references(html: &str) -> Vec<String> {
-        let mut found = Vec::new();
-        let mut rest = html;
-        while let Some(at) = rest.find("$(\"") {
-            rest = &rest[at + 3..];
-            let Some(end) = rest.find('"') else { break };
-            found.push(rest[..end].to_string());
-            rest = &rest[end..];
-        }
-        found
+        let html_resp = html_response(html.bytes);
+        let policy = html_resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(policy, "no-store", "入口 HTML 不得被缓存");
+
+        let csp = html_resp
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !csp.contains("unsafe-inline"),
+            "构建产物不应再需要 unsafe-inline：{csp}"
+        );
     }
 }
