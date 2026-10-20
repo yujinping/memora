@@ -128,7 +128,8 @@ http://localhost:6789/admin
 | 会话 | 内存会话表 + `HttpOnly; SameSite=Strict` Cookie，12 小时**绝对**过期（不滑动、重启即失效）；检测到 HTTPS 时自动加 `Secure` |
 | 退出登录 | 页面上的「退出」，或 `DELETE /api/v1/session`（幂等，未登录也返回 204） |
 | 关闭控制台 | 把 `config.toml` 的 `admin_password_hash` 留空**且**库里没有账号——只用 MCP 的部署不需要它。此时 `/admin` 明确提示「尚无控制台账号，请运行 `memora init`」，而不是给一个必然失败的登录框 |
-| 公网部署 | 反代必须放行 `/admin`、`/assets/*` 与 `/favicon.svg`（`deploy/Caddyfile` 已含）。页面本身不含任何数据 |
+| 公网部署 | 反代必须放行 `/admin*`、`/assets/*` 与 `/favicon.svg`（`deploy/Caddyfile` 已含）。页面本身不含任何数据 |
+| 访问入口 | 控制台地址是 `https://<域名>/admin`。**根路径 `/` 返回 404 是设计行为**，不做跳转（见「部署到 2GB 服务器」一节的说明） |
 | 页面安全 | 记忆内容一律**插值渲染**（不用 `v-html`，避免存储型 XSS）；CSP 已去掉 `'unsafe-inline'`（构建产物无内联脚本/样式） |
 | token 轮换 | 项目页的「换 token」可只轮换 token 而不动数据（`POST /projects/{id}/token`），旧 token **立即**失效 |
 
@@ -452,19 +453,28 @@ sudo mkswap /swapfile && sudo swapon /swapfile
 
 > 两种形态共用同一份二进制——这正是不做「纯自守护」的原因：`Restart=always` 只能在 systemd 侧提供。
 
-反代用 **Caddy** 自动签发 Let's Encrypt 证书，`memora init` 会渲染好配置片段。生产只需暴露四个前缀，其余一律 404：
+反代用 **Caddy** 自动签发 Let's Encrypt 证书，`memora init` 会渲染好配置片段。生产只需暴露六个前缀，其余一律 404：
 
 ```caddyfile
 mem.example.com {
 	handle /mcp*      { reverse_proxy 127.0.0.1:6789 }
 	handle /api/v1/*  { reverse_proxy 127.0.0.1:6789 }
-	handle /admin     { reverse_proxy 127.0.0.1:6789 }   # 控制台页面，漏了它公网就打不开
-	handle /admin     { reverse_proxy 127.0.0.1:6789 }   # 控制台页面，漏了它公网就打不开
+	handle /admin*    { reverse_proxy 127.0.0.1:6789 }   # 控制台 SPA；必须是前缀匹配，见下
+	handle /assets/*  { reverse_proxy 127.0.0.1:6789 }   # 控制台 js / css，漏了页面一片空白
+	handle /favicon.svg { reverse_proxy 127.0.0.1:6789 }
 	handle /health    { reverse_proxy 127.0.0.1:6789 }
 	handle            { respond 404 }   # 记忆库里是私有内容，不该有未预期的暴露面
 	encode zstd gzip
 }
 ```
+
+> **`/admin` 必须写成 `handle /admin*`（前缀匹配），不能写成 `handle /admin`（精确匹配）。**
+> 控制台是 Vue Router 的 history 模式，子路由（`/admin/projects`、`/admin/users` …）会被浏览器真的请求；
+> 精确匹配只放行入口页本身，于是在站内点任何一个菜单都会 404。
+>
+> **根路径 `/` 刻意返回 404**，这不是故障：控制台挂在 `/admin` 下，根路径不属于它，也不做重定向。
+> 访问控制台请直接用 `https://<你的域名>/admin`。刻意不做跳转的原因是最小暴露面——域名根路径被扫描器
+> 高频探测，返回一个不含信息的 404 比返回 302 更少透露「这里有一个可登录入口」。`/health` 同样只回 `ok`。
 
 SQLite 侧启用 `journal_mode=WAL` 与 `synchronous=NORMAL`，且**同一项目的连接池按项目串行创建**（WAL 的独占锁不受 `busy_timeout` 保护，并发建池必然 `database is locked`）。WAL 亦使「停机时优雅退出」成为必要——SIGTERM 后应用需自行收尾落盘。
 
