@@ -113,21 +113,24 @@ http://localhost:6789/admin
 ```
 
 用 `memora init` 生成的控制台用户名 / 口令登录（口令在 `init` 的输出里**只显示一次**），
-即可在页面上完成 **建项目 → 复制 token → 打开项目的记忆库**（实体 / 观测 / 关系，
-支持按实体名、类型、观测内容本地过滤），注销项目也在页面上。
+即可在页面上完成 **建项目 → 复制 token → 浏览记忆 / 交接 → 管理账号**。
 在此之前，「怎么建一个项目」这件事只有脚本能回答——这是原始设计里一处真实的缺口，
 补上的正是这条路径。
 
 | 项 | 说明 |
 |---|---|
-| 凭据形态 | 用户名 + 口令（默认用户名 `admin`）。口令以 **Argon2id** 哈希写入 `config.toml`，任何位置都不存明文 |
-| 口令从哪来 | `memora init` 生成 20 位随机口令并只打印一次；重置用 `memora init --force` |
-| 也可自己指定 | `--admin-password <明文>`（加载时即哈希，不落盘）、`--admin-password-hash <PHC>`，或环境变量 `ADMIN_PASSWORD` / `ADMIN_PASSWORD_HASH`。明文短于 8 字符**直接拒绝启动**——口令强度只在能拿到明文的那一刻可判 |
+| 前端技术栈 | **Vue 3 + Vite + Tailwind CSS v4**（`web/`），产物内嵌进二进制，**单文件即可发布** |
+| 凭据形态 | 用户名 + 口令（默认种子用户名 `admin`）。口令以 **Argon2id** 哈希写入 `_meta.db` 的 `users` 表 |
+| 账号从哪来 | `users` 表为空时，用 `config.toml` 的 `admin_user` / `admin_password_hash` **播种**第一个管理员；之后**以库为准**，改配置不再影响登录 |
+| 多账号 | 控制台「账号」页可增删账号、改口令。删账号会立即踢掉该账号的全部会话；**最后一个账号禁止删除**（否则谁都被锁在门外） |
+| 口令从哪来 | `memora init` 生成 20 位随机口令并只打印一次；忘记且进不去时重跑 `memora init --force` 重新播种 |
+| 也可自己指定 | `--admin-password <明文>`（启动时即哈希，不落盘）、`--admin-password-hash <PHC>`，或环境变量 `ADMIN_PASSWORD` / `ADMIN_PASSWORD_HASH`。明文短于 8 字符**直接拒绝启动**——口令强度只在能拿到明文的那一刻可判 |
 | 会话 | 内存会话表 + `HttpOnly; SameSite=Strict` Cookie，12 小时**绝对**过期（不滑动、重启即失效）；检测到 HTTPS 时自动加 `Secure` |
 | 退出登录 | 页面上的「退出」，或 `DELETE /api/v1/session`（幂等，未登录也返回 204） |
-| 关闭控制台 | 把 `config.toml` 的 `admin_password_hash` 留空——只用 MCP 的部署不需要它。此时 `/admin` 明确提示「未配置登录口令」，而不是给一个必然失败的登录框 |
-| 公网部署 | 反代必须放行 `/admin`（`deploy/Caddyfile` 已含）。页面本身不含任何数据，只是一张登录表单 |
-| 页面安全 | 记忆内容一律经 `textContent` 渲染（不用 `innerHTML`，避免存储型 XSS）；页面带 CSP、不引用任何外部资源 |
+| 关闭控制台 | 把 `config.toml` 的 `admin_password_hash` 留空**且**库里没有账号——只用 MCP 的部署不需要它。此时 `/admin` 明确提示「尚无控制台账号，请运行 `memora init`」，而不是给一个必然失败的登录框 |
+| 公网部署 | 反代必须放行 `/admin`、`/assets/*` 与 `/favicon.svg`（`deploy/Caddyfile` 已含）。页面本身不含任何数据 |
+| 页面安全 | 记忆内容一律**插值渲染**（不用 `v-html`，避免存储型 XSS）；CSP 已去掉 `'unsafe-inline'`（构建产物无内联脚本/样式） |
+| token 轮换 | 项目页的「换 token」可只轮换 token 而不动数据（`POST /projects/{id}/token`），旧 token **立即**失效 |
 
 **两套凭据严格隔离**，这条边界有专门用例守着，防止将来「顺手复用中间件」把它抹掉：
 
@@ -138,6 +141,20 @@ http://localhost:6789/admin
 
 > 会话 Cookie 之所以不能用于 `/mcp`：`/mcp` 的鉴权只认 Bearer 项目 token。
 > 浏览器里的一次登录不应等价于拿到某个项目的记忆读写权。
+
+#### 改前端（可选，只改后端时不需要 Node）
+
+前端产物 `src/console_dist/` **随仓库提交**，因此 `git clone && cargo build` 不需要 Node，
+单二进制发布也不需要构建机装前端工具链。只有改动 `web/` 下的源码时才需要重新生成：
+
+```bash
+scripts/build-web.sh              # 安装依赖（有 lockfile 则严格按锁文件）+ 类型检查 + 构建
+scripts/build-web.sh --no-install # 依赖已装好时只构建
+cd web && pnpm dev                # 开发模式：热更新，/api 与 /mcp 代理到 127.0.0.1:6789
+```
+
+> `build.rs` 在产物缺失时会**直接编译失败**并给出这条命令，而不是内嵌一个占位页——
+> 占位页会让服务正常启动、控制台打开却一片空白，属于「能跑但坏了」的最坏形态。
 
 ### 撤销本地部署
 
@@ -307,8 +324,11 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 | `POST` | `/projects/{id}/handoffs/{task_id}/ack` | 精确接手（CAS，重复 ack 幂等） |
 | `DELETE` | `/projects/{id}/handoffs/{task_id}` | 幂等删除全部修订 |
 | `GET` | `/projects/{id}/graph` | 该项目的全图快照（控制台「记忆浏览」用，只读） |
+| `POST` | `/projects/{id}/token` | **轮换 token**：只换 `token_hash`，不动数据；旧 token 立即失效 |
+| `GET` / `POST` | `/users` | 列账号 / 新建账号（`{username, password}`；口令过短 `400`，重名 `409`） |
+| `DELETE` / `PUT` | `/users/{username}` | 删账号（**最后一个** `409 last_user`，并踢掉其全部会话）/ 改口令 |
 | `POST` | `/session` | 控制台登录（公开；body `{username, password}`）→ 签发会话 Cookie |
-| `GET` | `/session` | 会话自检（公开）→ `{console_login_enabled, authenticated, user}` |
+| `GET` | `/session` | 会话自检（公开）→ `{console_login_enabled, authenticated, user, users}` |
 | `DELETE` | `/session` | 登出（幂等）→ `204` + 立即失效的 Cookie |
 | `GET` | `/health` | 健康检查（公开，无鉴权） |
 
@@ -320,13 +340,13 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 
 | 码 | 含义 | 典型场景 |
 |---|---|---|
-| `400` | 入参可修正 | `project_id` 非法（目录穿越 / 分隔符 / 空白）；请求的后端未编译进本构建（响应附带 `available_backends` 列表）；交接入参非法（空 `goal`、非法 `task_id`、超限） |
+| `400` | 入参可修正 | `project_id` 非法（目录穿越 / 分隔符 / 空白）；请求的后端未编译进本构建（响应附带 `available_backends` 列表）；交接入参非法（空 `goal`、非法 `task_id`、超限）；口令过短（`weak_password`）；登录名含空白或控制字符 |
 | `204` | 无待接手 | 交接零 ID 入口在「没有可接手的交接」时返回（正常状态；`404` 留给指定 `task_id` 不存在） |
 | `300` | 多条待接手 | 交接歧义：响应体给候选摘要，服务端不替调用方挑 |
-| `401` | 凭据问题 | 缺失或错误的 `ADMIN_TOKEN`；控制台用户名或口令错误；会话已过期 / 已登出；未配置登录口令 |
+| `401` | 凭据问题 | 缺失或错误的 `ADMIN_TOKEN`；控制台用户名或口令错误；会话已过期 / 已登出；尚未创建任何控制台账号 |
 | `403` | 来源不被接受 | 用会话 Cookie 鉴权的写请求来自跨源站（CSRF 二次防线） |
-| `404` | 资源不存在 | 项目未登记 |
-| `409` | 资源冲突 | `project_id` 已被占用 |
+| `404` | 资源不存在 | 项目未登记；账号不存在 |
+| `409` | 资源冲突 | `project_id` 已被占用；登录名已存在（`user_exists`）；删除最后一个账号（`last_user`） |
 | `500` | 服务端故障 | 元库不可用、后端未注册、熵源不可用 |
 
 统计口径与客户端**同源**：`stats` 与 `graph` 都走 `read_graph` 派生，而不是另写一套 SQL 查询，
@@ -373,7 +393,9 @@ mcp::dto 只被 tools 与 server 使用
 | `cli.rs` | 子命令与全局选项解析 | 零依赖手写；无子命令等价于 `run`，既有部署零改动 |
 | `daemon.rs` | `start` / `stop` / `restart` / `status` / `init` | 以 `/health` 通过为唯一成功判据；`status` / `stop` 以**实例记录**（pid + port + data_dir + 启动时间 + 版本）为准，而非重新推导配置；**不依赖存储层** |
 | `instance.rs` | 实例记录与进程存活探测 | `kill(pid,0)` 判定，`EPERM` 视为存活；损坏内容报错而非当作「未运行」；记录端口可消除「探错端口」误诊 |
-| `console.rs` | `/admin` 页面与 `/api/v1/session` | 页面**不含任何数据**，故可公开；登录见 `password` + `session` |
+| `console.rs` | `/admin` 页面、`/assets/*` 静态资源与 `/api/v1/session` | 页面**不含任何数据**，故可公开；资源清单由 `build.rs` 在编译期生成；未命中的资源一律 `404`（不回退 HTML） |
+| `build.rs` | 扫描 `src/console_dist/` → 生成内嵌资源清单 | 产物缺失时**编译期失败**（附修复命令），不内嵌占位页 |
+| `users.rs` | `_meta.db.users` 的读写与凭据校验 | 只存 PHC 哈希；账号不存在时也跑一次哈希校验（防枚举信道）；只在表为空时播种 |
 | `password.rs` | 口令哈希 / 校验 / 随机生成 | 只含哈希与口令，**不含任何 HTTP 概念**；随机量仍走系统熵，不引 rand 生态 |
 | `session.rs` | 内存会话表、Cookie 签发与解析、跨源判定 | 用内存表而非签名 Cookie：不必引入长期密钥；会话有效期**绝对**，不滑动 |
 | `admin.rs` | 项目生命周期 handler | 只经 `StorageRegistry` 取 trait 对象，不引用任何具体后端 |

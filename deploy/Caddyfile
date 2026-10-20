@@ -19,11 +19,22 @@ mem.example.com {
 		reverse_proxy 127.0.0.1:__PORT__
 	}
 
-	# 网页控制台。页面本身不含任何数据（只是一张登录表单），
+	# 网页控制台。页面本身不含任何数据（只是一份 SPA 空壳），
 	# 但**必须**在反代里放行，否则公网部署下浏览器打开 /admin 会拿到 404。
 	# 这条是实测发现的：原先只代理 mcp / api / health 三个前缀，
 	# 控制台在 localhost 直连时正常，一上 Caddy 就消失。
-	handle /admin {
+	handle /admin* {
+		reverse_proxy 127.0.0.1:__PORT__
+	}
+
+	# 控制台的构建产物（js / css）。漏掉这一条的形态很隐蔽：入口 HTML 返回 200，
+	# 页面能打开，但脚本与样式全 404，于是看到一片没有样式的空白——
+	# 直连 localhost 时一切正常，只有经反代才出现。
+	handle /assets/* {
+		reverse_proxy 127.0.0.1:__PORT__
+	}
+
+	handle /favicon.svg {
 		reverse_proxy 127.0.0.1:__PORT__
 	}
 
