@@ -110,17 +110,30 @@ async function request<T>(
 
 // ---------------------------------------------------------------- 类型
 
+/** 角色标识。 */
+export type Role = "admin" | "user";
+
 /** 会话自检结果。 */
 export interface SessionStatus {
   console_login_enabled: boolean;
   authenticated: boolean;
   user: string | null;
+  /**
+   * 当前身份的角色；未登录为 `null`。
+   *
+   * @intent 角色**必须**由服务端给出，前端不得从用户名或账号数推算：
+   *         控制台的导航（是否显示「账号」页）依赖它，一旦前端自行判断，
+   *         就会出现「页面显示可点、后端 403」的错位。注意它只影响呈现，
+   *         真正的授权始终在服务端。
+   */
+  role: Role | null;
   users: number;
 }
 
 /** 登录结果。 */
 export interface LoginResult {
   user: string;
+  role: Role;
   expires_in_secs: number;
 }
 
@@ -130,6 +143,13 @@ export interface Project {
   db_path: string;
   backend: string;
   created_at: number;
+  /**
+   * 归属账号；空串 = 无主（迁移前遗留，仅管理员可见）。
+   *
+   * @intent 管理员会把「归属指向不存在账号」的项目（例如账号已被删除）
+   *         在界面上标为失效，故这个字段是自由字符串而不是枚举。
+   */
+  owner: string;
 }
 
 /** 项目用量统计。 */
@@ -188,6 +208,8 @@ export interface ProjectToken {
   project_id: string;
   token: string;
   backend: string;
+  /** 归属账号（新建时即创建者；管理员代建时是管理员自己） */
+  owner: string;
 }
 
 /** 交接摘要（列表用）。 */
@@ -224,6 +246,8 @@ export interface Handoff {
 /** 控制台账号。 */
 export interface ConsoleUser {
   username: string;
+  /** 角色：决定数据范围。管理员管全部，普通账号只管自己名下的项目 */
+  role: Role;
   created_at: number;
   updated_at: number;
 }
@@ -312,12 +336,19 @@ export function listUsers(): Promise<ConsoleUser[]> {
   return request("GET", "/users");
 }
 
-/** 新建账号。 */
+/**
+ * 新建账号。
+ *
+ * @intent `role` 省略时由服务端落在普通账号上（最小权限缺省）。控制台总是
+ *         显式传值，但把它做成可选参数是为了让「建普通账号」这条高频路径
+ *         不必写 `"user"`——高频动作的写法越短，越不会有人图省事去传 admin。
+ */
 export function createUser(
   username: string,
   password: string,
+  role: Role = "user",
 ): Promise<ConsoleUser> {
-  return request("POST", "/users", { username, password });
+  return request("POST", "/users", { username, password, role });
 }
 
 /** 删除账号。 */
@@ -333,4 +364,18 @@ export function updatePassword(
   password: string,
 ): Promise<{ username: string }> {
   return request("PUT", `/users/${encodeURIComponent(username)}`, { password });
+}
+
+/**
+ * 修改账号角色。
+ *
+ * @intent 服务端会顺手刷新该账号**在线会话**的角色快照，故 `sessions_updated`
+ *         是「即时生效了多少个会话」而非「改了几行库」。界面据此告知
+ *         「对方无需重新登录即已生效」。
+ */
+export function updateRole(
+  username: string,
+  role: Role,
+): Promise<{ username: string; role: Role; sessions_updated: number }> {
+  return request("PUT", `/users/${encodeURIComponent(username)}/role`, { role });
 }

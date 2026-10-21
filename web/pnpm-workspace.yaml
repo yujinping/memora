@@ -1,0 +1,12 @@
+# pnpm 11 起，构建脚本白名单从这个文件读取（`package.json` 的 `pnpm` 字段已不再生效）。
+#
+# @intent 为什么只放行 esbuild：它是 vite 的底层打包器，其 postinstall 只做
+#         「校验平台二进制已就位」，没有可被投毒的任意代码执行面。其余依赖
+#         的 postinstall 一律保持禁用——放行一个不需要的脚本，等于给供应链
+#         多留一个入口，而收益为零。
+#
+# @intent 不设这一项时 pnpm 11 会以 `ERR_PNPM_IGNORED_BUILDS` **非零退出**，
+#         表现为 `pnpm build` 在真正调用 vue-tsc / vite 之前就失败，且
+#         错误信息里看不出「是构建脚本白名单问题」——只会看到一串 pnpm 内部栈。
+allowBuilds:
+  esbuild: true

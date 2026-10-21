@@ -1,7 +1,7 @@
 {
   "name": "memora-console",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "Memora (忆庐) 控制台：构建产物内嵌进 Rust 二进制",
   "scripts": {

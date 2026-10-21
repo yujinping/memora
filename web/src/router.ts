@@ -8,10 +8,15 @@
  * @intent 每个业务路由都带 `meta.needsAuth`，守卫统一读它，而不是在守卫里
  *         枚举路径名——新增页面时忘记加权限判断，是这个模式最常见的漏法，
  *         而「默认需要登录」让漏法变成「默认安全」。
+ *
+ * @intent `meta.adminOnly` 与 `meta.needsAuth` 同一取向：默认不设，需要时显式
+ *         标注。这里无法反过来（默认仅管理员），因为绝大多数页面租户都要用。
+ *         即便如此，漏标的后果只是「页面能打开、请求 403」，不会越权——
+ *         真正的授权始终在服务端。
  */
 
 import { createRouter, createWebHistory } from "vue-router";
-import { session } from "./lib/session";
+import { isAdmin, session } from "./lib/session";
 
 const routes = [
   {
@@ -49,7 +54,8 @@ const routes = [
     path: "/users",
     name: "users",
     component: () => import("./views/UsersView.vue"),
-    meta: { title: "账号" },
+    // 账号管理仅管理员可用：租户即便手输 URL 也进不去
+    meta: { title: "账号", adminOnly: true },
   },
   {
     // 兜底：未知路径回到项目页，而不是留一个空白 404——控制台的链接几乎
@@ -70,6 +76,10 @@ export const router = createRouter({
  * @intent 依赖 `session.ready`：应用启动时的自检是异步的，若在它完成之前
  *         就放行/拦截，会得到一次误跳转（先跳到 /login 再跳回来，
  *         表现为地址栏闪两下）。未就绪时先 `refresh()` 等一个答案。
+ *
+ * @intent 角色判定必须排在 `ready` 之后：`ready` 为假时 `role` 一定是 `null`，
+ *         此时按「非管理员」判断会把管理员也挡在账号页外，表现为
+ *         「刷新 /admin/users 时闪回项目页」。
  */
 router.beforeEach(async (to) => {
   if (!session.ready) {
@@ -90,6 +100,12 @@ router.beforeEach(async (to) => {
 
   if (!session.authenticated) {
     return { name: "login", query: { next: to.fullPath } };
+  }
+
+  if (to.meta.adminOnly && !isAdmin()) {
+    // 静默回到项目页：给一个「无权访问」的错误页会把租户引向
+    // 「我是不是该有权限」的困惑，而那个页面对他来说本来就不该存在。
+    return { name: "projects" };
   }
 
   return true;

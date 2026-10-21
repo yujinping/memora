@@ -1,11 +1,17 @@
 <script setup lang="ts">
 /**
- * 账号管理：列表、新建、改口令、删除。
+ * 账号管理：列表、新建、改角色、改口令、删除（仅管理员可见）。
  *
  * @author yujinping
- * @intent 删除按钮在「只剩一个账号」时直接禁用并给出原因，而不是让用户点下去
- *         再收到 409：服务端拒绝它是正确行为，但一个能点却永远失败的按钮
- *         比一个禁用且带说明的按钮难懂得多。
+ * @intent 两档角色，界面必须让它们的差别一眼可见：管理员管全部数据，
+ *         普通账号只管自己名下的项目。把「角色」做成一个不解释的徽标，
+ *         用户只能靠试错去理解权限范围——那是「为什么他看不到数据」
+ *         这类问题的源头。故角色旁直接写出数据范围。
+ *
+ * @intent 删除与降级的禁用判据是**管理员数量**而不是账号数量：只剩一群
+ *         普通账号时，删掉/降级最后一个管理员会让管理面永久锁死。
+ *         服务端同样会拒绝（409 `last_admin`），界面提前禁用是为了
+ *         不让用户点一个必然失败的按钮，而不是替代服务端判断。
  *
  * @intent 改口令**不踢掉已有会话**（这是服务端的语义），界面据此提示：
  *         「已登录的设备无需重新登录」。若用户想踢人，正确动作是删除账号，
@@ -17,9 +23,11 @@ import {
   deleteUser,
   listUsers,
   updatePassword,
+  updateRole,
   type ConsoleUser,
+  type Role,
 } from "../lib/api";
-import { refreshUserCount, session } from "../lib/session";
+import { refreshRole, refreshUserCount, session } from "../lib/session";
 import { formatTime } from "../lib/format";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
 import Toast from "../components/Toast.vue";
@@ -31,6 +39,7 @@ const loadError = ref("");
 /** 新建表单。 */
 const newName = ref("");
 const newPassword = ref("");
+const newRole = ref<Role>("user");
 const creating = ref(false);
 
 /** 改口令表单（`username` 为空表示关闭）。 */
@@ -40,10 +49,33 @@ const saving = ref(false);
 /** 待删除的账号。 */
 const pendingDelete = ref<ConsoleUser | null>(null);
 
+/** 待确认的角色变更。 */
+const pendingRole = ref<{ user: ConsoleUser; role: Role } | null>(null);
+
 const toast = ref<{ message: string; kind: "ok" | "err" } | null>(null);
 
-/** 只剩一个账号时不允许删除。 */
-const lastOne = computed(() => users.value.length <= 1);
+/** 管理员数量。 */
+const adminCount = computed(
+  () => users.value.filter((u) => u.role === "admin").length,
+);
+
+/** 删除该账号是否会锁死管理面。 */
+function isLastAdmin(user: ConsoleUser): boolean {
+  return user.role === "admin" && adminCount.value <= 1;
+}
+
+/** 该账号在界面上是否可被删除。 */
+function canDelete(user: ConsoleUser): boolean {
+  return !isLastAdmin(user);
+}
+
+/** 删除按钮的提示文案。 */
+function deleteHint(user: ConsoleUser): string {
+  if (isLastAdmin(user)) {
+    return "不能删除唯一的管理员：删掉后将无人能管理账号；先提升另一个账号";
+  }
+  return "删除该账号并销毁其全部会话（其名下项目会保留，仅管理员可见）";
+}
 
 function notify(message: string, kind: "ok" | "err" = "ok"): void {
   toast.value = { message, kind };
@@ -72,12 +104,20 @@ async function submitCreate(): Promise<void> {
   if (creating.value) return;
   creating.value = true;
   try {
-    const created = await createUser(newName.value, newPassword.value);
+    const created = await createUser(
+      newName.value,
+      newPassword.value,
+      newRole.value,
+    );
     newName.value = "";
     newPassword.value = "";
+    newRole.value = "user";
     await load();
     await refreshUserCount();
-    notify(`账号 ${created.username} 已创建`, "ok");
+    notify(
+      `账号 ${created.username} 已创建（${created.role === "admin" ? "管理员" : "普通账号"}）`,
+      "ok",
+    );
   } catch (err) {
     notify(err instanceof Error ? err.message : String(err), "err");
   } finally {
@@ -98,6 +138,37 @@ async function submitPassword(): Promise<void> {
     notify(err instanceof Error ? err.message : String(err), "err");
   } finally {
     saving.value = false;
+  }
+}
+
+/**
+ * 提交角色变更。
+ *
+ * @intent 改的若是自己，必须刷新本地身份：否则界面会停在旧角色上——
+ *         降权后「账号」导航还在、点进去满屏 403，是最难自查的一种错位。
+ */
+async function confirmRole(): Promise<void> {
+  const target = pendingRole.value;
+  pendingRole.value = null;
+  if (!target) return;
+  try {
+    const result = await updateRole(target.user.username, target.role);
+    await load();
+    const effect =
+      result.sessions_updated > 0
+        ? `，已即时生效于其 ${result.sessions_updated} 个在线会话（无需重新登录）`
+        : "，对方重新登录时生效";
+    notify(
+      `账号 ${result.username} 已改为${
+        result.role === "admin" ? "管理员" : "普通账号"
+      }${effect}`,
+      "ok",
+    );
+    if (result.username === session.user) {
+      await refreshRole();
+    }
+  } catch (err) {
+    notify(err instanceof Error ? err.message : String(err), "err");
   }
 }
 
@@ -128,10 +199,10 @@ onMounted(load);
       <div>
         <h1 class="text-lg font-semibold">账号</h1>
         <p class="mt-1 text-xs text-muted">
-          能登录控制台的账号都可管理项目与记忆（当前没有角色区分）。
-          配置文件中的
+          管理员可管理全部项目与全部账号；普通账号只能管理自己名下的项目，
+          并且只能修改自己的口令。配置文件中的
           <span class="mono">admin_user / admin_password_hash</span>
-          只在首次启动时用于播种第一个账号。
+          只在首次启动时用于播种第一个管理员。
         </p>
       </div>
       <button
@@ -171,6 +242,17 @@ onMounted(load);
             placeholder="创建后请转交给使用者"
           />
         </div>
+        <div class="w-44">
+          <label for="new-role" class="mb-1.5 block text-xs text-muted">角色</label>
+          <select
+            id="new-role"
+            v-model="newRole"
+            class="w-full rounded-md border border-line bg-surface-2 px-3 py-2 text-sm"
+          >
+            <option value="user">普通账号 · 仅本人数据</option>
+            <option value="admin">管理员 · 全部数据</option>
+          </select>
+        </div>
         <button
           type="submit"
           class="rounded-md bg-brand px-4 py-2 text-sm font-medium text-brand-ink transition-opacity hover:opacity-90 disabled:opacity-50"
@@ -179,6 +261,10 @@ onMounted(load);
           {{ creating ? "创建中…" : "创建账号" }}
         </button>
       </form>
+      <p v-if="newRole === 'admin'" class="mt-3 text-[11px] text-warn">
+        管理员能查看并删除<strong>全部</strong>项目、记忆与账号。仅在确实需要
+        第二个人拥有全部权限时才创建管理员。
+      </p>
     </section>
 
     <!-- 列表 -->
@@ -187,7 +273,7 @@ onMounted(load);
         <h2 class="text-sm font-semibold">
           账号列表
           <span class="ml-1 text-xs font-normal text-faint">
-            {{ users.length }} 个
+            {{ users.length }} 个 · 管理员 {{ adminCount }} 个
           </span>
         </h2>
       </div>
@@ -202,6 +288,7 @@ onMounted(load);
           <thead>
             <tr class="border-b border-line text-xs text-faint">
               <th class="px-4 py-2.5 text-left font-normal">用户名</th>
+              <th class="px-4 py-2.5 text-left font-normal">角色</th>
               <th class="px-4 py-2.5 text-left font-normal">创建时间</th>
               <th class="px-4 py-2.5 text-left font-normal">口令更新</th>
               <th class="px-4 py-2.5 text-right font-normal">操作</th>
@@ -222,6 +309,21 @@ onMounted(load);
                   当前登录
                 </span>
               </td>
+              <td class="px-4 py-2.5">
+                <span
+                  class="rounded border px-1.5 py-0.5 text-[11px]"
+                  :class="
+                    user.role === 'admin'
+                      ? 'border-brand/40 bg-brand/10 text-brand'
+                      : 'border-line bg-surface-2 text-muted'
+                  "
+                >
+                  {{ user.role === "admin" ? "管理员" : "普通账号" }}
+                </span>
+                <span class="ml-2 text-[11px] text-faint">
+                  {{ user.role === "admin" ? "全部数据" : "仅本人数据" }}
+                </span>
+              </td>
               <td class="px-4 py-2.5 text-xs text-muted">
                 {{ formatTime(user.created_at) }}
               </td>
@@ -238,17 +340,38 @@ onMounted(load);
                 <button
                   class="px-1.5 text-xs transition-colors"
                   :class="
-                    lastOne
+                    isLastAdmin(user) && user.role === 'admin'
                       ? 'cursor-not-allowed text-faint'
-                      : 'text-muted hover:text-danger hover:underline'
+                      : 'text-muted hover:text-ink hover:underline'
                   "
-                  :disabled="lastOne"
+                  :disabled="isLastAdmin(user)"
                   :title="
-                    lastOne
-                      ? '不能删除唯一的账号：删掉后将无法再登录控制台'
-                      : '删除该账号并销毁其全部会话'
+                    isLastAdmin(user)
+                      ? '不能降级唯一的管理员：降级后将无人能管理账号'
+                      : user.role === 'admin'
+                        ? '改为普通账号：只能看到自己名下的项目'
+                        : '提升为管理员：可查看并管理全部数据'
                   "
-                  @click="!lastOne && (pendingDelete = user)"
+                  @click="
+                    !isLastAdmin(user) &&
+                      (pendingRole = {
+                        user,
+                        role: user.role === 'admin' ? 'user' : 'admin',
+                      })
+                  "
+                >
+                  {{ user.role === "admin" ? "降为普通" : "提升为管理员" }}
+                </button>
+                <button
+                  class="px-1.5 text-xs transition-colors"
+                  :class="
+                    canDelete(user)
+                      ? 'text-muted hover:text-danger hover:underline'
+                      : 'cursor-not-allowed text-faint'
+                  "
+                  :disabled="!canDelete(user)"
+                  :title="deleteHint(user)"
+                  @click="canDelete(user) && (pendingDelete = user)"
                 >
                   删除
                 </button>
@@ -258,8 +381,12 @@ onMounted(load);
         </table>
       </div>
 
-      <p v-if="lastOne && !loading" class="border-t border-line px-4 py-2 text-[11px] text-faint">
-        只有一账号时删除被禁用：删掉它会让控制台永久无法登录。
+      <p
+        v-if="adminCount <= 1 && !loading && !loadError"
+        class="border-t border-line px-4 py-2 text-[11px] text-faint"
+      >
+        当前只有一个管理员，故它既不能删除也不能降级：那会让账号管理永久无人可用。
+        先提升另一个账号，再来处置它。
       </p>
     </section>
 
@@ -310,6 +437,29 @@ onMounted(load);
     </Teleport>
 
     <ConfirmDialog
+      v-if="pendingRole"
+      :title="pendingRole.role === 'admin' ? '提升为管理员' : '降为普通账号'"
+      :confirm-text="pendingRole.role === 'admin' ? '确认提升' : '确认降级'"
+      :danger="pendingRole.role === 'user'"
+      @confirm="confirmRole"
+      @cancel="pendingRole = null"
+    >
+      <p>
+        账号 <span class="mono text-ink">{{ pendingRole.user.username }}</span>
+        将改为
+        <strong>{{ pendingRole.role === "admin" ? "管理员" : "普通账号" }}</strong
+        >。
+      </p>
+      <p v-if="pendingRole.role === 'admin'" class="mt-2 text-warn">
+        管理员将能查看并删除全部项目、记忆与全部账号。
+      </p>
+      <p v-else class="mt-2">
+        降级后它只能看到自己名下的项目，立刻失去账号管理权限。
+      </p>
+      <p class="mt-2 text-xs text-muted">其在线会话的角色会立即刷新，无需重新登录。</p>
+    </ConfirmDialog>
+
+    <ConfirmDialog
       v-if="pendingDelete"
       title="删除账号"
       confirm-text="确认删除"
@@ -321,7 +471,7 @@ onMounted(load);
         账号 <span class="mono text-ink">{{ pendingDelete.username }}</span>
         将被删除，其全部已登录会话立即失效。
       </p>
-      <p class="mt-2">记忆与项目数据不受影响。</p>
+      <p class="mt-2">记忆与项目数据不受影响；该账号名下的项目会保留，仅管理员可见。</p>
     </ConfirmDialog>
 
     <Toast

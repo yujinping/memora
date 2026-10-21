@@ -115,9 +115,24 @@ CREATE TABLE projects (
   project_id  TEXT PRIMARY KEY,
   token_hash  TEXT NOT NULL,   -- SHA-256(Bearer Token)
   db_path     TEXT NOT NULL,   -- 相对 DATA_DIR 的 SQLite 路径
-  created_at  INTEGER NOT NULL
+  created_at  INTEGER NOT NULL,
+  backend     TEXT NOT NULL DEFAULT 'sqlite_file',  -- 该项目的存储后端（P6）
+  owner       TEXT NOT NULL DEFAULT ''  -- 归属账号（P8）；'' = 无主，仅管理员可见
+);
+
+-- 控制台账号（P4.4；P8 起带角色）
+CREATE TABLE users (
+  username      TEXT PRIMARY KEY,
+  password_hash TEXT NOT NULL,   -- Argon2id PHC 串
+  role          TEXT NOT NULL DEFAULT 'admin',  -- 'admin' | 'user'
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
 );
 ```
+
+`owner` 与 `role` 都是**幂等加列**迁移而来（见 §6.7），老库直接启动即可升级，无需手工操作。
+`projects` 不设指向 `users` 的外键：SQLite 的外键约束默认关闭，加了不生效却会让人误以为有保护，
+归属校验统一在应用层（`AdminIdentity::can_access`）完成。
 
 ### 4.2 项目库 `mem.db`
 ```sql
@@ -213,36 +228,49 @@ CREATE INDEX idx_conv_session ON conversations(session_id, created_at);
 MCP 服务端采用 **rmcp（Rust MCP SDK，3.x）** 实现 Streamable HTTP 传输。与官方 MCP Memory 的差异仅在**检索能力**（本服务额外支持中文片段与词内片段）与**返回结构的丰富度**（带 id 与时间戳），不改变三元组语义。
 
 ### 5.2 REST 管理层（`/api/v1`）
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| POST | `/projects` | 创建项目（生成 token 并返回明文，201） |
-| GET | `/projects` | 项目列表 |
-| DELETE | `/projects/{id}` | 注销项目（删登记行 + 删项目库文件） |
-| GET | `/projects/{id}/stats` | 实体 / 关系 / 观测统计 |
-| GET | `/projects/{id}/graph` | 该项目全图快照（控制台「记忆浏览」用，只读） |
-| POST | `/session` | 控制台登录（**公开**）→ 签发会话 Cookie |
-| GET | `/session` | 会话自检（**公开**）→ 是否已配置口令 / 是否已登录 |
-| DELETE | `/session` | 登出（幂等）→ 204 + 立即失效的 Cookie |
-| GET | `/health` | 健康检查（无鉴权） |
+| 方法 | 路径 | 说明 | 角色 |
+|---|---|---|---|
+| POST | `/projects` | 创建项目（生成 token 并返回明文，201） | 全部（`owner` 恒为本人） |
+| GET | `/projects` | 项目列表 | 全部（管理员全量，租户仅自己） |
+| DELETE | `/projects/{id}` | 注销项目（删登记行 + 删项目库文件） | 全部，仅可见项目 |
+| GET | `/projects/{id}/stats` | 实体 / 关系 / 观测统计 | 全部，仅可见项目 |
+| GET | `/projects/{id}/graph` | 该项目全图快照（控制台「记忆浏览」用，只读） | 全部，仅可见项目 |
+| POST | `/projects/{id}/token` | 轮换项目 token（旧 token 立即失效） | 全部，仅可见项目 |
+| POST / GET | `/projects/{id}/handoffs` | 交接保存 / 列表 | 全部，仅可见项目 |
+| GET / POST | `/projects/{id}/handoffs/pending[/ack]` | 待接手列表 / 批量接手 | 全部，仅可见项目 |
+| GET / DELETE | `/projects/{id}/handoffs/{task_id}[/ack]` | 交接详情 / 删除 / 单个接手 | 全部，仅可见项目 |
+| GET / POST | `/users` | 账号列表 / 新建账号 | **仅管理员** |
+| PUT | `/users/{username}` | 改口令 | 管理员改任何人；租户仅自己 |
+| DELETE | `/users/{username}` | 删除账号（连带销毁其会话） | **仅管理员**（拒绝删最后一个管理员） |
+| PUT | `/users/{username}/role` | 改角色（即时刷新在线会话） | **仅管理员**（拒绝降级最后一个管理员） |
+| POST | `/session` | 控制台登录（**公开**）→ 签发会话 Cookie | 公开 |
+| GET | `/session` | 会话自检（**公开**）→ 是否可登录 / 是否已登录 / 角色 | 公开 |
+| DELETE | `/session` | 登出（幂等）→ 204 + 立即失效的 Cookie | 公开 |
+| GET | `/health` | 健康检查（无鉴权） | 公开 |
+
+「仅可见项目」= 管理员可用任意 id，租户只能用自己的；越权与「id 不存在」返回**逐字相同的模板**（见 §6.2）。
 
 **两条凭据通道**：`ADMIN_TOKEN`（Bearer，给脚本 / CI）或控制台**会话 Cookie**（给浏览器）。
-项目 token **不是**管理凭据，不可用于本前缀。
+项目 token **不是**管理凭据，不可用于本前缀。`ADMIN_TOKEN` 的身份恒为管理员、不属于任何租户——脚本兼容性要求，见 §6.2。
 
 **请求 / 响应契约**
-- `POST /projects`：体为 `{"project_id"?: string, "backend"?: string}`，两字段均可省略——省略 `project_id` 时自动生成 `p_<12 位十六进制>`，省略 `backend` 时取 `STORAGE_BACKEND`。
-- 创建响应 `{"project_id", "token", "backend"}`：**明文 `token` 仅此一次出现**，库内只存 SHA-256，丢失只能重建项目。
+- `POST /projects`：体为 `{"project_id"?: string, "backend"?: string}`，两字段均可省略——省略 `project_id` 时自动生成 `p_<12 位十六进制>`，省略 `backend` 时取 `STORAGE_BACKEND`。**不接受 `owner`**：归属恒为当前身份（否则可代他人建项目）。
+- 创建响应 `{"project_id", "token", "backend", "owner"}`：**明文 `token` 仅此一次出现**，库内只存 SHA-256，丢失只能重建项目。轮换响应形状相同，`owner` 便于控制台复用同一段界面。
+- 列表项 `{"project_id", "db_path", "backend", "created_at", "owner"}`：`owner` 为 `""` 是迁移遗留的无主项目；指向已删账号即为「归属失效」。两种状态都只对管理员可见。
 - 注销响应 `{"project_id", "data_removed": bool}`：`data_removed=false` 表示「登记已撤销，但物理数据未能删除」（该项目的后端未编译进本构建）——如实报告，不假装成功。
-- 统计响应 `{"project_id", "backend", "entities", "relations", "observations"}`，数据一律从 `read_graph` 派生，与 MCP 客户端所见同源。
-- 登录体 `{"username", "password"}` → `{"user", "expires_in_secs"}` + `Set-Cookie`。**用户名错与口令错的响应逐字相同**（差异只进服务端日志），否则会形成用户名枚举信道——而用户名恰是本服务唯一的公开标识（默认 `admin`）。
+- 统计响应 `{"project_id", "backend", "entities", "relations", "observations", "handoffs"}`，数据一律从 `read_graph` 派生，与 MCP 客户端所见同源。
+- 新建账号体 `{"username", "password", "role"?}` → 201 `{"username", "role", "created_at", "updated_at"}`。**`role` 省略时为 `user`**；取值**逐字**匹配 `admin` / `user`，`"Admin"` 与 `"admin "` 一律 400——入参宽容等于把拼错的值升级成最高权限。
+- 改角色体 `{"role"}` → `{"username", "role", "sessions_updated"}`；`sessions_updated` 是被刷新角色快照的在线会话数（0 = 对方当前未登录）。
+- 登录体 `{"username", "password"}` → `{"user", "role", "expires_in_secs"}` + `Set-Cookie`。**用户名错与口令错的响应逐字相同**（差异只进服务端日志），否则会形成用户名枚举信道——而用户名恰是本服务唯一的公开标识（默认 `admin`）。
 
 **状态码语义**（与 MCP 侧 `-32602` / `-32603` 的分流原则一致：客户端可否自行修正）
 | 码 | 含义 | 触发场景 |
 |---|---|---|
-| 400 | 入参可修正 | project_id 非法（目录穿越 / 分隔符 / 空白）；请求的后端未编译进本构建（响应附带 `available_backends` 列表供自我修正） |
+| 400 | 入参可修正 | project_id 非法（目录穿越 / 分隔符 / 空白）；请求的后端未编译进本构建（响应附带 `available_backends` 列表供自我修正）；角色值非逐字匹配；口令短于 8 字符 |
 | 401 | 凭据问题 | 缺 / 错 `ADMIN_TOKEN`；控制台用户名或口令错误；会话过期 / 已登出；未配置登录口令 |
-| 403 | 来源不被接受 | 用会话 Cookie 鉴权的写请求来自跨源站（CSRF 第二道防线） |
-| 404 | 资源不存在 | 项目未登记 |
-| 409 | 资源冲突 | project_id 已被占用 |
+| 403 | 凭据有效但权限不足 / 来源不被接受 | 租户访问账号管理或改他人口令（`role_required`）；用会话 Cookie 鉴权的写请求来自跨源站（CSRF 第二道防线） |
+| 404 | 资源不存在**或不属于当前账号** | 项目未登记 / 越权（两者响应模板相同，防枚举） |
+| 409 | 资源冲突 | project_id 已被占用（全局判断，不区分归属）；账号重名；删除或降级最后一个管理员（`last_admin`） |
 | 500 | 服务端故障 | 元库不可用、后端未注册（登记的 backend 值本身合法但本构建未编译）、熵源不可用 |
 
 **注销的顺序约定**：先删物理数据（`StorageBackend::drop_project`），再删元库登记行。反序时若删文件失败，会留下「登记行已消失、数据仍在盘上」的不可见残留——既违背删除承诺又无法重试自愈；本顺序最坏情况是「文件已删、登记行尚在」，重试一次 DELETE 即可收敛。
@@ -297,7 +325,7 @@ MCP_ALLOWED_HOSTS=mem.example.com,localhost,127.0.0.1
 |---|---|
 | MCP 的 `initialize` 入参 | 只有 `protocol_version` / `capabilities` / `client_info` / `_meta`（rmcp 3.3.0 `model.rs` `InitializeRequestParams`）——**没有任何 cwd 或工作区字段** |
 | 客户端是否可能告知工作区 | 协议里唯一表达「文件系统根」的机制是 `roots`，但它在 rmcp 3.3.0 已标记**废弃**（SEP-2577）；且无状态 JSON 响应模式（`json_response = true`）下服务端无法反向发 `roots/list` 请求，此路不通 |
-| memora 侧是否采集过上下文 | `src/` 内 `workspace` / `cwd` / `current_dir` **零命中**；服务端不读任何请求头或 `clientInfo`；`projects` 表只有 `project_id` / `token_hash` / `db_path` / `created_at` / `backend` 五列 |
+| memora 侧是否采集过上下文 | `src/` 内 `workspace` / `cwd` / `current_dir` **零命中**；服务端不读任何请求头或 `clientInfo`；`projects` 表只有 `project_id` / `token_hash` / `db_path` / `created_at` / `backend` / `owner` 六列（`owner` 是人给的归属，不是从请求推出的上下文） |
 | WorkBuddy 侧配置作用域 | `~/.workbuddy/mcp.json` 是**用户级唯一一份**，`{工作区}/.workbuddy/mcp.json` 不存在 → 所有工作区共用同一条目、同一个 token |
 
 因此 `token → project` 这条绑定所表达的语义是**「这个客户端条目能访问哪个项目」**（访问权限），
@@ -354,12 +382,83 @@ memora 作为 HTTP 传输的外部服务二者皆无，因此必须用仓内声�
 
 ## 6. 鉴权与多租户
 
-- 全局 `_meta.db` 存 `projects(token_hash, db_path)`。
-- 客户端连接 `https://host/mcp/{project_id}` 或统一 `https://host/mcp`，请求头 `Authorization: Bearer <token>`；后者由中间件按 token 解析 `project_id`（详见 5.3 接入契约）。
-- 中间件流程：`token → SHA-256 → 查 projects → 解析 project_id（URL 路径优先，缺省回退到 token 绑定项目）→ 打开对应 SQLite`。
-- 无效 / 越权 token 返回 401。
-- **项目隔离双保险**：独立 SQLite 文件（数据物理隔离）+ 路径 / token 绑定（逻辑隔离），互不越权。
-- `ADMIN_TOKEN` 为独立环境变量，仅 REST 管理层使用，与项目 token 体系分离。
+### 6.1 两套凭据通道（不变）
+
+- 全局 `_meta.db` 存 `projects(token_hash, db_path, owner)` 与 `users(username, password_hash, role)`。
+- **MCP 通道**：客户端连 `https://host/mcp`，请求头 `Authorization: Bearer <项目 token>`；中间件按 `token → SHA-256 → 查 projects → 解析 project_id` 打开对应 SQLite。无效 / 越权 token 返回 401。
+- **管理通道**：`/api/v1` 认 `ADMIN_TOKEN`（Bearer，给脚本 / CI）或控制台会话 Cookie（给浏览器）。
+- **两条通道严格隔离**：会话 Cookie 不能鉴权 `/mcp`，项目 token 也不能鉴权 `/api/v1`。这条边界划在路由分组上（`/mcp` 只挂 `bearer_auth`，`/api/v1` 只挂 `admin_auth`），有专门用例钉住。
+- **项目隔离双保险**：独立 SQLite 文件（数据物理隔离）+ 令牌绑定（逻辑隔离），互不越权。
+
+### 6.2 多租户模型（P8）
+
+**归属粒度：只加在项目层。** `projects.owner` 是唯一归属列；记忆、观测、关系、交接记录**不带** owner，它们经所属项目继承归属。
+
+| 决策 | 取舍 |
+|---|---|
+| **项目级归属，而非记录级** | 记录级 owner 需要在每一张表上加列、每一次写入时校验、每一次查询时过滤，且**必然**出现「项目的 owner 与某条观测的 owner 不一致」这种无法自洽的状态。归属是项目这一层的概念——一条观测属于谁，取决于它写进了谁的库 |
+| **`project_id` 全局唯一，保持单列主键** | 改成 `(owner, project_id)` 复合主键会连带改 `StorageBackend` 的每个方法签名、数据路径与交接 CLI。代价远大于收益：跨账号撞名的概率低，且撞名时返回的 409 与「自己重名」逐字相同，不泄漏他人项目名 |
+| **普通账号可自建项目** | 「必须找管理员开项目」会让多租户只剩隔离、没有自治，而管理员会成为每个人的瓶颈。租户自建项目的 `owner` 强制取 `identity.user()`，**不接受**请求体指定——否则任何人都能代他人建项目 |
+| **`ADMIN_TOKEN` 恒为管理员、不属于任何租户** | `memora-handoff` 等脚本只用 `ADMIN_TOKEN`。若它被 owner 过滤或降权，所有脚本会在一次升级后集体坏掉，报错形态还是「项目不存在」（极难定位）。故 Bearer 身份的角色硬编码为 `Role::Admin` |
+| **越权返回 404，不返回 403** | 403 会变成项目名枚举接口。所有项目类端点经 `admin::visible_project` 单一判断点，越权时返回与该 id 真不存在**逐字相同模板**的 404（有对应用例比对两者模板）。警告另记服务端日志，供安全审计 |
+
+### 6.3 角色矩阵
+
+只有两档。中间档（例如「能看全部但不能删」）需要立刻回答「它能不能删项目 / 能不能改别人口令」等一串没人有答案的问题。
+
+| 能力 | `admin` | `user`（租户） |
+|---|---|---|
+| 项目列表 | 全部（含无主 / 归属失效） | 仅 `owner = 自己` |
+| 单个项目读写 / 统计 / 记忆浏览 | 任意项目 | 仅自己名下，其余 404 |
+| 创建项目 | 可以，`owner = 自己` | 可以，`owner = 自己` |
+| 轮换 token / 注销项目 | 任意项目 | 仅自己名下 |
+| 交接（7 个端点） | 任意项目 | 仅自己名下 |
+| 账号列表 / 新建 / 删除 / 改角色 | 可以 | 403 `role_required` |
+| 改口令 | 任何人 | **仅自己**（否则 403） |
+| 控制台「账号」导航 | 显示 | 隐藏（路由守卫同时拦截手输 URL） |
+
+**权限收口在三处，不在每个 handler 里各自判断**（分散判断是越权的常见来源）：
+
+1. `AdminIdentity::can_access(owner)` — 唯一的归属判断（`is_admin() || user() == owner`）；
+2. `admin::visible_project()` — 唯一的项目可见性入口，所有项目类 handler 经它取 `ProjectRecord`；
+3. `AdminIdentity::require_admin()` — 唯一的角色判断，所有账号类 handler 首行调用。
+
+### 6.4 会话中的角色快照
+
+会话记录携带签发时的角色（`Session { user, role, .. }`），而不是每次请求查库——`/api/v1` 是低频人工操作，但「每请求一次查询」会在会话表变大后变成可测量的开销，而收益为零。
+
+代价是角色变更需要主动刷新。因此 `SessionStore::refresh_role(user, role)` 在改角色时**原地更新该账号的全部会话**（不销毁、不踢人）：
+
+- 降权若滞后 12 小时，等于权限变更没生效；
+- 提权滞后则让用户对着「说我是管理员但什么也看不到」的界面反复刷新。
+
+### 6.5 最后一个管理员保护
+
+删除账号与降级角色都以**管理员数量**（而非账号数量）为判据：`count_admins() <= 1` 时拒绝，返回 409 `last_admin`。只剩一群普通账号时删掉最后一个管理员，会让管理面永久锁死，唯一补救手段是手工改库或删掉 `_meta.db`（后者连带丢掉全部项目登记）。
+
+逃生路径：先提升另一个账号为管理员，原管理员即可处置。控制台把这条路径写在禁用按钮的提示里。
+
+### 6.6 归属失效与无主项目
+
+两种遗留状态，都只对管理员可见：
+
+| 状态 | 成因 | 处置 |
+|---|---|---|
+| **无主**（`owner = ''`） | 升级前的存量项目 | 启动时 `claim_unowned_projects` 自动回填给首个管理员（按 username 升序取首个 admin，确定性）。仍无管理员时留空，等下次启动 |
+| **归属失效**（owner 指向已删除账号） | 删除账号时**不自动处置**其名下项目 | 控制台标「失效」，由管理员人工决定转交或注销 |
+
+删除账号时不自动转交或删除项目，是刻意的保守选择——两者都是在替用户做不可逆的决定。数据不会丢（管理员始终可见），而误删无法撤销。
+
+### 6.7 存量库迁移
+
+全部走**幂等加列**（`PRAGMA table_info` 检查后 `ALTER TABLE ... ADD COLUMN ... DEFAULT`），可反复执行：
+
+| 列 | 默认值 | 理由 |
+|---|---|---|
+| `projects.owner TEXT NOT NULL DEFAULT ''` | 空串 | 显式的「无主」中间态，而不是某个人。回填由启动时的认领逻辑完成，使「列已加、尚未认领」这个瞬间可表达 |
+| `users.role TEXT NOT NULL DEFAULT 'admin'` | `admin` | 回填为管理员是**忠实承接**旧语义：P7 时代「凡能登录者皆管理员」。若回填成 `user`，升级瞬间所有账号集体失去管理权，且再也无法恢复（没人能进账号页） |
+
+迁移期间不加外键（`owner` 指向 `users.username`）：SQLite 的 `PRAGMA foreign_keys` 默认关闭，加了也不生效，只会给人「有约束保护」的错觉。归属校验在应用层完成。
 
 ---
 
@@ -520,6 +619,21 @@ memora 作为 HTTP 传输的外部服务二者皆无，因此必须用仓内声�
   - **实测发现并修复的两个缺陷**（都属「各自看都对、合起来错」的一类）：
     1. **反代漏放行 `/admin`**：`deploy/Caddyfile` 只列了 mcp / api / health 三个前缀，新增控制台后忘了同步 → localhost 直连正常、公网经 Caddy 打开 404，且返回的正是模板里兜底的 `respond 404`。已补 `handle /admin`，并加用例断言反代模板覆盖**全部**公开前缀——路由表与反代模板互不相干，靠人记得同步是不可靠的。
     2. **跨站写请求曾被放行**：`is_cross_origin` 原先在「有 `Origin` 但无 `Host`」时返回「非跨站」（fail-open）。而测试用的 `oneshot` 恰好不产生 `Host`，跨站 DELETE 因此被放行。HTTP/1.1 与浏览器请求都必带 `Host`，故该分支只可能来自畸形或人为构造的请求；已改为 fail-closed，并补上「有 Origin 无 Host 必须判为跨站」的用例。
+
+- **P8 多租户已完成**：把「谁登录谁是管理员」的单租户模型改造为**项目级归属 + 两档角色**（`admin` / `user`）。
+  - 起因：P4.4 阶段性解决的是「人能第一次用起来」，但只解决到「一个人」为止——控制台里任何会话都能看到全部项目、轮换任何项目的 token、注销任何项目。一旦要交给第二个人用，这套模型就不成立；而 `users` 表当时只有 `username` + `password_hash` + 时间戳，连「谁是管理员」都无法表达。
+  - 变更（后端）：`projects` 表加 `owner` 列、`users` 表加 `role` 列，均为幂等加列迁移（`PRAGMA table_info` + `ALTER TABLE ... ADD COLUMN ... DEFAULT`），P7 遗留库启动后自动补齐；`auth.rs` 的 `AdminIdentity` 携带 `role`，新增 `require_admin`；新增 `users.rs` 的角色枚举（`Role::ALL` / `as_str` / 读路径宽容解析）与 `PUT /users/{username}/role`；`session.rs` 增加 `refresh_role` 原地刷新角色快照；`admin.rs` 增加 `parse_role`（写路径逐字匹配）与 `visible_project`（按 `role` + `owner` 收敛）。
+  - 变更（前端）：`api.ts` 补 `role` / `owner` 字段与 `updateRole`；`session.ts` 增加派生函数 `isAdmin()` 与 `refreshRole()`；`router.ts` 为 `/users` 加 `adminOnly` 元信息与守卫；`AppShell.vue` 按角色过滤导航项并显示角色徽标；`UsersView.vue` 增加角色列与升降级操作；`ProjectsView.vue` 增加归属列与「无主 / 失效 / 遗留」标记。
+  - **验证结果**：`cargo test` **388 项全部通过**（新增 23 项，其中 8 项为端到端多租户用例）；`cargo build` 与 `cargo clippy --all-targets -- -D warnings` **零告警**；`pnpm build`（`vue-tsc -b` + `vite build`）通过；实机 16 步冒烟（真实进程 + 真实 Cookie，非 `oneshot`）覆盖租户隔离、越权 404 与真不存在逐字同模板、角色变更对活跃会话即时生效、`last_admin` 双向保护、删号孤儿化、MCP 通路兼容与 P7 遗留库迁移幂等（重启不再重复认领）。
+  - 关键实现取舍：
+    1. **归属只落在项目上，不做记录级 owner**：记忆与交接经所属项目继承归属，省掉两张表的冗余列与「记录 owner 与项目 owner 不一致」这类只能靠巡检发现的不变量。代价是**单条记忆无法跨项目共享**——这与「按项目硬隔离」的定位一致，不是缺失。
+    2. **`project_id` 保持全局唯一**：数据路径 `data/{project_id}/mem.db` 因此不必改成嵌套目录，也未破坏「一个 token 只指向一个库」的既有不变量。代价是不同租户不能各自拥有同名项目，可用性损失由「项目名通常带业务语义」兜住。
+    3. **越权返回 404 而非 403**：与「真不存在」共用同一响应模板，否则用 403/404 之差就能枚举他人项目名。**这决定了测试写法**——`projects_of_another_tenant_are_indistinguishable_from_missing` 必须逐字段比对 `error` 与 `detail`（把项目名替换成 `<id>` 后比较），而不是只断言状态码。
+    4. **角色快照 + 原地刷新**：会话里存的是登录时的角色副本，若不刷新则「降权不生效」是安全漏洞、「提权不生效」是体验缺陷。选 `refresh_role` 而非「角色变了就踢人」，因为降权只需要立刻收回权限，不必要中断对方的会话（且踢人会让「误操作降级别」变得不可挽回）。
+    5. **写路径入参逐字匹配，读路径宽容**：`admin::parse_role` 只接受 `Role::ALL` 里的字面量，`"admin "` / `" Admin"` / `"ADMIN"` 一律 400。**这是测试抓到的真实缺陷**——首版复用了 `Role::parse`（含 `trim` + 小写归一），等价于把拼错的值静默升级成最高权限。但读路径（从库里读出存量 `role`）必须宽容，否则手工编辑过的值会让整个管理面失效。
+    6. **保护判据是管理员数而非账号数**：`count_admins() <= 1` 时该账号既不能删也不能降级（409 `last_admin`）。若沿用「最后一个账号」作判据，删掉唯一管理员但留着一堆普通账号时，系统就再也没人能管账号了。
+    7. **`ADMIN_TOKEN` 视为「无租户的管理员」**：它恒为 `admin` 角色，但它创建的项目 `owner` 记为首个管理员用户名而非空串——空串是「无主」的语义，留给迁移前的存量数据，否则下次启动的认领逻辑会把新项目也一并改写。
+  - **工程注意（本轮新增的两处坑）**：`result_large_err` 在 `Result<_, Response>` 上必然触发，`parse_role` 与 `require_admin` 统一改为返回 `Box<Response>`，调用点用 `return *response` 解引用；`pnpm build` 在 pnpm 11 下会因 esbuild 的 postinstall 被忽略而以 `ERR_PNPM_IGNORED_BUILDS` 非零退出（错误信息只有 pnpm 内部栈，看不到与构建脚本的关联），解法是在 `web/pnpm-workspace.yaml` 写 `allowBuilds: { esbuild: true }`——`package.json` 的 `pnpm` 字段在 pnpm 11 已不再被读取。
 
 每期产出完整可运行代码与测试，评审通过后再推进下一期。
 

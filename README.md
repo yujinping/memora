@@ -122,16 +122,26 @@ http://localhost:6789/admin
 | 前端技术栈 | **Vue 3 + Vite + Tailwind CSS v4**（`web/`），产物内嵌进二进制，**单文件即可发布** |
 | 凭据形态 | 用户名 + 口令（默认种子用户名 `admin`）。口令以 **Argon2id** 哈希写入 `_meta.db` 的 `users` 表 |
 | 账号从哪来 | `users` 表为空时，用 `config.toml` 的 `admin_user` / `admin_password_hash` **播种**第一个管理员；之后**以库为准**，改配置不再影响登录 |
-| 多账号 | 控制台「账号」页可增删账号、改口令。删账号会立即踢掉该账号的全部会话；**最后一个账号禁止删除**（否则谁都被锁在门外） |
+| **角色（两档）** | `admin` 管**全部**账号与全部项目；`user`（租户）只见并只操作**自己名下**的项目、只能改自己的口令。建账号时可选角色，**省略即普通账号**；之后可在「账号」页随时升降级 |
+| 多账号 | 控制台「账号」页可增删账号、改口令、改角色。删账号会立即踢掉该账号的全部会话；**最后一个管理员**禁止删除与降级（否则管理面永久锁死——剩一群普通账号同样救不回来） |
+| **项目归属** | 项目归**创建者**所有；记忆与交接经所属项目继承归属，无记录级 owner。归属**创建后不可转让**，管理员可代管任意项目。列表对租户只返回他自己名下的（过滤下推到 SQL） |
 | 口令从哪来 | `memora init` 生成 20 位随机口令并只打印一次；**`--force` 重跑不会重置口令**（已配置则沿用，且账号以库为准）。忘记时：① 已登录则控制台「账号」页改，或 `PUT /api/v1/users/{username}`（只需 `ADMIN_TOKEN`）；② 进不去则删 `_meta.db` 的 `users` 表行后重启，按配置重新播种 |
 | 也可自己指定 | `--admin-password <明文>`（启动时即哈希，不落盘）、`--admin-password-hash <PHC>`，或环境变量 `ADMIN_PASSWORD` / `ADMIN_PASSWORD_HASH`。明文短于 8 字符**直接拒绝启动**——口令强度只在能拿到明文的那一刻可判 |
-| 会话 | 内存会话表 + `HttpOnly; SameSite=Strict` Cookie，12 小时**绝对**过期（不滑动、重启即失效）；检测到 HTTPS 时自动加 `Secure` |
+| 会话 | 内存会话表 + `HttpOnly; SameSite=Strict` Cookie，12 小时**绝对**过期（不滑动、重启即失效）；检测到 HTTPS 时自动加 `Secure`。会话携带签发时的角色快照，**改角色时原地刷新**（降权立即生效，且不踢人） |
 | 退出登录 | 页面上的「退出」，或 `DELETE /api/v1/session`（幂等，未登录也返回 204） |
 | 关闭控制台 | 把 `config.toml` 的 `admin_password_hash` 留空**且**库里没有账号——只用 MCP 的部署不需要它。此时 `/admin` 明确提示「尚无控制台账号，请运行 `memora init`」，而不是给一个必然失败的登录框 |
 | 公网部署 | 反代必须放行 `/admin*`、`/assets/*` 与 `/favicon.svg`（`deploy/Caddyfile` 已含）。页面本身不含任何数据 |
 | 访问入口 | 控制台地址是 `https://<域名>/admin`。**根路径 `/` 返回 404 是设计行为**，不做跳转（见「部署到 2GB 服务器」一节的说明） |
 | 页面安全 | 记忆内容一律**插值渲染**（不用 `v-html`，避免存储型 XSS）；CSP 已去掉 `'unsafe-inline'`（构建产物无内联脚本/样式） |
-| token 轮换 | 项目页的「换 token」可只轮换 token 而不动数据（`POST /projects/{id}/token`），旧 token **立即**失效 |
+| token 轮换 | 项目页的「换 token」可只轮换 token 而不动数据（`POST /projects/{id}/token`），旧 token **立即**失效。租户可轮换自己项目的 token（不必找管理员） |
+
+**多租户隔离的三层**（任一被绕过，其余仍然有效）：
+
+| 层 | 机制 | 越权表现 |
+|---|---|---|
+| 界面 | 普通账号看不到「账号」导航；项目表带「归属」列 | 按钮不存在 |
+| 前端路由 | `/users` 标 `adminOnly`，守卫拦手输 URL | 静默回项目页 |
+| **服务端** | `can_access` / `visible_project` / `require_admin` 三处收口 | 项目类 **404**（与真不存在逐字同模板，防枚举）；账号类 **403** `role_required` |
 
 **两套凭据严格隔离**，这条边界有专门用例守着，防止将来「顺手复用中间件」把它抹掉：
 
@@ -140,6 +150,10 @@ http://localhost:6789/admin
 | 脚本 / CI | `ADMIN_TOKEN`、项目 token | `ADMIN_TOKEN` → `/api/v1`；项目 token → `/mcp` |
 | 浏览器 | 会话 Cookie | 仅 `/api/v1`，且**写请求要求同源**（CSRF 第二道防线，第一道是 `SameSite=Strict`）；**不能**用于 `/mcp` |
 
+> `ADMIN_TOKEN` 的身份**恒为管理员**、不属于任何租户。这是脚本兼容性要求：`memora-handoff`
+> 等工具只带它，若被降权或受归属过滤，所有脚本会在一次升级后集体坏掉，且报错形态是
+> 「项目不存在」——极难定位。
+>
 > 会话 Cookie 之所以不能用于 `/mcp`：`/mcp` 的鉴权只认 Bearer 项目 token。
 > 浏览器里的一次登录不应等价于拿到某个项目的记忆读写权。
 
@@ -326,13 +340,18 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 | `DELETE` | `/projects/{id}/handoffs/{task_id}` | 幂等删除全部修订 |
 | `GET` | `/projects/{id}/graph` | 该项目的全图快照（控制台「记忆浏览」用，只读） |
 | `POST` | `/projects/{id}/token` | **轮换 token**：只换 `token_hash`，不动数据；旧 token 立即失效 |
-| `GET` / `POST` | `/users` | 列账号 / 新建账号（`{username, password}`；口令过短 `400`，重名 `409`） |
-| `DELETE` / `PUT` | `/users/{username}` | 删账号（**最后一个** `409 last_user`，并踢掉其全部会话）/ 改口令 |
+| `GET` / `POST` | `/users` | 列账号 / 新建账号（`{username, password, role?}`；口令过短 `400`，重名 `409`）。**仅管理员** |
+| `DELETE` / `PUT` | `/users/{username}` | 删账号（**最后一个管理员** `409 last_admin`，并踢掉其全部会话）/ 改口令（管理员改任何人，租户仅自己）。删除**仅管理员** |
+| `PUT` | `/users/{username}/role` | 改角色（`{role}`）→ `{username, role, sessions_updated}`；**降级最后一个管理员** `409 last_admin`。**仅管理员** |
 | `POST` | `/session` | 控制台登录（公开；body `{username, password}`）→ 签发会话 Cookie |
-| `GET` | `/session` | 会话自检（公开）→ `{console_login_enabled, authenticated, user, users}` |
+| `GET` | `/session` | 会话自检（公开）→ `{console_login_enabled, authenticated, user, role, users}` |
 | `DELETE` | `/session` | 登出（幂等）→ `204` + 立即失效的 Cookie |
 | `GET` | `/health` | 健康检查（公开，无鉴权） |
 
+> 「仅可见项目」= 管理员可用任意 `id`，租户只能用自己的。越权访问返回的 404 与
+> 「id 真不存在」**逐字同模板**（`project \`<id>\` not found`），否则状态码差异会变成
+> 项目名枚举接口。
+>
 > `/session` 三个方法与其余管理端点**分开注册**：登录接口本身不可能先鉴权，
 > 若并进同一个 `route_layer`，`POST /session` 会在进入 handler 前就被 401 拒掉——
 > 这是一个只在「第一次用浏览器」时才暴露的装配错误，故有专门用例钉住。
@@ -341,13 +360,13 @@ MCP 工具由模型**按需**调用，不会自动落盘。请把下面两条规
 
 | 码 | 含义 | 典型场景 |
 |---|---|---|
-| `400` | 入参可修正 | `project_id` 非法（目录穿越 / 分隔符 / 空白）；请求的后端未编译进本构建（响应附带 `available_backends` 列表）；交接入参非法（空 `goal`、非法 `task_id`、超限）；口令过短（`weak_password`）；登录名含空白或控制字符 |
+| `400` | 入参可修正 | `project_id` 非法（目录穿越 / 分隔符 / 空白）；请求的后端未编译进本构建（响应附带 `available_backends` 列表）；交接入参非法（空 `goal`、非法 `task_id`、超限）；口令过短（`weak_password`）；登录名含空白或控制字符；`role` 非**逐字**匹配 `admin` / `user` |
 | `204` | 无待接手 | 交接零 ID 入口在「没有可接手的交接」时返回（正常状态；`404` 留给指定 `task_id` 不存在） |
 | `300` | 多条待接手 | 交接歧义：响应体给候选摘要，服务端不替调用方挑 |
 | `401` | 凭据问题 | 缺失或错误的 `ADMIN_TOKEN`；控制台用户名或口令错误；会话已过期 / 已登出；尚未创建任何控制台账号 |
-| `403` | 来源不被接受 | 用会话 Cookie 鉴权的写请求来自跨源站（CSRF 二次防线） |
-| `404` | 资源不存在 | 项目未登记；账号不存在 |
-| `409` | 资源冲突 | `project_id` 已被占用；登录名已存在（`user_exists`）；删除最后一个账号（`last_user`） |
+| `403` | 凭据有效但权限不足 / 来源不被接受 | 租户访问账号管理或改他人口令（`role_required`）；用会话 Cookie 鉴权的写请求来自跨源站（CSRF 二次防线） |
+| `404` | 资源不存在**或不属于当前账号** | 项目未登记 / 越权（两者模板相同，防枚举）；账号不存在 |
+| `409` | 资源冲突 | `project_id` 已被占用（全局判断，不区分归属）；登录名已存在（`user_exists`）；删除或降级最后一个管理员（`last_admin`） |
 | `500` | 服务端故障 | 元库不可用、后端未注册、熵源不可用 |
 
 统计口径与客户端**同源**：`stats` 与 `graph` 都走 `read_graph` 派生，而不是另写一套 SQL 查询，

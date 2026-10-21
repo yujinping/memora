@@ -10,6 +10,11 @@
  * @intent 轮换与注销是两个**语义完全不同**的动作，必须在界面上区分清楚：
  *         轮换只换凭据（数据保留），注销销毁数据。把它们放在同一个下拉里
  *         且不加说明，是那种「事后才意识到点错了」的设计。
+ *
+ * @intent 归属列只在管理员视图下有信息量（普通账号的项目全是自己的），
+ *         但仍照常渲染：它让「我现在看到的是自己的还是别人的」这件事
+ *         无需推理。管理员另会看到「无主」与「归属失效」两种异常标记——
+ *         它们都是升级 / 删号之后只有管理员能处置的遗留数据。
  */
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
@@ -18,6 +23,7 @@ import {
   deleteProject,
   getStats,
   listProjects,
+  listUsers,
   rotateToken,
   type Project,
   type ProjectStats,
@@ -25,6 +31,7 @@ import {
 } from "../lib/api";
 import { ApiError } from "../lib/api";
 import { formatDate, formatRelative } from "../lib/format";
+import { isAdmin } from "../lib/session";
 import ConfirmDialog from "../components/ConfirmDialog.vue";
 import Toast from "../components/Toast.vue";
 import TokenPanel from "../components/TokenPanel.vue";
@@ -39,6 +46,9 @@ const stats = ref<Record<string, ProjectStats | null>>({});
 const loading = ref(true);
 /** 列表加载失败的原因。 */
 const loadError = ref("");
+
+/** 现有账号名集合，用于识别「归属指向不存在账号」的项目（仅管理员取）。 */
+const knownUsers = ref<Set<string>>(new Set());
 
 /** 新建表单。 */
 const newId = ref("");
@@ -84,11 +94,38 @@ const rows = computed<Row[]>(() =>
 );
 
 /**
+ * 归属的显示形态。
+ *
+ * @intent 三种异常都归到同一列而不是新增列：`空` 是迁移中间态，
+ *         `失效` 是账号被删后的遗留，两者都只对管理员可见（普通账号根本
+ *         拿不到这些项目），处置动作也相同——所以合成一个单元格足够。
+ */
+function ownerLabel(project: Project): string {
+  if (!project.owner) return "无主";
+  return project.owner;
+}
+
+/** 归属是否已失效（账号已不存在）。 */
+function ownerIsStale(project: Project): boolean {
+  if (!project.owner || !isAdmin()) return false;
+  return !knownUsers.value.has(project.owner);
+}
+
+/** 归属是否缺失（迁移前遗留）。 */
+function ownerIsMissing(project: Project): boolean {
+  return !project.owner;
+}
+
+/**
  * 加载列表与统计。
  *
  * @intent 统计用 `Promise.allSettled` 而不是 `Promise.all`：一个项目的
  *         后端未注册不该让整张表的数字全部消失。失败的项留 `null`，
  *         界面上显示 `—`（并带 title 说明原因）。
+ *
+ * @intent 账号名清单只有管理员能取（`/users` 对租户是 403）。取失败时
+ *         只是不标「归属失效」，不影响主流程——那是一个提示性标记，
+ *         不该因为辅取失败就让整页报错。
  */
 async function load(): Promise<void> {
   loading.value = true;
@@ -100,6 +137,14 @@ async function load(): Promise<void> {
     projects.value = [];
     loading.value = false;
     return;
+  }
+
+  if (isAdmin()) {
+    try {
+      knownUsers.value = new Set((await listUsers()).map((u) => u.username));
+    } catch {
+      knownUsers.value = new Set();
+    }
   }
 
   const settled = await Promise.allSettled(
@@ -182,6 +227,12 @@ onMounted(load);
         <p class="mt-1 text-xs text-muted">
           每个项目独立持有记忆与交接数据，项目之间硬隔离——各自的 token
           只能访问各自的库。
+          <span v-if="isAdmin()">
+            你是管理员，故这里列出<strong>全部账号</strong>的项目。
+          </span>
+          <span v-else>
+            这里只列出你名下的项目；项目归属由创建者决定，创建后不能转让。
+          </span>
         </p>
       </div>
       <button
@@ -261,7 +312,8 @@ onMounted(load);
       <p v-else-if="loading" class="px-4 py-6 text-sm text-muted">加载中…</p>
 
       <p v-else-if="projects.length === 0" class="px-4 py-8 text-center text-sm text-muted">
-        还没有项目。用上面的表单创建第一个。
+        <span v-if="isAdmin()">还没有任何项目。用上面的表单创建第一个。</span>
+        <span v-else>你还没有项目。用上面的表单创建第一个。</span>
       </p>
 
       <div v-else class="overflow-x-auto">
@@ -269,6 +321,7 @@ onMounted(load);
           <thead>
             <tr class="border-b border-line text-xs text-faint">
               <th class="px-4 py-2.5 text-left font-normal">项目</th>
+              <th class="px-4 py-2.5 text-left font-normal">归属</th>
               <th class="px-4 py-2.5 text-left font-normal">后端</th>
               <th class="px-4 py-2.5 text-right font-normal">实体</th>
               <th class="px-4 py-2.5 text-right font-normal">关系</th>
@@ -285,6 +338,37 @@ onMounted(load);
               class="border-b border-line/60 last:border-0 hover:bg-surface-2/50"
             >
               <td class="mono px-4 py-2.5">{{ row.project.project_id }}</td>
+              <td class="px-4 py-2.5">
+                <span
+                  class="mono text-xs"
+                  :class="
+                    ownerIsMissing(row.project) || ownerIsStale(row.project)
+                      ? 'text-warn'
+                      : 'text-ink'
+                  "
+                  :title="
+                    ownerIsMissing(row.project)
+                      ? '无主项目：升级前遗留，仅管理员可见'
+                      : ownerIsStale(row.project)
+                        ? '归属账号已不存在：数据完整保留，仅管理员可见'
+                        : `归属账号 ${row.project.owner}`
+                  "
+                >
+                  {{ ownerLabel(row.project) }}
+                </span>
+                <span
+                  v-if="ownerIsStale(row.project)"
+                  class="ml-1.5 rounded border border-warn/40 bg-warn/10 px-1.5 py-0.5 text-[10px] text-warn"
+                >
+                  失效
+                </span>
+                <span
+                  v-else-if="ownerIsMissing(row.project)"
+                  class="ml-1.5 rounded border border-warn/40 bg-warn/10 px-1.5 py-0.5 text-[10px] text-warn"
+                >
+                  遗留
+                </span>
+              </td>
               <td class="px-4 py-2.5">
                 <span
                   class="rounded border border-line bg-surface-2 px-1.5 py-0.5 text-[11px] text-muted"

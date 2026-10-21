@@ -13,6 +13,7 @@
 
 import { reactive, readonly } from "vue";
 import * as api from "./api";
+import type { Role } from "./api";
 
 /** 登录态。 */
 interface SessionState {
@@ -20,6 +21,8 @@ interface SessionState {
   authenticated: boolean;
   /** 当前用户名 */
   user: string | null;
+  /** 当前身份的角色；未登录为 `null` */
+  role: Role | null;
   /** 系统中是否存在可登录账号 */
   loginEnabled: boolean;
   /** 账号总数 */
@@ -31,6 +34,7 @@ interface SessionState {
 const state = reactive<SessionState>({
   authenticated: false,
   user: null,
+  role: null,
   loginEnabled: true,
   userCount: 0,
   ready: false,
@@ -38,6 +42,20 @@ const state = reactive<SessionState>({
 
 /** 只读的登录态（组件不能直接改，必须经下面的动作）。 */
 export const session = readonly(state);
+
+/**
+ * 当前是否为管理员。
+ *
+ * @intent 用函数而不是 `session.isAdmin` 字段：字段需要在每次自检、登录登出、
+ *         角色变更后各同步一次，漏掉任何一处就会让导航与真实权限错位。
+ *         派生值只有一份真相（`role`），不存在「忘记同步」这种状态。
+ *
+ * @intent 它只用于**界面呈现**。真正的授权在服务端（越权一律 404 / 403），
+ *         前端把它当安全边界是错的——改一个 devtools 变量就能绕过。
+ */
+export function isAdmin(): boolean {
+  return state.role === "admin";
+}
 
 /** 上次登录的用户名（仅用于预填）。 */
 const LAST_USER_KEY = "memora.console.lastUser";
@@ -73,6 +91,7 @@ export async function refresh(): Promise<void> {
     const status = await api.getSession();
     state.authenticated = status.authenticated;
     state.user = status.user;
+    state.role = status.role;
     state.loginEnabled = status.console_login_enabled;
     state.userCount = status.users;
   } catch {
@@ -80,6 +99,7 @@ export async function refresh(): Promise<void> {
     // 看到「无法连接服务」的具体错误，比停在白屏上好。
     state.authenticated = false;
     state.user = null;
+    state.role = null;
     state.loginEnabled = true;
     state.userCount = 0;
   } finally {
@@ -92,6 +112,7 @@ export async function signIn(username: string, password: string): Promise<void> 
   const result = await api.login(username, password);
   state.authenticated = true;
   state.user = result.user;
+  state.role = result.role;
   rememberUser(result.user);
   // 账号数可能刚变化（首次登录后有人建了新账号），顺手刷新一次。
   void refreshUserCount();
@@ -106,6 +127,7 @@ export async function signOut(): Promise<void> {
   }
   state.authenticated = false;
   state.user = null;
+  state.role = null;
 }
 
 /** 仅刷新账号数（登录成功后调用，避免整轮自检）。 */
@@ -119,5 +141,20 @@ async function refreshUserCount(): Promise<void> {
   }
 }
 
+/**
+ * 重新自检并同步角色。
+ *
+ * @intent 管理员改了别人的角色后，对方页面上「账号」导航还在，直到他刷新——
+ *         这是无法避免的（服务端不会主动推送）。但**自己**的角色变化必须尽快
+ *         反映在界面上，否则会出现「界面说我是管理员、每个请求都 403」的错位。
+ *         所以角色变更动作与 403 都会调这里。
+ */
+async function refreshRole(): Promise<void> {
+  await refresh();
+}
+
 /** 供账号管理页在增删账号后同步顶部计数。 */
 export { refreshUserCount };
+
+/** 供角色变更与 403 兜底同步当前身份。 */
+export { refreshRole };
