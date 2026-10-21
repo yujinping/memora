@@ -12,14 +12,13 @@
 //!         与项目 token 的处置一致（[`crate::auth::sha256_hex`]），理由相同：
 //!         凭据一旦落盘明文，泄漏面就从「一次」变成「一直」。
 //!
-//! @intent 本期**没有角色区分**：凡能登录控制台的账号都是管理员。这不是疏漏，而是
-//!         当前需求（单人 / 小团队自托管）下多角色只会增加一个无人使用的维度，
-//!         却要立刻回答「谁能删项目」「谁能建账号」等一串本无答案的问题。
-//!         将来引入角色时，本表加一列即可；`authenticate` 的返回值已是记录而非用户名，
-//!         故调用点不必改签名。
+//! @intent P8 起**有角色区分**（[`Role`]）：`admin` 可见全部项目与账号，
+//!         `user` 只见自己名下的项目。P7 时期「凡能登录者皆管理员」的语义
+//!         通过迁移回填保留（见 [`crate::meta::ensure_role_column`]），
+//!         因此升级不会让任何既有账号突然失去权限。
 //!
-//! 与 [`crate::session`] 的分工：本模块只回答「这组凭据对不对」，不碰 Cookie、
-//! 不碰会话——那是会话模块的职责。
+//! 与 [`crate::session`] 的分工：本模块只回答「这组凭据对不对、这个人是什么角色」，
+//! 不碰 Cookie、不碰会话——那是会话模块的职责。
 
 use crate::entity::user::{ActiveModel, Column, Entity as Users};
 use anyhow::Context;
@@ -34,6 +33,77 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///         过长只会让日志换行。上限存在的意义是拦住误粘贴一整段文本。
 pub const USERNAME_MAX_CHARS: usize = 64;
 
+/// 账号角色。
+///
+/// @intent 只有两档，且**刻意不加第三档**（比如「只读审计」）：自托管场景下
+///         真实存在的需求只有「这是我的东西」与「这是所有人的东西」两种，
+///         中间态没有对应的人。多一档就要立刻回答「它能不能删项目 / 能不能
+///         改别人口令」等一串没人有答案的问题。
+///
+/// @intent 数据范围的差别只有一条，其余全部相同：
+///         - [`Role::Admin`]：可见并可操作**全部**项目与全部账号；
+///         - [`Role::User`]：只见并可操作**自己名下**的项目，只能改自己的口令。
+///         这条差异统一在 `admin` 模块的 `visible_project` / `require_admin` 处收口，
+///         不在每个 handler 里各自判断——分散判断是越权的常见来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// 管理员：全部数据
+    Admin,
+    /// 普通账号（租户）：仅自己的数据
+    User,
+}
+
+impl Role {
+    /// 全部角色（穷尽性测试的锚点，也用于校验入参）。
+    pub const ALL: [Role; 2] = [Role::Admin, Role::User];
+
+    /// 入库 / 配置使用的字符串标识。
+    ///
+    /// @intent 取值与 `users.role` 列的历史值一一对应，不可随意变更：
+    ///         改了它等于让存量行的语义漂移。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::User => "user",
+        }
+    }
+
+    /// 从字符串标识解析。
+    ///
+    /// @intent 未知值返回 `None` 而不是**默认猜一个**：库里的角色值无法解析意味着
+    ///         数据被外部改写或版本不匹配，此时按 `User` 处理会静默降权（用户
+    ///         突然看不到自己的东西），按 `Admin` 处理则是提权。两种猜测都比
+    ///         一次显式的失败更危险，故由调用方决定如何报告。
+    ///
+    /// @intent 容忍首尾空白与大小写，是为了**读路径**：`users.role` 列可能被
+    ///         手工编辑过，配置项也可能带尾随空格，这些都不该让整个服务失效。
+    ///         但**不要**把它当成 API 入参校验（见 `admin::parse_role`）：入参位置
+    ///         上宽容的代价是把一个拼错的值升级成最高权限，而调用方毫无反馈。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "admin" => Some(Role::Admin),
+            "user" => Some(Role::User),
+            _ => None,
+        }
+    }
+
+    /// 是否管理员。
+    pub fn is_admin(&self) -> bool {
+        matches!(self, Role::Admin)
+    }
+}
+
+impl Default for Role {
+    /// 缺省角色是 [`Role::User`]。
+    ///
+    /// @intent 缺省必须是**权限更小**的那个：任何「忘了指定角色」的路径都应该
+    ///         得到一个权限受限的账号，而不是一个悄悄成为管理员的新用户。
+    ///         注意播种管理员时**显式**指定 `Role::Admin`，不依赖这个缺省值。
+    fn default() -> Self {
+        Role::User
+    }
+}
+
 /// 账号记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRecord {
@@ -41,6 +111,8 @@ pub struct UserRecord {
     pub username: String,
     /// 口令的 Argon2id PHC 串
     pub password_hash: String,
+    /// 角色（决定数据范围）
+    pub role: Role,
     /// 创建时间（Unix 秒）
     pub created_at: i64,
     /// 最近一次口令变更时间（Unix 秒）
@@ -104,6 +176,11 @@ pub enum BootstrapOutcome {
 ///
 /// @intent 表非空但配置里换了用户名时**不新建**：配置已经表达不了「账号集合」这件事，
 ///         半信半疑地按它补一个账号，正是「同一件事两个来源」的典型后果。
+///
+/// @intent 种子账号**恒为管理员**：它是配置里那一对凭据的人化形态，而配置项本身
+///         就是最高权限（`ADMIN_TOKEN` 也在同一个文件里）。若种子降级成普通账号，
+///         一个全新的实例会在引导完成后立刻没有任何管理员，`users` 端点全部
+///         不可达——那是一个无法自愈的状态。
 pub async fn bootstrap_admin(
     db: &DatabaseConnection,
     username: &str,
@@ -119,7 +196,7 @@ pub async fn bootstrap_admin(
 
     let username = validate_username(username)
         .map_err(|reason| anyhow::anyhow!("admin_user is not a usable username: {reason}"))?;
-    create(db, &username, password_hash).await?;
+    create_with_role(db, &username, password_hash, Role::Admin).await?;
     Ok(BootstrapOutcome::Created { username })
 }
 
@@ -130,13 +207,44 @@ pub async fn count(db: &DatabaseConnection) -> anyhow::Result<usize> {
     Ok(total as usize)
 }
 
+/// 角色为 `admin` 的账号数。
+///
+/// @intent 「最后一个管理员」的保护需要它：删除 / 降级一个管理员之前，
+///         必须能回答「这是不是最后一个」。用 `count` 会算错——普通账号
+///         也是账号，但它们登不进账号管理页，删掉所有管理员的后果是永久锁死。
+pub async fn count_admins(db: &DatabaseConnection) -> anyhow::Result<usize> {
+    use sea_orm::PaginatorTrait;
+    let total = Users::find()
+        .filter(Column::Role.eq(Role::Admin.as_str()))
+        .count(db)
+        .await?;
+    Ok(total as usize)
+}
+
+/// 首个管理员（按登录名升序，确定性）。
+///
+/// @intent 供 [`crate::meta::claim_unowned_projects`] 定位「存量项目归谁」。
+///         取登录名升序而非创建时间：`created_at` 只到秒，同一批建的账号会同值，
+///         排序因此不稳定，而认领结果必须与执行时机无关（它要可重入）。
+pub async fn first_admin(db: &DatabaseConnection) -> anyhow::Result<Option<String>> {
+    let row = Users::find()
+        .filter(Column::Role.eq(Role::Admin.as_str()))
+        .order_by_asc(Column::Username)
+        .one(db)
+        .await?;
+    Ok(row.map(|model| model.username))
+}
+
 /// 按登录名取账号；不存在返回 `None`。
 pub async fn find(db: &DatabaseConnection, username: &str) -> anyhow::Result<Option<UserRecord>> {
     let row = Users::find()
         .filter(Column::Username.eq(username))
         .one(db)
         .await?;
-    Ok(row.map(record_of))
+    match row {
+        Some(model) => Ok(Some(record_of(model)?)),
+        None => Ok(None),
+    }
 }
 
 /// 全部账号，按登录名升序。
@@ -146,23 +254,31 @@ pub async fn find(db: &DatabaseConnection, username: &str) -> anyhow::Result<Opt
 ///         而人的点击目标正落在那些行上。
 pub async fn list(db: &DatabaseConnection) -> anyhow::Result<Vec<UserRecord>> {
     let rows = Users::find().order_by_asc(Column::Username).all(db).await?;
-    Ok(rows.into_iter().map(record_of).collect())
+    rows.into_iter().map(record_of).collect()
 }
 
 /// 新建账号。
 ///
+/// @intent 角色是**显式参数**，不提供「省略则取某默认值」的重载。建账号时
+///         授权级别必须由调用方写下来：默认成管理员会让「多建一个测试账号」
+///         变成一次提权；默认成普通账号则让播种管理员那条路径靠「记得多传一个
+///         参数」来成立。两种默认都在把一次显式决定偷换成隐式约定。
+///         调用方各写一行 `Role::User` / `Role::Admin`，读代码的人一眼看到权限。
+///
 /// @intent 调用方必须先算出 `password_hash`（见 [`crate::password::hash_password`]）：
 ///         本函数刻意不接受明文，否则「明文进数据库层」这条通道会一直存在，
 ///         而它只会在某次重构里被误用。
-pub async fn create(
+pub async fn create_with_role(
     db: &DatabaseConnection,
     username: &str,
     password_hash: &str,
+    role: Role,
 ) -> anyhow::Result<()> {
     let now = now_secs();
     Users::insert(ActiveModel {
         username: Set(username.to_string()),
         password_hash: Set(password_hash.to_string()),
+        role: Set(role.as_str().to_string()),
         created_at: Set(now),
         updated_at: Set(now),
     })
@@ -176,8 +292,10 @@ pub async fn create(
 ///
 /// @intent 返回 `bool` 而非 `Result<()>`：与 `meta::delete_project` 同一取向——
 ///         调用方需要区分「本来就没了」（幂等成功）与「确实删掉了一个」。
-///         **最后一个账号的保护不在这里**：它属于业务规则（「不得把所有人锁在门外」），
+///         **最后一个管理员的保护不在这里**：它属于业务规则（「不得把管理面锁死」），
 ///         由 handler 在事务性语义外统一判定，避免存储层偷偷拒绝一次合法删除。
+///         注意判据是**管理员数**而非账号数——剩一群普通账号时删掉最后一个管理员，
+///         管理面同样锁死。
 pub async fn delete(db: &DatabaseConnection, username: &str) -> anyhow::Result<bool> {
     let result = Users::delete_by_id(username.to_string()).exec(db).await?;
     Ok(result.rows_affected > 0)
@@ -199,14 +317,48 @@ pub async fn update_password(
     Ok(affected > 0)
 }
 
+/// 更新角色，返回账号是否存在。
+///
+/// @intent 与 `update_password` 分开而不是合成一个「改账号」接口：两者的授权规则
+///         不同（改自己的口令人人可为，改角色只有管理员可为），合成一个接口
+///         就必须在 handler 里按字段分别判权，而「只传了一半字段」的请求
+///         会让那个判断变得含糊。
+pub async fn update_role(
+    db: &DatabaseConnection,
+    username: &str,
+    role: Role,
+) -> anyhow::Result<bool> {
+    let affected = Users::update_many()
+        .col_expr(Column::Role, Expr::value(role.as_str().to_string()))
+        .col_expr(Column::UpdatedAt, Expr::value(now_secs()))
+        .filter(Column::Username.eq(username))
+        .exec(db)
+        .await?
+        .rows_affected;
+    Ok(affected > 0)
+}
+
 /// 实体模型 → 账号记录。
-fn record_of(model: crate::entity::user::Model) -> UserRecord {
-    UserRecord {
+///
+/// @intent 角色解析失败是**错误**而非降级成默认值：`users.role` 只可能由本程序写入，
+///         出现无法解析的值意味着库被外部改过或版本不匹配。此时静默当成普通账号
+///         会让管理员在下次登录时突然失去权限，而日志里什么都没有。
+fn record_of(model: crate::entity::user::Model) -> anyhow::Result<UserRecord> {
+    let role = Role::parse(&model.role).ok_or_else(|| {
+        anyhow::anyhow!(
+            "user `{}` has an unrecognised role {:?}; expected one of {:?}",
+            model.username,
+            model.role,
+            Role::ALL.map(|r| r.as_str())
+        )
+    })?;
+    Ok(UserRecord {
         username: model.username,
         password_hash: model.password_hash,
+        role,
         created_at: model.created_at,
         updated_at: model.updated_at,
-    }
+    })
 }
 
 /// 校验一组凭据，成功时返回账号记录。
@@ -284,6 +436,19 @@ mod tests {
         crate::password::hash_password(plain).unwrap()
     }
 
+    /// 测试内的普通账号创建快捷方式。
+    ///
+    /// @intent 绝大多数用例关心的不是角色，而是「账号能不能登、口令能不能改」。
+    ///         让它们每次写一遍 `Role::User` 只会把视线从被测行为上引开；
+    ///         而真正测角色的用例显式调用 `create_with_role`，两者意图分明。
+    async fn create(
+        db: &DatabaseConnection,
+        username: &str,
+        password_hash: &str,
+    ) -> anyhow::Result<()> {
+        create_with_role(db, username, password_hash, Role::User).await
+    }
+
     // ------------------------------------------------------------ 登录名校验
 
     /// 中文名、邮箱都能用；空、含空白、超长都必须被拒。
@@ -315,6 +480,11 @@ mod tests {
         }
         let record = find(&db, "root").await.unwrap().expect("种子账号应存在");
         assert!(crate::password::verify_password("bootstrap-secret", &record.password_hash));
+        assert_eq!(
+            record.role,
+            Role::Admin,
+            "种子账号必须是管理员，否则全新实例会没有任何管理员"
+        );
 
         // 再跑一次：即使配置换了用户名也不得新增
         match bootstrap_admin(&db, "someone-else", &hash).await.unwrap() {
@@ -445,6 +615,133 @@ mod tests {
         assert!(
             authenticate(&db, "alice", "first-secret").await.unwrap().is_some(),
             "原口令不得被后到的创建请求改写"
+        );
+    }
+
+    // ------------------------------------------------------------ 角色（P8）
+
+    /// 角色标识必须能往返，且未知值**不猜**。
+    #[test]
+    fn role_parse_roundtrip_and_rejects_unknown() {
+        for role in Role::ALL {
+            assert_eq!(Role::parse(role.as_str()), Some(role));
+        }
+        assert_eq!(Role::parse("ADMIN"), Some(Role::Admin), "大小写不敏感");
+        assert_eq!(Role::parse(" user "), Some(Role::User), "容忍首尾空白");
+        assert_eq!(Role::parse("root"), None, "未知角色不得被猜成某个权限");
+        assert_eq!(Role::parse(""), None);
+
+        // 缺省是权限更小的那个：任何「忘了传角色」的路径都不该造出管理员
+        assert_eq!(Role::default(), Role::User);
+        assert!(!Role::default().is_admin());
+    }
+
+    /// 缺省 `create` 造普通账号；`create_with_role` 才显式给权限。
+    ///
+    /// @intent 这条守的是「多建一个测试账号 = 一次提权」这种事故：
+    ///         `create` 是被复用最多的入口，它的缺省值必须是最小权限。
+    #[tokio::test]
+    async fn create_defaults_to_a_plain_tenant() {
+        let db = temp_db().await;
+        create(&db, "tenant", &phc("tenant-secret")).await.unwrap();
+        create_with_role(&db, "boss", &phc("boss-secret"), Role::Admin)
+            .await
+            .unwrap();
+
+        assert_eq!(find(&db, "tenant").await.unwrap().unwrap().role, Role::User);
+        assert_eq!(find(&db, "boss").await.unwrap().unwrap().role, Role::Admin);
+    }
+
+    /// `authenticate` 必须把角色带出来——鉴权后的授权全靠它。
+    #[tokio::test]
+    async fn authenticate_returns_the_role() {
+        let db = temp_db().await;
+        create_with_role(&db, "boss", &phc("boss-secret"), Role::Admin)
+            .await
+            .unwrap();
+        create(&db, "tenant", &phc("tenant-secret")).await.unwrap();
+
+        assert_eq!(
+            authenticate(&db, "boss", "boss-secret")
+                .await
+                .unwrap()
+                .unwrap()
+                .role,
+            Role::Admin
+        );
+        assert_eq!(
+            authenticate(&db, "tenant", "tenant-secret")
+                .await
+                .unwrap()
+                .unwrap()
+                .role,
+            Role::User
+        );
+    }
+
+    /// 管理员计数（含 0）与「首个管理员」的确定性。
+    #[tokio::test]
+    async fn admin_counts_and_first_admin_are_deterministic() {
+        let db = temp_db().await;
+        assert_eq!(count_admins(&db).await.unwrap(), 0);
+        assert_eq!(first_admin(&db).await.unwrap(), None);
+
+        // 故意倒序创建，断言取的是登录名序而非创建顺序
+        create_with_role(&db, "zoe", &phc("zoe-secret"), Role::Admin)
+            .await
+            .unwrap();
+        create_with_role(&db, "adam", &phc("adam-secret"), Role::Admin)
+            .await
+            .unwrap();
+        create(&db, "tenant", &phc("tenant-secret")).await.unwrap();
+
+        assert_eq!(count_admins(&db).await.unwrap(), 2, "普通账号不计入");
+        assert_eq!(count(&db).await.unwrap(), 3);
+        assert_eq!(first_admin(&db).await.unwrap().as_deref(), Some("adam"));
+    }
+
+    /// 改角色要如实报告影响行数；降级后 `count_admins` 立刻反映。
+    #[tokio::test]
+    async fn update_role_reports_what_really_happened() {
+        let db = temp_db().await;
+        create_with_role(&db, "boss", &phc("boss-secret"), Role::Admin)
+            .await
+            .unwrap();
+
+        assert!(update_role(&db, "boss", Role::User).await.unwrap());
+        assert_eq!(find(&db, "boss").await.unwrap().unwrap().role, Role::User);
+        assert_eq!(count_admins(&db).await.unwrap(), 0);
+
+        assert!(update_role(&db, "boss", Role::Admin).await.unwrap());
+        assert_eq!(count_admins(&db).await.unwrap(), 1);
+
+        assert!(
+            !update_role(&db, "ghost", Role::Admin).await.unwrap(),
+            "不存在的账号应返回 false"
+        );
+    }
+
+    /// 库里角色值无法解析时必须报错，而不是静默降级或提权。
+    ///
+    /// @intent 这是「数据被外部改过 / 版本不匹配」的唯一可检测时刻。静默降级会让
+    ///         管理员莫名失去权限，静默提权则更糟——两者都不会在日志里留痕。
+    #[tokio::test]
+    async fn unrecognised_role_in_the_database_is_an_error() {
+        let db = temp_db().await;
+        create(&db, "alice", &phc("alice-secret")).await.unwrap();
+
+        db.execute(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE users SET role = 'superuser' WHERE username = 'alice'",
+        ))
+        .await
+        .unwrap();
+
+        let err = find(&db, "alice").await.unwrap_err();
+        assert!(err.to_string().contains("superuser"), "{err}");
+        assert!(
+            authenticate(&db, "alice", "alice-secret").await.is_err(),
+            "角色损坏时登录必须失败，而不是按某个默认角色放行"
         );
     }
 }

@@ -9,11 +9,18 @@
 //!         [`authenticate_admin`]，以免两处各自判定而出现「一条通路做了 CSRF 检查、
 //!         另一条忘了做」这类不对称缺陷。
 //!         `/mcp` 一侧**只有** Bearer 一条通路，会话 Cookie 不参与——见 `routes` 的装配。
+//!
+//! @intent P8：管理面的身份从「有没有凭据」细化为「是谁 + 什么角色」。
+//!         [`AdminIdentity`] 因此携带 `user` 与 `role`，并把结果写入请求扩展，
+//!         让每个 handler 都能取到它（而不是各自重新解析一遍请求头）。
+//!         授权判断统一走 [`AdminIdentity::require_admin`] 与
+//!         [`AdminIdentity::can_access`]——**分散判断是越权的主要来源**。
 
 use crate::error::{AuthError, ProjectResolveError};
 use crate::reply::{internal_error, unauthorized};
 use crate::session;
 use crate::state::AppState;
+use crate::users::Role;
 use axum::extract::{Request, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue, Method};
 use axum::middleware::Next;
@@ -90,15 +97,82 @@ fn auth_failure(err: AuthError) -> Response {
 /// @intent 保留「凭据来自哪条通路」这一信息，是为了让中间件能对**会话通路**施加
 ///         CSRF 检查：携带会话 Cookie 的是浏览器，而浏览器会自动附带该 Cookie，
 ///         于是跨站请求也能通过鉴权；Bearer 通路不存在这个问题，故不受该检查约束。
+///
+/// @intent 两个变体都携带 `user`：授权需要一个**主体**来回答「这个名字的数据
+///         你能看吗」。只有 Bearer 通路没有天然主体，它取配置里的 `admin_user`
+///         ——那正是「配置里那对凭据的人化形态」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminIdentity {
     /// 来自 `Authorization: Bearer <ADMIN_TOKEN>`（脚本 / 无状态调用方）
-    BearerToken,
+    ///
+    /// @intent 恒为 [`Role::Admin`]：`ADMIN_TOKEN` 能建项目、能删项目、能读写任何项目
+    ///         的数据，它比任何控制台账号权限都大。若把它降级成普通账号，
+    ///         `memora-handoff` 这类只用 `ADMIN_TOKEN` 的脚本会突然看不见项目。
+    BearerToken {
+        /// 主体名（取配置里的 `admin_user`）
+        user: String,
+    },
     /// 来自有效会话 Cookie（网页控制台）
     Session {
         /// 登录用户名
         user: String,
+        /// 签发时的角色快照（见 `session` 模块文档）
+        role: Role,
     },
+}
+
+impl AdminIdentity {
+    /// 主体名（授权与日志用）。
+    pub fn user(&self) -> &str {
+        match self {
+            AdminIdentity::BearerToken { user } => user,
+            AdminIdentity::Session { user, .. } => user,
+        }
+    }
+
+    /// 角色。
+    pub fn role(&self) -> Role {
+        match self {
+            AdminIdentity::BearerToken { .. } => Role::Admin,
+            AdminIdentity::Session { role, .. } => *role,
+        }
+    }
+
+    /// 是否管理员。
+    pub fn is_admin(&self) -> bool {
+        self.role().is_admin()
+    }
+
+    /// 是否可访问某人名下的资源。
+    ///
+    /// @intent 这是整个权限模型的**唯一一处**判断：管理员放行一切，其余只放行
+    ///         自己名下的。所有项目类端点都经 `admin::visible_project` 调用它，
+    ///         而不是各自写 `if identity.is_admin() || owner == identity.user()`——
+    ///         后者的每一份拷贝都是一次可能写错方向的机会。
+    pub fn can_access(&self, owner: &str) -> bool {
+        self.is_admin() || self.user() == owner
+    }
+
+    /// 要求管理员身份；非管理员返回可直接回传的 403。
+    ///
+    /// @intent 返回 `Result<(), Response>` 而不是 `bool`：调用方拿到 `Err` 时
+    ///         必须把它原样返回，这样「忘写返回值」不会变成「静默放行」
+    ///         （`bool` 的 `unwrap_or(false)` 很容易被写成 `unwrap_or(true)`）。
+    ///
+    /// @intent 错误侧装箱（`Box<Response>`）：`Response` 有 128 字节，直接内联会让
+    ///         每个 `Result` 都按它的大小搬运。这里与 `admin::visible_project`
+    ///         保持同一形态——同一个模块里两种装箱风格只是给后来者添乱。
+    ///         多一次分配只发生在**已经要构造 JSON 响应体**的拒绝路径上。
+    pub fn require_admin(&self) -> Result<(), Box<Response>> {
+        if self.is_admin() {
+            Ok(())
+        } else {
+            Err(Box::new(crate::reply::forbidden(
+                "role_required",
+                "this endpoint requires an administrator account",
+            )))
+        }
+    }
 }
 
 /// 定长数据的常量时间比较。
@@ -128,14 +202,19 @@ pub fn authenticate_admin(state: &AppState, headers: &HeaderMap) -> Option<Admin
         let expected = state.config.admin_token.as_bytes();
         // 空 ADMIN_TOKEN 表示「未配置管理凭据」，此时任何 Bearer 都不该被接受。
         if !expected.is_empty() && constant_time_eq(token.as_bytes(), expected) {
-            return Some(AdminIdentity::BearerToken);
+            return Some(AdminIdentity::BearerToken {
+                user: state.config.admin_user.clone(),
+            });
         }
         return None;
     }
 
     let id = session::cookie_value(headers, session::COOKIE_NAME)?;
     let found = state.sessions.get(&id)?;
-    Some(AdminIdentity::Session { user: found.user })
+    Some(AdminIdentity::Session {
+        user: found.user,
+        role: found.role,
+    })
 }
 
 /// 管理面鉴权中间件：`/api/v1` 的写操作与统计。
@@ -143,6 +222,10 @@ pub fn authenticate_admin(state: &AppState, headers: &HeaderMap) -> Option<Admin
 /// @intent 会话通路上追加跨站检查（见 [`AdminIdentity`]）。这里返回 403 而非 401：
 ///         凭据本身是有效的，被拒的是「这次请求来自别的站点」，换个凭据也不会变好——
 ///         属于与 `/mcp` 的 Host 白名单同类的「请求来源不被接受」。
+///
+/// @intent 身份写入请求扩展，handler 用 `Extension<AdminIdentity>` 取出。
+///         这比让每个 handler 自己解析请求头可靠得多：解析逻辑只有一份，
+///         而且「某个 handler 忘了解析」会变成编译期缺少提取器，而不是运行期越权。
 pub async fn admin_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let identity = match authenticate_admin(&state, req.headers()) {
         Some(identity) => identity,
@@ -156,6 +239,7 @@ pub async fn admin_auth(State(state): State<AppState>, mut req: Request, next: N
         tracing::warn!(
             method = %req.method(),
             path = %req.uri().path(),
+            user = %identity.user(),
             "rejected a cross-origin state-changing request authenticated by session cookie"
         );
         return crate::reply::forbidden(
@@ -308,5 +392,76 @@ mod tests {
                 "{unsafe_method} 必须要求 CSRF 检查"
             );
         }
+    }
+
+    // ------------------------------------------------------ 身份与角色（P8）
+
+    /// Bearer 通路恒为管理员，主体名取配置里的 `admin_user`。
+    #[test]
+    fn bearer_token_identity_is_always_an_admin() {
+        let identity = AdminIdentity::BearerToken {
+            user: "root".to_string(),
+        };
+        assert_eq!(identity.user(), "root");
+        assert_eq!(identity.role(), Role::Admin);
+        assert!(identity.is_admin());
+        assert!(identity.require_admin().is_ok());
+    }
+
+    /// 会话通路的角色来自签发快照，不得被「猜」成管理员。
+    #[test]
+    fn session_identity_keeps_the_issued_role() {
+        let tenant = AdminIdentity::Session {
+            user: "alice".to_string(),
+            role: Role::User,
+        };
+        assert_eq!(tenant.role(), Role::User);
+        assert!(!tenant.is_admin());
+        assert!(
+            tenant.require_admin().is_err(),
+            "普通账号必须被账号管理类端点拒绝"
+        );
+
+        let admin = AdminIdentity::Session {
+            user: "boss".to_string(),
+            role: Role::Admin,
+        };
+        assert!(admin.is_admin());
+    }
+
+    /// 数据范围的唯一判断点：管理员全通，其余只看自己名下的。
+    ///
+    /// @intent 这条断言是越权防护的锚点。它必须同时验证**两个方向**：
+    ///         管理员能访问别人的（否则管理面无意义），普通账号不能访问别人的
+    ///         （否则隔离是假的）。只测一个方向会让另一个方向的回归静默通过。
+    #[test]
+    fn access_is_owner_scoped_except_for_admins() {
+        let admin = AdminIdentity::Session {
+            user: "boss".to_string(),
+            role: Role::Admin,
+        };
+        let alice = AdminIdentity::Session {
+            user: "alice".to_string(),
+            role: Role::User,
+        };
+
+        assert!(admin.can_access("alice"), "管理员可见任何人的项目");
+        assert!(admin.can_access("boss"));
+        assert!(alice.can_access("alice"), "普通账号可见自己的项目");
+        assert!(!alice.can_access("bob"), "普通账号不得见他人的项目");
+        assert!(
+            !alice.can_access(""),
+            "无主项目只对管理员可见（空串不等于任何用户名）"
+        );
+        assert!(
+            admin.can_access(""),
+            "迁移期遗留的无主项目必须对管理员可见，否则升级后数据像是丢了"
+        );
+
+        // Bearer 通路也走同一个判断（它是管理员，故全通）
+        let script = AdminIdentity::BearerToken {
+            user: "root".to_string(),
+        };
+        assert!(script.can_access("anyone-else"));
     }
 }

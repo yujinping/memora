@@ -226,6 +226,25 @@ async fn serve(config: Config) -> Result<()> {
         ),
     }
 
+    // 无主项目的认领：P7 及更早的 `projects` 表没有 `owner` 列，加列后存量行
+    // 留成空串（= 仅管理员可见）。这里把它们认领给首个管理员，使升级后的
+    // 数据归属明确。必须排在账号播种**之后**——没有管理员时它会静默跳过，
+    // 于是「先建账号再认领」这个顺序是必需的，而不是巧合。
+    match meta::claim_unowned_projects(&db).await {
+        Ok(0) => tracing::debug!("no unowned projects to claim"),
+        Ok(claimed) => tracing::info!(
+            projects = claimed,
+            "claimed legacy projects without an owner for the first administrator"
+        ),
+        // 认领失败不该让服务起不来：项目本身仍然可用（只是归属为空，
+        // 对管理员可见）。但必须告警——否则「租户看不到本该属于自己的项目」
+        // 会变成一次无从排查的静默失败。
+        Err(err) => tracing::error!(
+            error = %err,
+            "failed to claim unowned projects; they remain visible to administrators only"
+        ),
+    }
+
     // 存储后端注册表：本构建可用的后端 + 校验默认后端
     let storage = StorageRegistry::from_config(&config)?;
     let available: Vec<&str> = storage

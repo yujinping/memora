@@ -19,6 +19,14 @@
 //!
 //! @intent 与 `/mcp` 的凭据**严格隔离**：会话 Cookie 不是项目 token，也不参与 `/mcp`
 //!         鉴权。这条由 `routes` 的装配顺序保证——`/mcp` 的中间件只认 Bearer。
+//!
+//! @intent P8 起会话携带**角色快照**。这不是缓存优化，而是权限模型的必要一环：
+//!         每条鉴权请求都要作答「你是谁、你是什么角色」，若每次都回查 `users`，
+//!         一次页面加载（十几个并发请求）就是十几次库查询，而账号信息几乎不变。
+//!         代价是「改角色后已登录的会话仍是旧角色，直到重新登录」。这个代价靠
+//!         [`SessionStore::refresh_role`] 补齐：改角色时原地刷新该账号全部会话的
+//!         角色快照，于是提权与降权都立即生效，而**不需要**踢人重登
+//!         （对比：删除账号必须撤销会话，那是 [`SessionStore::remove_user`]）。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -28,6 +36,7 @@ use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue};
 
 use crate::auth;
+use crate::users::Role;
 
 /// 会话 Cookie 名。
 pub const COOKIE_NAME: &str = "memora_session";
@@ -43,6 +52,8 @@ pub const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 pub struct Session {
     /// 登录用户名（用于界面上显示「当前以谁的身份登录」）
     pub user: String,
+    /// 签发时的角色快照（决定数据范围）
+    pub role: Role,
     /// 绝对过期时刻
     pub expires_at: Instant,
 }
@@ -64,8 +75,12 @@ impl SessionStore {
     }
 
     /// 以默认有效期创建会话，返回会话 id。
-    pub fn create(&self, user: &str) -> anyhow::Result<String> {
-        self.create_with_ttl(user, SESSION_TTL)
+    ///
+    /// @intent 参数是 `(user, role)` 而非只有 `user`：角色必须在**签发时**就确定，
+    ///         否则鉴权中间件要么回查库（每个请求一次），要么拿不到角色
+    ///         （于是只能假设最宽或最窄的权限，两者都错）。
+    pub fn create(&self, user: &str, role: Role) -> anyhow::Result<String> {
+        self.create_with_ttl(user, role, SESSION_TTL)
     }
 
     /// 以指定有效期创建会话。
@@ -73,10 +88,16 @@ impl SessionStore {
     /// @intent 有效期可注入使过期逻辑能被**确定性**验证：测试传入零时长即可让会话
     ///         立即过期，不必 `sleep` 等待——基于真实时钟的等待型断言在负载高的机器上
     ///         必然出现偶发失败。
-    pub fn create_with_ttl(&self, user: &str, ttl: Duration) -> anyhow::Result<String> {
+    pub fn create_with_ttl(
+        &self,
+        user: &str,
+        role: Role,
+        ttl: Duration,
+    ) -> anyhow::Result<String> {
         let id = auth::random_hex(auth::TOKEN_BYTES)?;
         let session = Session {
             user: user.to_string(),
+            role,
             expires_at: Instant::now() + ttl,
         };
 
@@ -123,6 +144,27 @@ impl SessionStore {
         let before = guard.len();
         guard.retain(|_, session| session.user != user);
         before - guard.len()
+    }
+
+    /// 刷新某账号全部会话的角色快照，返回被刷新的条数。
+    ///
+    /// @intent 为什么必须刷新而不是「等对方重新登录」：降权（admin → user）若滞后，
+    ///         被降权者手上的会话仍能看全部数据，最多 12 小时——这不是「稍后生效」，
+    ///         而是「权限变更没生效」。提权方向同理，用户按下「设为管理员」后
+    ///         对方页面一刷新就该是对的。
+    ///
+    /// @intent 与 [`Self::remove_user`] 的分工：改角色是「同一个人换了权限」，
+    ///         踢掉重登纯属打扰；删除账号是「这个人不该再来」，必须撤销会话。
+    pub fn refresh_role(&self, user: &str, role: Role) -> usize {
+        let mut guard = self.lock();
+        let mut updated = 0;
+        for session in guard.values_mut() {
+            if session.user == user {
+                session.role = role;
+                updated += 1;
+            }
+        }
+        updated
     }
 
     /// 当前会话数（含尚未被清理的过期条目）。
@@ -289,7 +331,7 @@ mod tests {
     #[test]
     fn created_session_is_retrievable() {
         let store = SessionStore::new();
-        let id = store.create("admin").unwrap();
+        let id = store.create("admin", Role::Admin).unwrap();
 
         let session = store.get(&id).expect("新建会话应可查到");
         assert_eq!(session.user, "admin");
@@ -297,11 +339,35 @@ mod tests {
         assert_eq!(store.count_sessions(), 1, "表里应恰好一条会话");
     }
 
+    /// 会话必须携带签发时的角色——鉴权后的授权全靠它。
+    ///
+    /// @intent 这是 P8 的关键契约：中间件只拿到会话，若角色丢了，
+    ///         它就只能假设「人人都是管理员」（越权）或「人人都是租户」（管理员
+    ///         看不见自己的项目）——两者都是静默的错答案。
+    #[test]
+    fn session_carries_the_role_it_was_issued_with() {
+        let store = SessionStore::new();
+        let admin = store.create("boss", Role::Admin).unwrap();
+        let tenant = store.create("alice", Role::User).unwrap();
+
+        assert_eq!(store.get(&admin).unwrap().role, Role::Admin);
+        assert_eq!(store.get(&tenant).unwrap().role, Role::User);
+
+        // 同名账号的不同会话（改角色前后各登录一次）各自保留自己的快照
+        let later = store.create("boss", Role::User).unwrap();
+        assert_eq!(
+            store.get(&admin).unwrap().role,
+            Role::Admin,
+            "已签发的会话不被新会话影响"
+        );
+        assert_eq!(store.get(&later).unwrap().role, Role::User);
+    }
+
     /// 不存在的 id 必须查不到（而不是返回某个默认会话）。
     #[test]
     fn unknown_session_id_is_not_found() {
         let store = SessionStore::new();
-        store.create("admin").unwrap();
+        store.create("admin", Role::Admin).unwrap();
 
         assert!(store.get("deadbeef").is_none());
         assert!(store.get("").is_none());
@@ -313,7 +379,7 @@ mod tests {
         let store = SessionStore::new();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..64 {
-            let id = store.create("admin").unwrap();
+            let id = store.create("admin", Role::Admin).unwrap();
             assert_eq!(id.len(), auth::TOKEN_BYTES * 2);
             assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
             assert!(seen.insert(id), "会话 id 出现重复");
@@ -327,7 +393,7 @@ mod tests {
     #[test]
     fn expired_session_is_rejected_and_purged() {
         let store = SessionStore::new();
-        let id = store.create_with_ttl("admin", Duration::ZERO).unwrap();
+        let id = store.create_with_ttl("admin", Role::Admin, Duration::ZERO).unwrap();
 
         assert!(store.get(&id).is_none(), "零时长会话应立即过期");
         assert_eq!(store.count_sessions(), 0, "过期条目应在查询时被顺手移除");
@@ -337,7 +403,7 @@ mod tests {
     #[test]
     fn removed_session_can_no_longer_authenticate() {
         let store = SessionStore::new();
-        let id = store.create("admin").unwrap();
+        let id = store.create("admin", Role::Admin).unwrap();
         assert!(store.get(&id).is_some());
 
         assert!(store.remove(&id), "首次移除应返回 true");
@@ -356,7 +422,7 @@ mod tests {
     fn expired_entries_do_not_accumulate() {
         let store = SessionStore::new();
         for _ in 0..10 {
-            store.create_with_ttl("admin", Duration::ZERO).unwrap();
+            store.create_with_ttl("admin", Role::Admin, Duration::ZERO).unwrap();
         }
         assert_eq!(
             store.count_sessions(),
@@ -366,7 +432,7 @@ mod tests {
 
         // 长期会话（默认 TTL）则正常累积，说明清理只针对已过期条目。
         for _ in 0..5 {
-            store.create("admin").unwrap();
+            store.create("admin", Role::Admin).unwrap();
         }
         assert_eq!(store.count_sessions(), 5, "未过期的会话应全部保留");
     }
@@ -375,8 +441,8 @@ mod tests {
     #[test]
     fn multiple_sessions_coexist() {
         let store = SessionStore::new();
-        let a = store.create("admin").unwrap();
-        let b = store.create("admin").unwrap();
+        let a = store.create("admin", Role::Admin).unwrap();
+        let b = store.create("admin", Role::Admin).unwrap();
 
         assert_ne!(a, b);
         assert!(store.get(&a).is_some());
@@ -396,9 +462,9 @@ mod tests {
     #[test]
     fn removing_a_user_revokes_only_that_users_sessions() {
         let store = SessionStore::new();
-        let alice_a = store.create("alice").unwrap();
-        let alice_b = store.create("alice").unwrap();
-        let bob = store.create("bob").unwrap();
+        let alice_a = store.create("alice", Role::User).unwrap();
+        let alice_b = store.create("alice", Role::User).unwrap();
+        let bob = store.create("bob", Role::User).unwrap();
 
         assert_eq!(store.remove_user("alice"), 2, "应销毁 alice 的两个会话");
         assert!(store.get(&alice_a).is_none());
@@ -408,6 +474,36 @@ mod tests {
 
         assert_eq!(store.remove_user("alice"), 0, "重复销毁应返回 0 而非 panic");
         assert_eq!(store.remove_user("never-existed"), 0);
+    }
+
+    /// 改角色：刷新该账号全部会话，且不波及别人的会话。
+    ///
+    /// @intent 这条守的是「降权必须立即生效」：若只刷新一部分会话，被降权者
+    ///         换一台设备就又是管理员了。
+    #[test]
+    fn refreshing_a_role_updates_every_session_of_that_user() {
+        let store = SessionStore::new();
+        let alice_a = store.create("alice", Role::Admin).unwrap();
+        let alice_b = store.create("alice", Role::Admin).unwrap();
+        let bob = store.create("bob", Role::Admin).unwrap();
+
+        assert_eq!(store.refresh_role("alice", Role::User), 2);
+        assert_eq!(store.get(&alice_a).unwrap().role, Role::User);
+        assert_eq!(store.get(&alice_b).unwrap().role, Role::User);
+        assert_eq!(
+            store.get(&bob).unwrap().role,
+            Role::Admin,
+            "bob 的角色不得被波及"
+        );
+
+        // 会话本身仍然有效（改角色不踢人）
+        assert_eq!(store.count_sessions(), 3);
+
+        // 提权同样生效
+        assert_eq!(store.refresh_role("alice", Role::Admin), 2);
+        assert_eq!(store.get(&alice_a).unwrap().role, Role::Admin);
+
+        assert_eq!(store.refresh_role("nobody", Role::User), 0);
     }
 
     // ------------------------------------------------------------ Cookie

@@ -8,27 +8,45 @@
 //!         P4：`/api/v1` 补齐项目生命周期（增 / 删 / 统计），handler 实现在 `admin` 模块。
 
 use crate::admin;
-use crate::auth::{admin_auth, bearer_auth};
+use crate::auth::{admin_auth, bearer_auth, AdminIdentity};
 use crate::console;
 use crate::mcp;
 use crate::meta;
 use crate::reply::internal_error;
 use crate::state::AppState;
+use axum::extract::{Extension, State};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use tower_http::limit::RequestBodyLimitLayer;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use sea_orm::DatabaseConnection;
 
 /// 健康检查（无需鉴权）。
 async fn health() -> &'static str {
     "ok"
 }
 
-/// 管理员：项目列表。
-async fn list_projects(meta: DatabaseConnection) -> Response {
-    match meta::list_projects(&meta).await {
+/// 项目列表：管理员见全部，普通账号只见自己名下的。
+///
+/// @intent 列表是**唯一**会因角色不同而形状不同的项目端点（单个项目的访问
+///         由 `admin::visible_project` 统一判权）。这里必须显式分支：
+///         若一律全量，租户会在「项目」页看到别人的项目名；若一律按 owner 过滤，
+///         管理员就失去了「管理所有数据」的能力——而那是他的全部职责。
+///
+/// @intent 过滤下推到 SQL（`list_projects_of`）而非取全量后在内存里筛：
+///         后者的功能结果相同，但「别人的数据压根没有被读出来」与
+///         「读出来又丢掉了」是两种可信度完全不同的保证。
+async fn list_projects(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AdminIdentity>,
+) -> Response {
+    let result = if identity.is_admin() {
+        meta::list_projects(&state.meta).await
+    } else {
+        meta::list_projects_of(&state.meta, identity.user()).await
+    };
+
+    match result {
         Ok(projects) => Json(projects).into_response(),
         Err(err) => internal_error(&err),
     }
@@ -89,17 +107,10 @@ pub fn create_app(state: AppState) -> Router {
         )
         .with_state(state.clone());
 
-    // 管理路由：ADMIN_TOKEN 或控制台会话；项目列表的 db 连接经闭包注入，避免与路由状态耦合
-    let meta_conn = state.meta.clone();
+    // 管理路由：ADMIN_TOKEN 或控制台会话。身份由 `admin_auth` 写入请求扩展，
+    // handler 用 `Extension<AdminIdentity>` 取出后自行判权（见 `admin` 模块文档）。
     let api_routes = Router::new()
-        .route(
-            "/projects",
-            get(move || {
-                let conn = meta_conn.clone();
-                async move { list_projects(conn).await }
-            })
-            .post(admin::create_project),
-        )
+        .route("/projects", get(list_projects).post(admin::create_project))
         .route("/projects/{id}", delete(admin::delete_project))
         .route("/projects/{id}/stats", get(admin::project_stats))
         .route("/projects/{id}/graph", get(admin::project_graph))
@@ -108,7 +119,7 @@ pub fn create_app(state: AppState) -> Router {
             "/projects/{id}/token",
             post(admin::rotate_project_token),
         )
-        // 控制台账号（P7）：登录名是路径段，故含非法字符时由 handler 自行判定
+        // 账号管理（P7，P8 起仅管理员）：登录名是路径段，故含非法字符时由 handler 自行判定
         .route(
             "/users",
             get(admin::list_users).post(admin::create_user),
@@ -116,6 +127,13 @@ pub fn create_app(state: AppState) -> Router {
         .route(
             "/users/{username}",
             delete(admin::delete_user).put(admin::update_user_password),
+        )
+        // 角色变更（P8，仅管理员）：与改口令分开注册，因为两者的授权规则不同
+        // （改自己的口令人人可为，改角色只有管理员可为），合在一个 handler 里
+        // 判权会让「只传了半个字段」的请求变得含糊。
+        .route(
+            "/users/{username}/role",
+            put(admin::update_user_role),
         )
         // 交接（P4.3）：静态段 `pending` 必须先于 `{task_id}` 注册（matchit 对静态段
         // 优先，但先注册是防退化的自文档写法），并有专门用例钉住路由遮蔽。
@@ -238,6 +256,11 @@ mod tests {
                     token: token.to_string(),
                     db_path: format!("{id}/mem.db"),
                     backend: backend.to_string(),
+                    // @intent 归属留空 = 迁移前遗留的无主项目。用这个值而不是
+                    //         某个具体用户名，是因为它让**每一条既有用例**都顺带
+                    //         验证了「无主项目对管理员仍然可见」——升级后数据
+                    //         像是丢了，是这类迁移最常见的故障形态。
+                    owner: String::new(),
                 },
             )
             .await
@@ -252,9 +275,14 @@ mod tests {
             // @intent 只改 `admin_user`（供 `status` 在 Bearer 登录时回报身份），
             //         口令则写进 `users` 表——即生产路径下 `memora init` 所做的那一步。
             config.admin_user = CONSOLE_USER.to_string();
-            crate::users::create(&db, CONSOLE_USER, &console_password_hash())
-                .await
-                .unwrap();
+            crate::users::create_with_role(
+                &db,
+                CONSOLE_USER,
+                &console_password_hash(),
+                crate::users::Role::Admin,
+            )
+            .await
+            .unwrap();
         }
 
         let state = AppState::new(db, config, storage);
@@ -1980,22 +2008,54 @@ mod tests {
         }
     }
 
-    /// 登录并返回后续请求可直接使用的 Cookie 对。
-    async fn login(app: Router) -> String {
-        let (status, _body, headers) = send_with_cookie(
+    /// 以指定账号登录并返回后续请求可直接使用的 Cookie 对。
+    ///
+    /// @intent 与 [`login`] 分开是为了多租户用例：那里必须能拿到**非管理员**
+    ///         的会话，才能在同一个应用实例上验证两种角色的可见范围差异。
+    async fn login_as(app: Router, username: &str, password: &str) -> String {
+        let (status, body, headers) = send_with_cookie(
             app,
             "POST",
             "/api/v1/session",
             None,
             None,
             Some(serde_json::json!({
-                "username": CONSOLE_USER,
-                "password": CONSOLE_PASSWORD,
+                "username": username,
+                "password": password,
             })),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "登录应当成功");
+        assert_eq!(status, StatusCode::OK, "登录应当成功：{body}");
         session_cookie_pair(&headers).expect("登录响应必须带会话 Cookie")
+    }
+
+    /// 以种子管理员登录并返回后续请求可直接使用的 Cookie 对。
+    async fn login(app: Router) -> String {
+        login_as(app, CONSOLE_USER, CONSOLE_PASSWORD).await
+    }
+
+    /// 新建账号（走真实的管理接口，不直接写库）。
+    ///
+    /// @intent 刻意不走 `users::create_with_role`：用例要验证的是「管理员开号的
+    ///         那条链路」，直插数据库会绕过参数校验与角色解析，把接口本身的问题
+    ///         藏在测试之外。
+    async fn create_account(
+        app: Router,
+        admin_token: &str,
+        username: &str,
+        password: &str,
+        role: &str,
+    ) -> serde_json::Value {
+        let (status, body) = send_json(
+            app,
+            "POST",
+            "/api/v1/users",
+            Some(admin_token),
+            serde_json::json!({ "username": username, "password": password, "role": role }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "建账号失败：{body}");
+        body
     }
 
     /// `/admin` 必须公开可访问：它只是一张登录表单，登录前就要能看到。
@@ -2410,5 +2470,579 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, _) = get_with_token(app, "/api/v1/projects/demo/graph", Some("secret")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "项目 token 不是管理凭据");
+    }
+
+    // ------------------------------------------------- 多租户与角色（P8）
+
+    /// 项目列表按角色分支：管理员全量，普通账号只见自己名下的。
+    ///
+    /// @intent 这是多租户里唯一「形状随角色变化」的端点，也是最容易被写成
+    ///         「一律全量」的一处。用例同时钉住两个方向：
+    ///         - 租户看不到别人（含无主）的项目；
+    ///         - 管理员看得到**无主**项目——否则升级后老数据会在控制台上像是丢了。
+    #[tokio::test]
+    async fn project_listing_is_scoped_by_role() {
+        let (app, _dir) = setup_with_console(true).await;
+        create_account(app.clone(), "admin", "alice", "alice-password", "user").await;
+
+        // 三个预置项目均为无主（迁移中间态），管理员应全部可见
+        let (status, list) = get_with_token(app.clone(), "/api/v1/projects", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK);
+        let ids: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["project_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3, "管理员应看到全部项目：{list}");
+        assert!(
+            list.as_array().unwrap().iter().all(|p| p["owner"] == ""),
+            "迁移前遗留项目应如实报出空归属：{list}"
+        );
+
+        // 租户一个也看不到：无主项目不属于任何人
+        let cookie = login_as(app.clone(), "alice", "alice-password").await;
+        let (status, list, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/projects", Some(&cookie), None, None)
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            list.as_array().unwrap().len(),
+            0,
+            "租户不得看到任何无主项目：{list}"
+        );
+
+        // 租户自建一个项目，从此只看到它
+        let (status, body, _) = send_with_cookie(
+            app.clone(),
+            "POST",
+            "/api/v1/projects",
+            Some(&cookie),
+            Some("http://localhost"),
+            Some(serde_json::json!({ "project_id": "alice-notes" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "租户应能自建项目：{body}");
+        assert_eq!(
+            body["owner"], "alice",
+            "项目归属必须是创建者本人，而不是配置里的 admin_user"
+        );
+
+        let (_, list, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/projects", Some(&cookie), None, None)
+                .await;
+        let ids: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["project_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["alice-notes"], "租户只应看到自己的项目：{list}");
+
+        // 管理员依旧能看到四个（三个无主 + alice 的）
+        let (_, list) = get_with_token(app, "/api/v1/projects", Some("admin")).await;
+        assert_eq!(list.as_array().unwrap().len(), 4, "管理员应看到全部：{list}");
+    }
+
+    /// 跨租户访问单个项目一律 404，且与「真不存在」在结构与文案模板上完全一致。
+    ///
+    /// @intent 断言的是**响应模板一致**而不只是状态码相同：若越权返回 403、
+    ///         不存在返回 404，则「403 与否」就成了一个项目名枚举接口。
+    ///         这里逐项比对 `error` 标识与 `detail` 的模板（把项目名换成占位符后
+    ///         必须完全相同），防止将来有人「为了让报错更友好」给越权分支
+    ///         加一句额外说明——那句说明本身就是泄漏点。
+    #[tokio::test]
+    async fn projects_of_another_tenant_are_indistinguishable_from_missing() {
+        let (app, _dir) = setup_with_console(true).await;
+        create_account(app.clone(), "admin", "alice", "alice-password", "user").await;
+        create_account(app.clone(), "admin", "bob", "bob-password", "user").await;
+
+        let alice = login_as(app.clone(), "alice", "alice-password").await;
+        let bob = login_as(app.clone(), "bob", "bob-password").await;
+
+        // alice 建项目，bob 去访问
+        let (status, _, _) = send_with_cookie(
+            app.clone(),
+            "POST",
+            "/api/v1/projects",
+            Some(&alice),
+            Some("http://localhost"),
+            Some(serde_json::json!({ "project_id": "alice-private" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        /// 把 `detail` 里的项目名替换成占位符，得到可跨项目名比较的「模板」。
+        fn template(body: &serde_json::Value, project_id: &str) -> String {
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .replace(project_id, "<id>")
+        }
+
+        for uri in [
+            "/api/v1/projects/{id}/stats",
+            "/api/v1/projects/{id}/graph",
+            "/api/v1/projects/{id}/handoffs",
+        ] {
+            let target = uri.replace("{id}", "alice-private");
+            let ghost = uri.replace("{id}", "ghost-project");
+
+            let (status, body, _) =
+                send_with_cookie(app.clone(), "GET", &target, Some(&bob), None, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{target} 越权应为 404：{body}");
+
+            let (ghost_status, ghost_body, _) =
+                send_with_cookie(app.clone(), "GET", &ghost, Some(&bob), None, None).await;
+            assert_eq!(ghost_status, status, "{uri}：越权与不存在的状态码必须相同");
+            assert_eq!(body["error"], ghost_body["error"], "{uri}：错误标识必须相同");
+            assert_eq!(
+                template(&body, "alice-private"),
+                template(&ghost_body, "ghost-project"),
+                "{uri}：越权与不存在的文案模板必须相同，否则可用来枚举项目名——\
+                 越权响应：{body}，不存在响应：{ghost_body}"
+            );
+        }
+
+        // 删除与轮换同样不可越权（写操作更危险）
+        let (status, _, _) = send_with_cookie(
+            app.clone(),
+            "POST",
+            "/api/v1/projects/alice-private/token",
+            Some(&bob),
+            Some("http://localhost"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "越权轮换 token 必须失败");
+
+        let (status, _, _) = send_with_cookie(
+            app.clone(),
+            "DELETE",
+            "/api/v1/projects/alice-private",
+            Some(&bob),
+            Some("http://localhost"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "越权注销必须失败");
+
+        // owner 本人与管理员都仍能访问，证明 404 只针对越权者
+        let (status, _, _) = send_with_cookie(
+            app.clone(),
+            "GET",
+            "/api/v1/projects/alice-private/stats",
+            Some(&alice),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "owner 应能访问自己的项目");
+        let (status, _) =
+            get_with_token(app, "/api/v1/projects/alice-private/stats", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK, "管理员应能访问任何项目");
+    }
+
+    /// 账号管理接口仅管理员可用；租户一律 403（不是 404——账号名不是敏感资源，
+    /// 且这里的目标是「你没这个权限」，不是「这东西不存在」）。
+    #[tokio::test]
+    async fn account_management_requires_admin() {
+        let (app, _dir) = setup_with_console(true).await;
+        create_account(app.clone(), "admin", "alice", "alice-password", "user").await;
+        let alice = login_as(app.clone(), "alice", "alice-password").await;
+
+        let (status, body, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/users", Some(&alice), None, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "租户不得列账号：{body}");
+        assert_eq!(body["error"], "role_required");
+
+        let cases = [
+            (
+                "POST",
+                "/api/v1/users",
+                Some(serde_json::json!({ "username": "eve", "password": "eve-password" })),
+            ),
+            (
+                "PUT",
+                "/api/v1/users/bob/role",
+                Some(serde_json::json!({ "role": "admin" })),
+            ),
+            ("DELETE", "/api/v1/users/console-admin", None),
+        ];
+        for (method, uri, payload) in cases {
+            let (status, body, _) = send_with_cookie(
+                app.clone(),
+                method,
+                uri,
+                Some(&alice),
+                Some("http://localhost"),
+                payload,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {uri} 应仅限管理员：{body}"
+            );
+        }
+
+        // 租户可以改自己的口令（这是该接口对他存在的理由）
+        let (status, body, _) = send_with_cookie(
+            app.clone(),
+            "PUT",
+            "/api/v1/users/alice",
+            Some(&alice),
+            Some("http://localhost"),
+            Some(serde_json::json!({ "password": "alice-new-password" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "租户应能改自己的口令：{body}");
+
+        // 但不能改别人的
+        let (status, body, _) = send_with_cookie(
+            app,
+            "PUT",
+            "/api/v1/users/bob",
+            Some(&alice),
+            Some("http://localhost"),
+            Some(serde_json::json!({ "password": "hijacked-password" })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "租户不得改他人口令：{body}"
+        );
+        assert_eq!(body["error"], "role_required");
+    }
+
+    /// 改角色必须立即生效：会话里的角色快照被原地刷新，不需要重新登录。
+    ///
+    /// @intent 若只改库不刷新会话，降权的旧会话还能用满 12 小时——那等于
+    ///         「权限变更没生效」。此用例同时覆盖提权与降权两个方向。
+    #[tokio::test]
+    async fn role_changes_take_effect_on_live_sessions() {
+        let (app, _dir) = setup_with_console(true).await;
+        create_account(app.clone(), "admin", "alice", "alice-password", "user").await;
+        let alice = login_as(app.clone(), "alice", "alice-password").await;
+
+        // 初始：租户，看不到账号页
+        let (_, body, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/session", Some(&alice), None, None)
+                .await;
+        assert_eq!(body["role"], "user");
+        let (status, _, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/users", Some(&alice), None, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // 提权：同一个 Cookie 立刻变成管理员
+        let (status, body) = send_json(
+            app.clone(),
+            "PUT",
+            "/api/v1/users/alice/role",
+            Some("admin"),
+            serde_json::json!({ "role": "admin" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["role"], "admin");
+        assert_eq!(
+            body["sessions_updated"], 1,
+            "alice 有一个在线会话，必须被刷新：{body}"
+        );
+
+        let (_, body, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/session", Some(&alice), None, None)
+                .await;
+        assert_eq!(body["role"], "admin", "提权应立刻反映在会话自检里");
+        let (status, body, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/users", Some(&alice), None, None).await;
+        assert_eq!(status, StatusCode::OK, "提权后应立即能管账号：{body}");
+
+        // 降权：立刻失去管理权限，但会话本身还在（不踢人）
+        let (status, body) = send_json(
+            app.clone(),
+            "PUT",
+            "/api/v1/users/alice/role",
+            Some("admin"),
+            serde_json::json!({ "role": "user" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/session", Some(&alice), None, None)
+                .await;
+        assert_eq!(status, StatusCode::OK, "降权不应销毁会话");
+        assert_eq!(body["role"], "user");
+        let (status, _, _) =
+            send_with_cookie(app, "GET", "/api/v1/users", Some(&alice), None, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "降权后应立即失去管理权限");
+    }
+
+    /// 唯一管理员不可被删除、也不可被降级。
+    ///
+    /// @intent 判据是「管理员数」而不是「账号数」：只剩一群普通账号时，
+    ///         删掉/降级最后一个管理员会让管理面永久锁死，而唯一的补救手段是
+    ///         手工改库或删掉 `_meta.db`（后者连带丢掉全部项目登记）。
+    /// @intent 顺带钉住「先提一个管理员，再动原来那个就合法了」这条逃生路径——
+    ///         否则用户看到 409 会以为系统坏了。
+    #[tokio::test]
+    async fn the_only_admin_can_be_neither_deleted_nor_demoted() {
+        let (app, _dir) = setup_with_console(true).await;
+        create_account(app.clone(), "admin", "bob", "bob-password", "user").await;
+
+        let (status, body) = delete_with_token(
+            app.clone(),
+            &format!("/api/v1/users/{CONSOLE_USER}"),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "last_admin");
+
+        let (status, body) = send_json(
+            app.clone(),
+            "PUT",
+            &format!("/api/v1/users/{CONSOLE_USER}/role"),
+            Some("admin"),
+            serde_json::json!({ "role": "user" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "last_admin");
+
+        // 普通账号删除不受此限（他本来就不是管理员）
+        let (status, body) =
+            delete_with_token(app.clone(), "/api/v1/users/bob", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK, "删除普通账号不应被拦：{body}");
+
+        // 有第二个管理员之后，原来的就可以动了
+        create_account(app.clone(), "admin", "carol", "carol-password", "admin").await;
+        let (status, body) = send_json(
+            app.clone(),
+            "PUT",
+            &format!("/api/v1/users/{CONSOLE_USER}/role"),
+            Some("admin"),
+            serde_json::json!({ "role": "user" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "存在第二个管理员后应允许降级：{body}");
+
+        // 于是 carol 成了唯一管理员，她不能被删
+        let (status, body) =
+            delete_with_token(app, "/api/v1/users/carol", Some("admin")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "唯一管理员保护应随之转移：{body}");
+        assert_eq!(body["error"], "last_admin");
+    }
+
+    /// 删除账号后，它名下的项目不会消失，只是变成「仅管理员可见」。
+    ///
+    /// @intent 这是刻意的保守选择：自动转交或自动删除都是在替用户做不可逆的决定。
+    ///         用例同时钉住「管理面不能因此丢数据」和「别人也拿不到这些数据」。
+    #[tokio::test]
+    async fn deleting_an_account_orphans_its_projects_without_losing_them() {
+        let (app, _dir) = setup_with_console(true).await;
+        create_account(app.clone(), "admin", "alice", "alice-password", "user").await;
+        let alice = login_as(app.clone(), "alice", "alice-password").await;
+
+        let (status, _, _) = send_with_cookie(
+            app.clone(),
+            "POST",
+            "/api/v1/projects",
+            Some(&alice),
+            Some("http://localhost"),
+            Some(serde_json::json!({ "project_id": "alice-notes" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) =
+            delete_with_token(app.clone(), "/api/v1/users/alice", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["sessions_revoked"], 1,
+            "删除账号必须同时销毁它的会话，否则 Cookie 还能用满 12 小时：{body}"
+        );
+
+        // 旧 Cookie 立即失效
+        let (status, _, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/session", Some(&alice), None, None)
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        // 会话自检本身是公开的，这里靠 authenticated 判定
+        let (_, body, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/session", Some(&alice), None, None)
+                .await;
+        assert_eq!(body["authenticated"], false, "删除账号后旧 Cookie 必须失效");
+
+        // 项目还在，管理员看得见，归属仍是那个已不存在的账号名
+        let (status, body) =
+            get_with_token(app.clone(), "/api/v1/projects/alice-notes/stats", Some("admin"))
+                .await;
+        assert_eq!(status, StatusCode::OK, "项目数据不得随账号一起消失：{body}");
+        let (_, list) = get_with_token(app.clone(), "/api/v1/projects", Some("admin")).await;
+        let orphan = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["project_id"] == "alice-notes")
+            .expect("项目必须仍在列表里");
+        assert_eq!(
+            orphan["owner"], "alice",
+            "应如实报出失效归属，供管理员处置"
+        );
+
+        // 别的租户依旧看不到
+        create_account(app.clone(), "admin", "bob", "bob-password", "user").await;
+        let bob = login_as(app.clone(), "bob", "bob-password").await;
+        let (status, _, _) =
+            send_with_cookie(app.clone(), "GET", "/api/v1/projects/alice-notes/stats", Some(&bob), None, None)
+                .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "失效归属的项目对任何租户都不可见"
+        );
+    }
+
+    /// 新建账号省略 `role` 时必须是普通账号，非法角色值必须是 400。
+    ///
+    /// @intent 「省略即管理员」会把「顺手多开一个号」变成「顺手多开一个管理员」，
+    ///         而这类事故没有任何提示。缺省值落在低权限上，是有意的。
+    #[tokio::test]
+    async fn new_accounts_default_to_tenant_and_reject_unknown_roles() {
+        let (app, _dir) = setup_with_console(true).await;
+
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/users",
+            Some("admin"),
+            serde_json::json!({ "username": "dave", "password": "dave-password" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["role"], "user", "省略 role 必须落在普通账号：{body}");
+
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/users",
+            Some("admin"),
+            serde_json::json!({
+                "username": "mallory",
+                "password": "mallory-password",
+                "role": "superuser"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "未知角色不得被猜成某种权限：{body}");
+
+        // 前缀匹配/大小写都不算数——只有精确的 admin 才是管理员。
+        // @intent 读路径（`Role::parse`）容忍空白与大小写，写路径不容忍：
+        //         入参位置宽容等于把拼错的值升级成最高权限。
+        for sloppy in ["admin ", " Admin", "ADMIN"] {
+            let (status, body) = send_json(
+                app.clone(),
+                "POST",
+                "/api/v1/users",
+                Some("admin"),
+                serde_json::json!({
+                    "username": "trent",
+                    "password": "trent-password",
+                    "role": sloppy
+                }),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "角色值 `{sloppy}` 不得被宽容接受：{body}"
+            );
+        }
+
+        // 账号列表如实报出角色
+        let (_, list) = get_with_token(app, "/api/v1/users", Some("admin")).await;
+        let dave = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["username"] == "dave")
+            .expect("dave 应在列表里");
+        assert_eq!(dave["role"], "user");
+        let admin = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["username"] == CONSOLE_USER)
+            .expect("种子管理员应在列表里");
+        assert_eq!(admin["role"], "admin");
+    }
+
+    /// `ADMIN_TOKEN`（脚本路径）恒为管理员，且不属于任何租户。
+    ///
+    /// @intent 这条不是「权限更宽」的顺手设计，而是兼容性要求：`memora-handoff`
+    ///         等脚本只用 `ADMIN_TOKEN`，若它被降级或受 owner 过滤，所有脚本会在
+    ///         一次升级后集体坏掉，且报错形态是「项目不存在」——极难定位。
+    #[tokio::test]
+    async fn admin_token_acts_as_a_tenantless_administrator() {
+        let (app, _dir) = setup_with_console(true).await;
+        create_account(app.clone(), "admin", "alice", "alice-password", "user").await;
+        let alice = login_as(app.clone(), "alice", "alice-password").await;
+        let (_, _, _) = send_with_cookie(
+            app.clone(),
+            "POST",
+            "/api/v1/projects",
+            Some(&alice),
+            Some("http://localhost"),
+            Some(serde_json::json!({ "project_id": "alice-notes" })),
+        )
+        .await;
+
+        // 自检里身份是配置里的 admin_user，角色是 admin
+        let (status, body) =
+            get_with_token(app.clone(), "/api/v1/session", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["authenticated"], true);
+        assert_eq!(body["user"], CONSOLE_USER);
+        assert_eq!(body["role"], "admin");
+
+        // 能读别人名下的项目
+        let (status, body) =
+            get_with_token(app.clone(), "/api/v1/projects/alice-notes/stats", Some("admin"))
+                .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["project_id"], "alice-notes");
+
+        // 能用账号管理
+        let (status, _) = get_with_token(app.clone(), "/api/v1/users", Some("admin")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 但它自己「创建」的项目归属是 admin_user 这个主体名，不是空串
+        let (status, body) = send_json(
+            app.clone(),
+            "POST",
+            "/api/v1/projects",
+            Some("admin"),
+            serde_json::json!({ "project_id": "script-project" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(
+            body["owner"], CONSOLE_USER,
+            "脚本建的项目归属应是 admin_user，空串会被下一次启动的认领逻辑重写"
+        );
+
+        // 普通账号拿不到脚本项目的任何东西
+        let (status, _, _) = send_with_cookie(
+            app,
+            "GET",
+            "/api/v1/projects/script-project/stats",
+            Some(&alice),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

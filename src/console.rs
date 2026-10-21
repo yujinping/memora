@@ -26,7 +26,7 @@
 //! - 403：来源不被接受（跨站写请求）
 //! - 500：服务端故障（元库不可用、熵源不可用）
 
-use crate::auth::{authenticate_admin, AdminIdentity};
+use crate::auth::authenticate_admin;
 use crate::reply;
 use crate::session;
 use crate::state::AppState;
@@ -89,6 +89,8 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     /// 登录用户名
     pub user: String,
+    /// 角色标识（`admin` / `user`）
+    pub role: String,
     /// 会话有效期（秒）
     pub expires_in_secs: u64,
 }
@@ -106,6 +108,13 @@ pub struct SessionStatus {
     pub authenticated: bool,
     /// 已登录时的用户名
     pub user: Option<String>,
+    /// 已登录时的角色标识；未登录为 `None`
+    ///
+    /// @intent 角色必须由服务端给出，**不能**让前端从账号名猜测：控制台的导航
+    ///         （是否显示「账号」页）与若干按钮的可见性都依赖它。前端一旦自行判断，
+    ///         就会出现「页面显示可点、后端 403」的错位，而那类错位最容易被误读成
+    ///         后端 bug。注意它只影响**界面呈现**，真正的授权始终在服务端做。
+    pub role: Option<String>,
     /// 账号总数（凭证来自库，故此处顺带给出规模，便于「为什么进不去」的判断）
     ///
     /// @intent 这与 `console_login_enabled` 是同一件事的两种精度，看似冗余，
@@ -229,14 +238,18 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Respon
         Ok(total) => total,
         Err(err) => return reply::internal_error(&err),
     };
+    let (user, role) = match &identity {
+        Some(identity) => (
+            Some(identity.user().to_string()),
+            Some(identity.role().as_str().to_string()),
+        ),
+        None => (None, None),
+    };
     Json(SessionStatus {
         console_login_enabled: total > 0,
         authenticated: identity.is_some(),
-        user: match identity {
-            Some(AdminIdentity::Session { user }) => Some(user),
-            Some(AdminIdentity::BearerToken) => Some(state.config.admin_user.clone()),
-            None => None,
-        },
+        user,
+        role,
         users: total,
     })
     .into_response()
@@ -279,7 +292,7 @@ pub async fn login(
         Err(err) => return reply::internal_error(&err),
     };
 
-    let id = match state.sessions.create(&record.username) {
+    let id = match state.sessions.create(&record.username, record.role) {
         Ok(id) => id,
         Err(err) => return reply::internal_error(&err),
     };
@@ -291,12 +304,17 @@ pub async fn login(
         &session::build_session_cookie(&id, session::SESSION_TTL, secure),
     );
 
-    tracing::info!(user = %record.username, "console login succeeded");
+    tracing::info!(
+        user = %record.username,
+        role = record.role.as_str(),
+        "console login succeeded"
+    );
     (
         StatusCode::OK,
         response_headers,
         Json(LoginResponse {
             user: record.username,
+            role: record.role.as_str().to_string(),
             expires_in_secs: session::SESSION_TTL.as_secs(),
         }),
     )

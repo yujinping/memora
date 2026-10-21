@@ -1,6 +1,6 @@
 [package]
 name = "memora"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 authors = ["yujinping"]
 description = "Memora (忆庐): 轻量自托管 AI 长期记忆服务 (MCP + SQLite)"

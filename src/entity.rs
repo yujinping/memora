@@ -24,6 +24,25 @@ pub mod project {
         /// 该项目使用的存储后端标识（sqlite_file / in_mem / ...），见 docs §12.5
         #[sea_orm(column_type = "Text", default_value = "sqlite_file")]
         pub backend: String,
+        /// 归属账号（`users.username`）；空串 = 历史遗留的无主项目
+        ///
+        /// @intent 归属落在**项目**这一层，而不是给每条记忆 / 交接加 owner 列：
+        ///         一块记忆、一条交接本就只属于一个项目，而项目库已按 project_id
+        ///         物理隔离（`data/{project_id}/mem.db`）。在记录级再记一遍归属，
+        ///         等于把同一事实存两处，且必须保证两处永不冲突——那是纯粹的
+        ///         一致性负担，换不来任何额外的隔离。
+        ///
+        /// @intent 空串是一个**显式的迁移中间态**而非错误：P7 及更早的库没有这一列，
+        ///         `ADD COLUMN ... DEFAULT ''` 会把存量行留成空串。启动时的
+        ///         [`crate::meta::claim_unowned_projects`] 会把它认领给管理员；
+        ///         若此时系统里还没有任何账号（只用 ADMIN_TOKEN 的部署），
+        ///         空串会一直保留——此类项目对管理员可见、对租户不可见。
+        ///
+        /// @intent 不加外键约束：SQLite 的外键默认关闭（`PRAGMA foreign_keys`），
+        ///         开了也只是把「删账号时项目怎么办」从业务决策变成一次级联失败。
+        ///         归属的有效性由 `admin` 模块在写入时保证，读时按字符串比较即可。
+        #[sea_orm(column_type = "Text", default_value = "")]
+        pub owner: String,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -52,6 +71,17 @@ pub mod user {
         /// 口令的 Argon2id PHC 串（**不存明文**）
         #[sea_orm(column_type = "Text")]
         pub password_hash: String,
+        /// 角色标识：`admin` 或 `user`
+        ///
+        /// @intent 存字符串而非整数枚举：与 `projects.backend` 同一取向——库里的值
+        ///         必须能被人直接读懂，`sqlite3 _meta.db 'select * from users'`
+        ///         一眼就能回答「谁是管理员」。取值不可随意变更（写入即成为契约）。
+        ///
+        /// @intent 存量回填为 `admin`：P7 时期「能登录控制台的都是管理员」，
+        ///         迁移若默认成 `user`，会让线上唯一的账号在升级瞬间失去管理权，
+        ///         而它此刻连管理员都还不是——一个不可自愈的死锁。
+        #[sea_orm(column_type = "Text", default_value = "admin")]
+        pub role: String,
         /// 创建时间（Unix 秒）
         #[sea_orm(column_type = "BigInteger")]
         pub created_at: i64,
